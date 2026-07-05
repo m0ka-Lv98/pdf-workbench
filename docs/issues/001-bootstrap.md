@@ -16,5 +16,5 @@ Make a fresh clone reproducibly installable, testable, and runnable on macOS and
 
 ## Acceptance criteria
 
-- A clean macOS runner and a clean Windows runner start the application from the locked environment.
+- A clean macOS runner and a clean Windows runner start the application from a fresh virtual environment.
 - CI passes on macOS, Windows, and Ubuntu for Python 3.12 and 3.13.

@@ -34,12 +34,31 @@ Acrobat Proの全機能再現ではなく、日常的に使う閲覧・ページ
 - macOS 14+ または Windows 10/11 x64
 - Python 3.12または3.13
 - Git
+- Ubuntu は GUI 配布対象ではなく、移植性と単体テスト検証の対象
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -e ".[dev]"
+```
+
+仮想環境の有効化:
+
+macOS / Linux
+
+```bash
+source .venv/bin/activate
+```
+
+Windows PowerShell
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+
+起動:
+
+```bash
 python -m pdf_workbench
 ```
 
@@ -53,8 +72,9 @@ python -m pdf_workbench /path/to/document.pdf
 
 ```bash
 ruff check .
-pytest
+ruff format --check .
 mypy src/pdf_workbench
+pytest --cov=pdf_workbench
 ```
 
 ## 設定とログ
@@ -63,7 +83,7 @@ mypy src/pdf_workbench
 - Qt設定はレジストリではなく、ユーザープロファイル配下の設定ディレクトリへINIファイルとして保存する
 - 実行ファイルの隣には設定やログを書き込まない
 
-macOSでも同じコマンドでローカル起動できます。最終配布ターゲットはWindowsです。
+macOS と Windowsを開発・検証対象とし、Ubuntu は移植性と単体テスト検証の対象とします。最終配布ターゲットは Windows です。
 
 ## Windows実行ファイル
 

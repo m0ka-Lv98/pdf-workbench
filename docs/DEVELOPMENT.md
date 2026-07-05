@@ -6,9 +6,22 @@
 git clone <repository-url>
 cd pdf-workbench
 python -m venv .venv
-source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -e ".[dev]"
+```
+
+仮想環境の有効化:
+
+macOS / Linux
+
+```bash
+source .venv/bin/activate
+```
+
+Windows PowerShell
+
+```powershell
+.\.venv\Scripts\Activate.ps1
 ```
 
 OCR開発も行う場合:
@@ -19,7 +32,7 @@ python -m pip install -e ".[dev,ocr]"
 
 OCRmyPDFはPythonパッケージ以外にもTesseract等の外部依存を必要とするため、M4でWindows導入手順を固定する。
 
-macOS開発でも通常のセットアップ、起動、テストは同じ手順で行える。最終配布物の検証とPyInstallerのEXE生成はWindowsで行う。
+macOS と Windows は開発・検証対象とする。Ubuntu は GUI 配布対象ではなく、移植性と単体テスト検証の対象とする。最終配布物の検証と PyInstaller の EXE 生成は Windows で行う。
 
 ## 起動
 

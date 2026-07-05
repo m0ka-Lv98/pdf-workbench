@@ -35,6 +35,6 @@ def test_configure_qsettings_uses_user_config_dir(
     settings = configure_qsettings()
 
     expected_dir = ensure_app_directories().config_dir
-    assert settings.fileName() == str(expected_dir / f"{APP_NAME}.ini")
+    assert Path(settings.fileName()) == expected_dir / f"{APP_NAME}.ini"
     assert Path(settings.fileName()).parent == expected_dir
     assert settings.format() == QSettings.Format.IniFormat
