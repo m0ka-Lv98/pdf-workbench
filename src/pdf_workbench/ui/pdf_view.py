@@ -119,6 +119,9 @@ class PagePlaceholder(QFrame):
         )
         return QRectF(0.0, 0.0, mapper.view_size.width(), mapper.view_size.height())
 
+    def content_rect(self) -> QRectF:
+        return QRectF(self._content_rect())
+
     def _update_size(self) -> None:
         hint = self.sizeHint()
         self.setMinimumSize(hint)
@@ -579,8 +582,8 @@ class PdfView(QWidget):
         if self._metadata is None:
             return QRectF()
         page = self._canvas.pages[page_index]
-        rect = page.geometry()
-        return QRectF(rect)
+        rect = page.content_rect()
+        return QRectF(page.pos(), rect.size())
 
     def _bump_generation(self) -> None:
         self._generation += 1
