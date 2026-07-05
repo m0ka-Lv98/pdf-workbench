@@ -9,8 +9,7 @@ Make a fresh clone reproducibly installable, testable, and runnable on macOS and
 ## Tasks
 
 - [ ] Confirm Python 3.12 and 3.13 support
-- [ ] Generate and commit `uv.lock`
-- [ ] Verify `uv sync --extra dev --frozen`
+- [ ] Document and verify `venv + pip` based setup
 - [ ] Run Ruff, mypy, and pytest in CI
 - [ ] Document macOS and Windows prerequisites
 - [ ] Confirm logs and settings are written under the user profile

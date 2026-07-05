@@ -2,16 +2,19 @@
 
 ## セットアップ
 
-```powershell
+```bash
 git clone <repository-url>
 cd pdf-workbench
-uv sync --extra dev
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e ".[dev]"
 ```
 
 OCR開発も行う場合:
 
-```powershell
-uv sync --extra dev --extra ocr
+```bash
+python -m pip install -e ".[dev,ocr]"
 ```
 
 OCRmyPDFはPythonパッケージ以外にもTesseract等の外部依存を必要とするため、M4でWindows導入手順を固定する。
@@ -20,17 +23,17 @@ macOS開発でも通常のセットアップ、起動、テストは同じ手順
 
 ## 起動
 
-```powershell
-uv run pdf-workbench
+```bash
+python -m pdf_workbench
 ```
 
 ## 品質確認
 
-```powershell
-uv run ruff check .
-uv run ruff format --check .
-uv run mypy src/pdf_workbench
-uv run pytest --cov=pdf_workbench
+```bash
+ruff check .
+ruff format --check .
+mypy src/pdf_workbench
+pytest --cov=pdf_workbench
 ```
 
 ## ブランチ

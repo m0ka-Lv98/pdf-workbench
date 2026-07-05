@@ -8,10 +8,10 @@ Closes #
 
 ## Verification
 
-- [ ] `uv run ruff check .`
-- [ ] `uv run ruff format --check .`
-- [ ] `uv run mypy src/pdf_workbench`
-- [ ] `uv run pytest`
+- [ ] `ruff check .`
+- [ ] `ruff format --check .`
+- [ ] `mypy src/pdf_workbench`
+- [ ] `pytest`
 - [ ] GUI behavior checked on macOS or Windows as applicable
 - [ ] PDF-writing changes include round-trip validation
 

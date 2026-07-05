@@ -20,7 +20,7 @@ Acrobat Proの全機能再現ではなく、日常的に使う閲覧・ページ
 - ページ操作・フォーム: pypdf
 - OCR: OCRmyPDF + Tesseract（後続フェーズ）
 - Windows配布: PyInstaller
-- 依存関係管理: uv
+- 依存関係管理: venv + pip
 
 ## 現在の状態
 
@@ -33,26 +33,28 @@ Acrobat Proの全機能再現ではなく、日常的に使う閲覧・ページ
 
 - macOS 14+ または Windows 10/11 x64
 - Python 3.12または3.13
-- uv
 - Git
 
-```powershell
-uv sync --extra dev
-uv run pdf-workbench
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e ".[dev]"
+python -m pdf_workbench
 ```
 
 PDFファイルを指定して起動できます。
 
-```powershell
-uv run pdf-workbench C:\path\to\document.pdf
+```bash
+python -m pdf_workbench /path/to/document.pdf
 ```
 
 ## テスト
 
-```powershell
-uv run ruff check .
-uv run pytest
-uv run mypy src/pdf_workbench
+```bash
+ruff check .
+pytest
+mypy src/pdf_workbench
 ```
 
 ## 設定とログ
@@ -67,14 +69,14 @@ macOSでも同じコマンドでローカル起動できます。最終配布タ
 
 安定性確認用の`onedir`ビルド:
 
-```powershell
-uv run pyinstaller packaging/pdf_workbench_onedir.spec --noconfirm --clean
+```bash
+pyinstaller packaging/pdf_workbench_onedir.spec --noconfirm --clean
 ```
 
 単一EXEの実験ビルド:
 
-```powershell
-uv run pyinstaller packaging/pdf_workbench_onefile.spec --noconfirm --clean
+```bash
+pyinstaller packaging/pdf_workbench_onefile.spec --noconfirm --clean
 ```
 
 出力先は`dist/`です。GitHub Actionsの`Build Windows executable`からも生成できます。Windows EXEはWindowsランナー上でのみ生成します。

@@ -9,8 +9,8 @@ $ErrorActionPreference = "Stop"
 if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
     throw "GitHub CLI (gh) が見つかりません。winget install --id GitHub.cli を実行してください。"
 }
-if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
-    throw "uv が見つかりません。winget install --id astral-sh.uv を実行してください。"
+if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
+    throw "Python が見つかりません。Python 3.12 以降をインストールしてください。"
 }
 
 gh auth status | Out-Host
@@ -63,5 +63,5 @@ foreach ($label in $labels) {
     gh label create $label.Name --color $label.Color --description $label.Description --force | Out-Null
 }
 
-uv run python scripts/create_github_issues.py
+python scripts/create_github_issues.py
 Write-Host "GitHub bootstrap completed."
