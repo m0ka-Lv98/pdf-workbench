@@ -86,7 +86,7 @@ def test_render_cache_misses_when_file_revision_changes(tmp_path: Path) -> None:
     first_revision = make_revision(tmp_path, content=b"one")
     cache.put(RenderCacheKey(first_revision, 0, 1.0, 0, 1.0), make_image())
 
-    second_revision = make_revision(tmp_path, content=b"two")
+    second_revision = make_revision(tmp_path, content=b"updated-content")
 
     assert cache.get(RenderCacheKey(second_revision, 0, 1.0, 0, 1.0)) is None
 
