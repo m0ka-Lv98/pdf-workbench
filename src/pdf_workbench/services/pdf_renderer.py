@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,16 +12,9 @@ from PIL.ImageQt import ImageQt
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QImage
 
-from pdf_workbench.services.page_coordinates import PageGeometry
+from pdf_workbench.services.page_coordinates import PageGeometry, PageMetadata
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True, slots=True)
-class PageMetadata:
-    width_points: float
-    height_points: float
-    geometry: PageGeometry | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,15 +153,10 @@ class PdfiumDocumentBackend:
     def page_metadata(self, page_index: int) -> PageMetadata:
         page = self._document[page_index]
         try:
-            width, height = page.get_size()
             geometry = PageGeometry.from_pdfium_page(page)
         finally:
             page.close()
-        return PageMetadata(
-            width_points=float(width),
-            height_points=float(height),
-            geometry=geometry,
-        )
+        return PageMetadata(geometry=geometry)
 
     def render_page(
         self,
@@ -176,10 +165,12 @@ class PdfiumDocumentBackend:
         rotation: int,
         device_pixel_ratio: float,
     ) -> QImage:
-        if logical_zoom <= 0:
-            raise ValueError("logical_zoom must be positive")
-        if device_pixel_ratio <= 0:
-            raise ValueError("device_pixel_ratio must be positive")
+        if not math.isfinite(logical_zoom) or logical_zoom <= 0:
+            raise ValueError("logical_zoom must be finite and positive")
+        if not math.isfinite(device_pixel_ratio) or device_pixel_ratio <= 0:
+            raise ValueError("device_pixel_ratio must be finite and positive")
+        if rotation not in {0, 90, 180, 270}:
+            raise ValueError("rotation must be one of 0, 90, 180, 270")
 
         page = self._document[page_index]
         try:

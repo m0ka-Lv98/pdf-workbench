@@ -1,19 +1,19 @@
 from __future__ import annotations
 
+import math
 import uuid
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QCloseEvent, QColor, QPainter, QPaintEvent, QPixmap
 from PySide6.QtWidgets import QFrame, QLabel, QScrollArea, QSizePolicy, QVBoxLayout, QWidget
 
-from pdf_workbench.services.page_coordinates import PageCoordinateMapper, PageGeometry, PdfRect
+from pdf_workbench.services.page_coordinates import PageCoordinateMapper, PageMetadata
 from pdf_workbench.services.pdf_renderer import (
     DocumentMetadata,
     DocumentRevision,
-    PageMetadata,
     PdfRenderServiceProtocol,
     RenderRequest,
 )
@@ -21,6 +21,10 @@ from pdf_workbench.services.pdf_renderer import (
 
 def _clamp(value: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(value, maximum))
+
+
+_CONTENT_MARGIN = 8.0
+_MINIMUM_PAGE_EXTENT = 200
 
 
 class PlaceholderState(StrEnum):
@@ -36,7 +40,7 @@ class PagePlaceholder(QFrame):
         super().__init__(parent)
         self.page_index = page_index
         self._state = PlaceholderState.NOT_REQUESTED
-        self._metadata = PageMetadata(595.0, 842.0)
+        self._metadata: PageMetadata | None = None
         self._logical_zoom = 1.5
         self._rotation = 0
         self._device_pixel_ratio = 1.0
@@ -82,45 +86,34 @@ class PagePlaceholder(QFrame):
         self.update()
 
     def sizeHint(self) -> QSize:
-        content_rect = self._content_rect()
-        width = max(200, round(content_rect.width()))
-        height = max(200, round(content_rect.height()))
+        mapper = self._coordinate_mapper()
+        width = max(
+            _MINIMUM_PAGE_EXTENT,
+            math.ceil(mapper.view_size.width() + 2 * _CONTENT_MARGIN),
+        )
+        height = max(
+            _MINIMUM_PAGE_EXTENT,
+            math.ceil(mapper.view_size.height() + 2 * _CONTENT_MARGIN),
+        )
         return QSize(width, height)
 
-    def _content_rect(self) -> QRectF:
-        geometry = self._metadata.geometry
-        if geometry is None:
-            geometry = PageGeometry(
-                media_box=PdfRect(
-                    0.0,
-                    0.0,
-                    self._metadata.width_points,
-                    self._metadata.height_points,
-                ),
-                crop_box=PdfRect(
-                    0.0,
-                    0.0,
-                    self._metadata.width_points,
-                    self._metadata.height_points,
-                ),
-                visible_box=PdfRect(
-                    0.0,
-                    0.0,
-                    self._metadata.width_points,
-                    self._metadata.height_points,
-                ),
-                intrinsic_rotation=0,
-            )
+    def _coordinate_mapper(self) -> PageCoordinateMapper:
+        if self._metadata is None:
+            raise RuntimeError("page metadata is not configured")
         mapper = PageCoordinateMapper(
-            geometry=geometry,
+            geometry=self._metadata.geometry,
             additional_rotation=self._rotation,
             logical_zoom=self._logical_zoom,
             device_pixel_ratio=self._device_pixel_ratio,
         )
-        return QRectF(0.0, 0.0, mapper.view_size.width(), mapper.view_size.height())
+        return mapper
 
-    def content_rect(self) -> QRectF:
-        return QRectF(self._content_rect())
+    def page_content_rect(self) -> QRectF:
+        mapper = self._coordinate_mapper()
+        content_size = mapper.view_size
+        x = (self.width() - content_size.width()) / 2.0
+        y = (self.height() - content_size.height()) / 2.0
+        return QRectF(x, y, content_size.width(), content_size.height())
 
     def _update_size(self) -> None:
         hint = self.sizeHint()
@@ -134,15 +127,8 @@ class PagePlaceholder(QFrame):
         painter = QPainter(self)
         painter.fillRect(self.rect().adjusted(1, 1, -1, -1), QColor("#f7f7f7"))
         if self._pixmap is not None:
-            target = self.rect().adjusted(8, 8, -8, -8)
-            scaled = self._pixmap.scaled(
-                target.size(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            x_pos = target.x() + max(0, (target.width() - scaled.width()) // 2)
-            y_pos = target.y() + max(0, (target.height() - scaled.height()) // 2)
-            painter.drawPixmap(x_pos, y_pos, scaled)
+            target = self.page_content_rect()
+            painter.drawPixmap(target, self._pixmap, QRectF(self._pixmap.rect()))
             return
 
         painter.setPen(QColor("#666666"))
@@ -313,6 +299,9 @@ class PdfView(QWidget):
         self.state_changed.emit()
 
     def set_zoom(self, scale: float) -> None:
+        scale = float(scale)
+        if not math.isfinite(scale):
+            raise ValueError("scale must be finite")
         if self._metadata is None:
             self._logical_zoom = max(0.25, min(scale, 5.0))
             return
@@ -332,10 +321,11 @@ class PdfView(QWidget):
         self.state_changed.emit()
 
     def set_rotation(self, rotation: int) -> None:
-        normalized = rotation % 360
-        if normalized == self._rotation:
+        if rotation not in {0, 90, 180, 270}:
+            raise ValueError("rotation must be one of 0, 90, 180, 270")
+        if rotation == self._rotation:
             return
-        self._rotation = normalized
+        self._rotation = rotation
         if self._metadata is None:
             return
         self._desired_pages.clear()
@@ -582,8 +572,10 @@ class PdfView(QWidget):
         if self._metadata is None:
             return QRectF()
         page = self._canvas.pages[page_index]
-        rect = page.content_rect()
-        return QRectF(page.pos(), rect.size())
+        local_rect = page.page_content_rect()
+        page_origin_in_content = page.mapTo(self._content, QPoint(0, 0))
+        top_left = QPointF(page_origin_in_content) + local_rect.topLeft()
+        return QRectF(top_left, local_rect.size())
 
     def _bump_generation(self) -> None:
         self._generation += 1

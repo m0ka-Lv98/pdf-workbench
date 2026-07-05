@@ -5,10 +5,12 @@ from pathlib import Path
 import pytest
 from pypdf import PdfWriter
 from PySide6.QtCore import QPointF, QRectF
+from PySide6.QtGui import QPolygonF
 
 from pdf_workbench.services.page_coordinates import (
     PageCoordinateMapper,
     PageGeometry,
+    PageMetadata,
     PdfPoint,
     PdfRect,
 )
@@ -56,6 +58,19 @@ def _coords(point: object) -> tuple[float, float]:
         return float(x), float(y)
     x, y = point  # type: ignore[misc]
     return float(x), float(y)
+
+
+def _build_oracle_pdf(path: Path, intrinsic_rotation: int) -> Path:
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=600, height=800)
+    page.mediabox.lower_left = (-20, -10)
+    page.mediabox.upper_right = (580, 790)
+    page.cropbox.lower_left = (50, 100)
+    page.cropbox.upper_right = (450, 700)
+    page.rotate(intrinsic_rotation)
+    with path.open("wb") as stream:
+        writer.write(stream)
+    return path
 
 
 @pytest.mark.parametrize("rotation", [0, 90, 180, 270])
@@ -112,52 +127,137 @@ def test_page_coordinate_mapper_round_trips_polygons(rotation: int) -> None:
     assert tuple(mapper.device_to_pdf_polygon(mapper.pdf_to_device_polygon(polygon))) == polygon
 
 
-def test_page_coordinate_mapper_uses_pdfium_posconv_oracle(tmp_path: Path) -> None:
+@pytest.mark.parametrize("intrinsic_rotation", [0, 90, 180, 270])
+@pytest.mark.parametrize("additional_rotation", [0, 90, 180, 270])
+def test_page_coordinate_mapper_uses_pdfium_posconv_oracle(
+    tmp_path: Path,
+    intrinsic_rotation: int,
+    additional_rotation: int,
+) -> None:
     from pypdfium2 import PdfDocument
 
-    pdf_path = tmp_path / "oracle.pdf"
-    writer = PdfWriter()
-    page = writer.add_blank_page(width=200, height=300)
-    page.cropbox.lower_left = (20, 30)
-    page.cropbox.upper_right = (180, 260)
-    page.rotate(90)
-    with pdf_path.open("wb") as stream:
-        writer.write(stream)
+    pdf_path = _build_oracle_pdf(tmp_path / f"oracle-{intrinsic_rotation}.pdf", intrinsic_rotation)
 
     document = PdfDocument(str(pdf_path))
+    max_error_x = 0.0
+    max_error_y = 0.0
     try:
         pdfium_page = document[0]
         geometry = PageGeometry.from_pdfium_page(pdfium_page)
         mapper = PageCoordinateMapper(
             geometry=geometry,
-            additional_rotation=180,
-            logical_zoom=1.25,
-            device_pixel_ratio=1.5,
+            additional_rotation=additional_rotation,
+            logical_zoom=1.5,
+            device_pixel_ratio=2.0,
         )
         bitmap = pdfium_page.render(
             scale=mapper.logical_zoom * mapper.device_pixel_ratio,
-            rotation=180,
+            rotation=additional_rotation,
         )
         posconv = bitmap.get_posconv(pdfium_page)
 
-        pdf_point = PdfPoint(75.0, 120.0)
-        device_point = mapper.pdf_to_device_point(pdf_point)
-        oracle_point = posconv.to_bitmap(pdf_point.x, pdf_point.y)
-        assert_point_close_qt(device_point, QPointF(*_coords(oracle_point)))
-        assert_point_close_pdf(mapper.device_to_pdf_point(device_point), pdf_point)
-        oracle_pdf_point = PdfPoint(
-            *_coords(
-                posconv.to_page(
-                    round(device_point.x()),
-                    round(device_point.y()),
+        points = [
+            geometry.visible_box.bottom_left,
+            geometry.visible_box.bottom_right,
+            geometry.visible_box.top_left,
+            geometry.visible_box.top_right,
+            geometry.visible_box.center,
+            PdfPoint(123.0, 234.0),
+        ]
+        for pdf_point in points:
+            device_point = mapper.pdf_to_device_point(pdf_point)
+            oracle_point = posconv.to_bitmap(pdf_point.x, pdf_point.y)
+            expected = QPointF(*_coords(oracle_point))
+            max_error_x = max(max_error_x, abs(device_point.x() - expected.x()))
+            max_error_y = max(max_error_y, abs(device_point.y() - expected.y()))
+            assert_point_close_qt(device_point, expected)
+            back = mapper.device_to_pdf_point(device_point)
+            assert_point_close_pdf(back, pdf_point)
+            oracle_pdf_point = PdfPoint(
+                *_coords(
+                    posconv.to_page(
+                        round(device_point.x()),
+                        round(device_point.y()),
+                    )
                 )
             )
-        )
-        assert oracle_pdf_point.x == pytest.approx(pdf_point.x, abs=1.0)
-        assert oracle_pdf_point.y == pytest.approx(pdf_point.y, abs=1.0)
+            assert oracle_pdf_point.x == pytest.approx(pdf_point.x, abs=1.0)
+            assert oracle_pdf_point.y == pytest.approx(pdf_point.y, abs=1.0)
     finally:
         pdfium_page.close()
         document.close()
+
+    assert max_error_x <= 1.0
+    assert max_error_y <= 1.0
+
+
+@pytest.mark.parametrize("zoom,dpr", [(1.0, 1.0), (1.5, 2.0), (2.75, 1.25)])
+def test_page_coordinate_mapper_respects_zoom_and_dpr_independently(
+    zoom: float,
+    dpr: float,
+) -> None:
+    geometry = make_geometry()
+    mapper = PageCoordinateMapper(
+        geometry,
+        additional_rotation=0,
+        logical_zoom=zoom,
+        device_pixel_ratio=dpr,
+    )
+    baseline = PageCoordinateMapper(
+        geometry,
+        additional_rotation=0,
+        logical_zoom=zoom,
+        device_pixel_ratio=1.0,
+    )
+
+    point = PdfPoint(33.0, 77.0)
+    assert mapper.view_size == baseline.view_size
+    assert_point_close_qt(
+        mapper.pdf_to_view_point(point),
+        baseline.pdf_to_view_point(point),
+    )
+    rect = PdfRect(30.0, 40.0, 70.0, 90.0)
+    assert_qrect_close(mapper.pdf_to_view_rect(rect), baseline.pdf_to_view_rect(rect))
+
+
+@pytest.mark.parametrize("rotation", [0, 90, 180, 270])
+def test_polygon_conversion_preserves_vertices_and_order(rotation: int) -> None:
+    mapper = PageCoordinateMapper(
+        geometry=make_geometry(rotation=90),
+        additional_rotation=rotation,
+        logical_zoom=1.75,
+        device_pixel_ratio=1.5,
+    )
+    polygons = [
+        QPolygonF(),
+        QPolygonF([QPointF(25.0, 35.0)]),
+        QPolygonF([QPointF(25.0, 35.0), QPointF(40.0, 50.0)]),
+        QPolygonF([QPointF(25.0, 35.0), QPointF(35.0, 80.0), QPointF(60.0, 45.0)]),
+        QPolygonF(
+            [
+                QPointF(25.0, 35.0),
+                QPointF(60.0, 35.0),
+                QPointF(45.0, 55.0),
+                QPointF(60.0, 80.0),
+                QPointF(25.0, 80.0),
+            ]
+        ),
+    ]
+    for polygon in polygons:
+        mapped = mapper.pdf_to_view_polygon(
+            tuple(PdfPoint(point.x(), point.y()) for point in polygon)
+        )
+        assert mapped.count() == polygon.count()
+        round_tripped = mapper.view_to_pdf_polygon(mapped)
+        assert len(round_tripped) == polygon.count()
+
+
+def test_invalid_rectangles_rejected_by_mapper() -> None:
+    mapper = PageCoordinateMapper(make_geometry(), 0, 1.0, 1.0)
+    with pytest.raises(ValueError):
+        mapper.pdf_to_view_rect(PdfRect(10.0, 10.0, 10.0, 20.0))
+    with pytest.raises(ValueError):
+        mapper.pdf_to_view_rect(PdfRect(10.0, 10.0, 20.0, 10.0))
 
 
 def test_page_coordinate_mapper_rejects_invalid_scale_and_rotation() -> None:
@@ -229,6 +329,34 @@ def test_pdf_rect_normalized_from_reversed_edges() -> None:
     assert rect == PdfRect(1.0, 2.0, 5.0, 8.0)
 
 
+def test_page_geometry_rejects_invalid_rotation() -> None:
+    box = PdfRect(0.0, 0.0, 10.0, 20.0)
+    with pytest.raises(ValueError):
+        PageGeometry(box, box, box, 45)
+
+
+def test_page_metadata_from_size_derives_geometry() -> None:
+    metadata = PageMetadata.from_size(144.0, 200.0, intrinsic_rotation=90)
+
+    assert metadata.geometry.media_box == PdfRect(0.0, 0.0, 144.0, 200.0)
+    assert metadata.geometry.crop_box == PdfRect(0.0, 0.0, 144.0, 200.0)
+    assert metadata.geometry.visible_box == PdfRect(0.0, 0.0, 144.0, 200.0)
+    assert metadata.width_points == 144.0
+    assert metadata.height_points == 200.0
+    assert metadata.geometry.intrinsic_rotation == 90
+
+
+@pytest.mark.parametrize("width,height", [(0.0, 200.0), (-1.0, 200.0), (144.0, 0.0), (144.0, -1.0)])
+def test_page_metadata_from_size_rejects_invalid_extents(width: float, height: float) -> None:
+    with pytest.raises(ValueError):
+        PageMetadata.from_size(width, height)
+
+
+def test_page_metadata_from_size_rejects_invalid_rotation() -> None:
+    with pytest.raises(ValueError):
+        PageMetadata.from_size(144.0, 200.0, intrinsic_rotation=45)
+
+
 def test_page_geometry_from_pdfium_page_uses_bbox(tmp_path: Path) -> None:
     from pypdfium2 import PdfDocument
 
@@ -241,14 +369,25 @@ def test_page_geometry_from_pdfium_page_uses_bbox(tmp_path: Path) -> None:
         writer.write(stream)
 
     document = PdfDocument(str(pdf_path))
+    closed = False
     try:
         pdfium_page = document[0]
+        original_close = pdfium_page.close
+
+        def tracked_close() -> None:
+            nonlocal closed
+            closed = True
+            original_close()
+
+        pdfium_page.close = tracked_close  # type: ignore[assignment]
         geometry = PageGeometry.from_pdfium_page(pdfium_page)
     finally:
-        pdfium_page.close()
+        if not closed:
+            pdfium_page.close()
         document.close()
 
     assert geometry.media_box == PdfRect(0.0, 0.0, 200.0, 300.0)
     assert geometry.crop_box == PdfRect(20.0, 30.0, 180.0, 260.0)
     assert geometry.visible_box == PdfRect(20.0, 30.0, 180.0, 260.0)
     assert geometry.intrinsic_rotation == 0
+    assert closed is True

@@ -150,6 +150,38 @@ class PageGeometry:
 
 
 @dataclass(frozen=True, slots=True)
+class PageMetadata:
+    geometry: PageGeometry
+
+    @property
+    def width_points(self) -> float:
+        return self.geometry.visible_box.width
+
+    @property
+    def height_points(self) -> float:
+        return self.geometry.visible_box.height
+
+    @classmethod
+    def from_size(
+        cls,
+        width_points: float,
+        height_points: float,
+        *,
+        intrinsic_rotation: int = 0,
+    ) -> PageMetadata:
+        width_points = _require_positive_finite("width_points", width_points)
+        height_points = _require_positive_finite("height_points", height_points)
+        box = PdfRect(0.0, 0.0, width_points, height_points)
+        geometry = PageGeometry(
+            media_box=box,
+            crop_box=box,
+            visible_box=box,
+            intrinsic_rotation=intrinsic_rotation,
+        )
+        return cls(geometry=geometry)
+
+
+@dataclass(frozen=True, slots=True)
 class PageCoordinateMapper:
     geometry: PageGeometry
     additional_rotation: int
