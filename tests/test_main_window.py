@@ -3,7 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import QSettings
+from pypdf import PdfWriter
+from PySide6.QtCore import QMimeData, QPoint, QPointF, QSettings, Qt, QUrl
+from PySide6.QtGui import QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import QMessageBox
 from pytestqt.qtbot import QtBot
 
@@ -11,7 +13,6 @@ from pdf_workbench.ui.main_window import MainWindow
 from pdf_workbench.ui.pdf_view import PdfView
 
 
-@pytest.fixture(autouse=True)
 def patch_pdf_open(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_open_document(self: PdfView, path: Path) -> None:
         self._path = path
@@ -27,9 +28,11 @@ def create_settings(tmp_path: Path) -> QSettings:
 
 
 def test_main_window_opens_and_closes_multiple_documents(
+    monkeypatch: pytest.MonkeyPatch,
     qtbot: QtBot,
     tmp_path: Path,
 ) -> None:
+    patch_pdf_open(monkeypatch)
     settings = create_settings(tmp_path)
     window = MainWindow(settings)
     qtbot.addWidget(window)
@@ -56,6 +59,7 @@ def test_main_window_requires_confirmation_for_modified_document(
     qtbot: QtBot,
     tmp_path: Path,
 ) -> None:
+    patch_pdf_open(monkeypatch)
     settings = create_settings(tmp_path)
     window = MainWindow(settings)
     qtbot.addWidget(window)
@@ -83,9 +87,11 @@ def test_main_window_requires_confirmation_for_modified_document(
 
 
 def test_main_window_persists_recent_files_and_geometry(
+    monkeypatch: pytest.MonkeyPatch,
     qtbot: QtBot,
     tmp_path: Path,
 ) -> None:
+    patch_pdf_open(monkeypatch)
     settings = create_settings(tmp_path)
     window = MainWindow(settings)
     qtbot.addWidget(window)
@@ -102,3 +108,103 @@ def test_main_window_persists_recent_files_and_geometry(
 
     assert reopened._recent_files[0] == document_path.resolve()
     assert settings.value(MainWindow._GEOMETRY_KEY) is not None
+
+
+def test_main_window_avoids_duplicate_tabs_for_same_document(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    window = MainWindow(settings)
+    qtbot.addWidget(window)
+
+    document_path = tmp_path / "duplicate.pdf"
+    document_path.touch()
+
+    window.open_document(document_path)
+    window.open_document(document_path)
+
+    assert window._tabs.count() == 1
+    assert window._tabs.currentIndex() == 0
+    assert window._recent_files == [document_path.resolve()]
+
+
+def test_main_window_drops_missing_recent_files_from_menu(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    missing_path = tmp_path / "missing.pdf"
+    settings.setValue(
+        MainWindow._RECENT_FILES_KEY,
+        f'["{missing_path}"]',
+    )
+
+    window = MainWindow(settings)
+    qtbot.addWidget(window)
+
+    assert window._recent_files == []
+    assert window.recent_files_menu.actions()[0].isEnabled() is False
+
+
+def test_main_window_accepts_pdf_drag_and_drop(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    window = MainWindow(settings)
+    qtbot.addWidget(window)
+
+    document_path = tmp_path / "drop.pdf"
+    document_path.touch()
+    mime_data = QMimeData()
+    mime_data.setUrls([QUrl.fromLocalFile(str(document_path))])
+
+    drag_event = QDragEnterEvent(
+        QPoint(10, 10),
+        Qt.DropAction.CopyAction,
+        mime_data,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    window.dragEnterEvent(drag_event)
+    assert drag_event.isAccepted()
+
+    drop_event = QDropEvent(
+        QPointF(10, 10),
+        Qt.DropAction.CopyAction,
+        mime_data,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    window.dropEvent(drop_event)
+
+    assert window._tabs.count() == 1
+    assert window._documents[0].session.source_path == document_path.resolve()
+
+
+def test_main_window_opens_real_pdf_document(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    settings = create_settings(tmp_path)
+    window = MainWindow(settings)
+    qtbot.addWidget(window)
+
+    document_path = tmp_path / "real.pdf"
+    writer = PdfWriter()
+    writer.add_blank_page(width=144, height=144)
+    with document_path.open("wb") as output:
+        writer.write(output)
+
+    window.open_document(document_path)
+
+    assert window._tabs.count() == 1
+    assert window._documents[0].session.source_path == document_path.resolve()
+    assert window._documents[0].view.page_count == 1

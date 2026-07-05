@@ -124,8 +124,19 @@ class MainWindow(QMainWindow):
             self.open_document(Path(filename))
 
     def open_document(self, path: Path) -> None:
+        normalized_path = path.expanduser().resolve()
+        existing_index = self._find_document_index(normalized_path)
+        if existing_index is not None:
+            self._tabs.setCurrentIndex(existing_index)
+            self._remember_recent_file(normalized_path)
+            self.statusBar().showMessage(
+                f"{normalized_path.name} はすでに開いています",
+                5000,
+            )
+            return
+
         try:
-            session = DocumentSession(path)
+            session = DocumentSession(normalized_path)
             view = PdfView(self)
             view.open_document(session.source_path)
         except Exception as exc:
@@ -238,6 +249,12 @@ class MainWindow(QMainWindow):
             return None
         return self._documents[index]
 
+    def _find_document_index(self, path: Path) -> int | None:
+        for index, document in enumerate(self._documents):
+            if document.session.source_path == path:
+                return index
+        return None
+
     def _tab_title(self, document: DocumentTab) -> str:
         suffix = " *" if document.session.is_modified else ""
         return f"{document.session.source_path.name}{suffix}"
@@ -287,6 +304,12 @@ class MainWindow(QMainWindow):
     def _refresh_recent_file_actions(self) -> None:
         self.recent_files_menu.clear()
         existing_paths = [path for path in self._recent_files if path.exists()]
+        if existing_paths != self._recent_files:
+            self._recent_files = existing_paths
+            self._settings.setValue(
+                self._RECENT_FILES_KEY,
+                json.dumps([str(item) for item in self._recent_files], ensure_ascii=True),
+            )
         if not existing_paths:
             action = self.recent_files_menu.addAction("最近使ったファイルはありません")
             action.setEnabled(False)
