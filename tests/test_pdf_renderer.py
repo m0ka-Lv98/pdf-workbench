@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 import pytest
@@ -67,6 +68,30 @@ class FailingMetadataBackend(FakeBackend):
         if page_index == 0:
             raise RuntimeError("metadata failure")
         return super().page_metadata(page_index)
+
+
+class BlockingBackend(FakeBackend):
+    def __init__(self, label: str) -> None:
+        super().__init__(label)
+        self.render_started = threading.Event()
+        self.allow_render_to_finish = threading.Event()
+        self.close_call_count = 0
+
+    def render_page(
+        self,
+        page_index: int,
+        logical_zoom: float,
+        rotation: int,
+        device_pixel_ratio: float,
+    ) -> QImage:
+        self.render_started.set()
+        if not self.allow_render_to_finish.wait(timeout=5):
+            raise RuntimeError("test render was not released")
+        return super().render_page(page_index, logical_zoom, rotation, device_pixel_ratio)
+
+    def close(self) -> None:
+        self.close_call_count += 1
+        super().close()
 
 
 def test_render_cache_hits_existing_entry(tmp_path: Path) -> None:
@@ -202,6 +227,51 @@ def test_service_shutdown_returns_bool(qtbot: QtBot) -> None:
     assert service.shutdown() is True
 
 
+def test_render_service_shutdown_timeout_can_be_retried(qtbot: QtBot, tmp_path: Path) -> None:
+    from pdf_workbench.services.pdf_renderer import PdfRenderService as Service
+
+    backend = BlockingBackend("blocking")
+    factory_calls: list[Path] = []
+
+    def factory(path: Path) -> BlockingBackend:
+        factory_calls.append(path)
+        return backend
+
+    service = Service(backend_factory=factory)
+    qtbot.waitUntil(service._thread.isRunning)
+
+    revision = make_revision(tmp_path)
+    document_path = tmp_path / "blocking.pdf"
+    service.open_document("doc-1", document_path, 1, revision)
+
+    qtbot.waitUntil(lambda: "doc-1" in service._worker._documents)
+    service.request_render(
+        RenderRequest(
+            document_id="doc-1",
+            generation=1,
+            page_index=0,
+            logical_zoom=1.0,
+            rotation=0,
+            device_pixel_ratio=1.0,
+            priority=0,
+            revision=revision,
+        )
+    )
+
+    assert backend.render_started.wait(timeout=5) is True
+    assert service.shutdown(timeout_ms=10) is False
+    assert service._thread.isRunning()
+
+    backend.allow_render_to_finish.set()
+    qtbot.waitUntil(lambda: backend.close_call_count == 1)
+
+    assert service.shutdown(timeout_ms=3000) is True
+    assert not service._thread.isRunning()
+    assert service.shutdown(timeout_ms=3000) is True
+    assert backend.close_call_count == 1
+    assert len(factory_calls) == 1
+
+
 def test_render_worker_deduplicates_identical_requests_per_document(tmp_path: Path) -> None:
     cache = RenderImageCache(max_bytes=1024 * 1024)
     backend = FakeBackend("sample")
@@ -230,7 +300,14 @@ def test_render_worker_deduplicates_identical_requests_per_document(tmp_path: Pa
 def test_worker_updates_generation_without_reopening_backend(tmp_path: Path) -> None:
     cache = RenderImageCache(max_bytes=1024 * 1024)
     backend = FakeBackend("sample")
-    worker = PdfRenderWorker(lambda _path: backend, cache)
+    factory_calls = 0
+
+    def factory(_path: Path) -> FakeBackend:
+        nonlocal factory_calls
+        factory_calls += 1
+        return backend
+
+    worker = PdfRenderWorker(factory, cache)
     revision = make_revision(tmp_path)
     path = tmp_path / "sample.pdf"
 
@@ -248,10 +325,88 @@ def test_worker_updates_generation_without_reopening_backend(tmp_path: Path) -> 
         )
     )
     worker.update_document_generation("doc-1", 2, revision)
+    worker.enqueue_render(
+        RenderRequest(
+            document_id="doc-1",
+            generation=1,
+            page_index=0,
+            logical_zoom=1.0,
+            rotation=0,
+            device_pixel_ratio=1.0,
+            priority=0,
+            revision=revision,
+        )
+    )
+    assert len(worker._pending_requests) == 0
+    worker.enqueue_render(
+        RenderRequest(
+            document_id="doc-1",
+            generation=2,
+            page_index=0,
+            logical_zoom=1.0,
+            rotation=0,
+            device_pixel_ratio=1.0,
+            priority=0,
+            revision=revision,
+        )
+    )
+    worker._process_next()
 
     assert backend.closed is False
     assert worker._documents["doc-1"].generation == 2
+    assert backend.render_calls == [0]
+    assert factory_calls == 1
     assert worker._pending_requests == []
+
+
+def test_generation_update_does_not_affect_other_document(tmp_path: Path) -> None:
+    cache = RenderImageCache(max_bytes=1024 * 1024)
+    backends: dict[str, FakeBackend] = {}
+
+    def factory(path: Path) -> FakeBackend:
+        backend = FakeBackend(path.stem)
+        backends[path.stem] = backend
+        return backend
+
+    worker = PdfRenderWorker(factory, cache)
+    revision_a = make_revision(tmp_path, name="a.pdf")
+    revision_b = make_revision(tmp_path, name="b.pdf")
+
+    worker.open_document("doc-a", tmp_path / "a.pdf", 1, revision_a)
+    worker.open_document("doc-b", tmp_path / "b.pdf", 1, revision_b)
+
+    request_a = RenderRequest(
+        document_id="doc-a",
+        generation=1,
+        page_index=0,
+        logical_zoom=1.0,
+        rotation=0,
+        device_pixel_ratio=1.0,
+        priority=0,
+        revision=revision_a,
+    )
+    request_b = RenderRequest(
+        document_id="doc-b",
+        generation=1,
+        page_index=0,
+        logical_zoom=1.0,
+        rotation=0,
+        device_pixel_ratio=1.0,
+        priority=0,
+        revision=revision_b,
+    )
+    worker.enqueue_render(request_a)
+    worker.enqueue_render(request_b)
+
+    worker.update_document_generation("doc-a", 2, revision_a)
+
+    assert all(request.request.document_id == "doc-b" for request in worker._pending_requests)
+    assert worker._documents["doc-b"].generation == 1
+    assert backends["b"].closed is False
+
+    worker._process_next()
+
+    assert backends["b"].render_calls == [0]
 
 
 def test_worker_closes_backend_when_metadata_read_fails(tmp_path: Path) -> None:

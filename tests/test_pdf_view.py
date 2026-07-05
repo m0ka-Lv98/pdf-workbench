@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 from pypdf import PdfWriter
@@ -60,6 +61,54 @@ class FakeRenderService(QObject):
 
     def shutdown(self, timeout_ms: int = 3000) -> None:
         self.shutdown_called = True
+
+
+class RecordingBackend:
+    def __init__(self) -> None:
+        self.render_calls: list[tuple[int, float, int, float]] = []
+        self.close_call_count = 0
+        self.operation_thread_ids: list[int] = []
+        self.metadata_thread_ids: list[int] = []
+        self.render_started = threading.Event()
+
+    def page_count(self) -> int:
+        self.operation_thread_ids.append(threading.get_ident())
+        return 1
+
+    def page_metadata(self, page_index: int) -> PageMetadata:
+        self.metadata_thread_ids.append(threading.get_ident())
+        return PageMetadata(144.0, 200.0)
+
+    def render_page(
+        self,
+        page_index: int,
+        logical_zoom: float,
+        rotation: int,
+        device_pixel_ratio: float,
+    ) -> QImage:
+        self.operation_thread_ids.append(threading.get_ident())
+        self.render_calls.append((page_index, logical_zoom, rotation, device_pixel_ratio))
+        self.render_started.set()
+        image = QImage(144, 200, QImage.Format.Format_ARGB32)
+        image.fill(0xFFFFFFFF)
+        image.setDevicePixelRatio(device_pixel_ratio)
+        return image
+
+    def close(self) -> None:
+        self.operation_thread_ids.append(threading.get_ident())
+        self.close_call_count += 1
+
+
+def create_recording_service() -> tuple[PdfRenderService, RecordingBackend, list[Path]]:
+    backend = RecordingBackend()
+    factory_calls: list[Path] = []
+
+    def factory(path: Path) -> RecordingBackend:
+        factory_calls.append(path)
+        return backend
+
+    service = PdfRenderService(backend_factory=factory)
+    return service, backend, factory_calls
 
 
 def create_pdf(path: Path, page_count: int) -> Path:
@@ -285,3 +334,51 @@ def test_real_render_service_shuts_down_without_thread_leak(qtbot: QtBot) -> Non
     qtbot.waitUntil(lambda: not service._thread.isRunning())
 
     assert not service._thread.isRunning()
+
+
+def test_real_render_service_rerenders_after_zoom_change(qtbot: QtBot, tmp_path: Path) -> None:
+    document_path = create_pdf(tmp_path / "zoom-real.pdf", 1)
+    service, backend, factory_calls = create_recording_service()
+    view = PdfView(render_service=service, debounce_interval_ms=0)
+    wrapper = show_view(qtbot, view)
+
+    view.open_document(document_path)
+    qtbot.waitUntil(lambda: len(backend.render_calls) >= 1)
+
+    view.set_zoom(2.0)
+    qtbot.waitUntil(lambda: len(backend.render_calls) >= 2)
+
+    assert backend.render_calls[-1] == (0, 2.0, 0, 1.0)
+    assert len(factory_calls) == 1
+    assert backend.close_call_count == 0
+    assert threading.get_ident() not in backend.operation_thread_ids
+
+    service.shutdown()
+    qtbot.waitUntil(lambda: not service._thread.isRunning())
+    assert not service._thread.isRunning()
+    assert wrapper.isVisible()
+
+
+def test_real_render_service_rerenders_after_rotation_change(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    document_path = create_pdf(tmp_path / "rotation-real.pdf", 1)
+    service, backend, factory_calls = create_recording_service()
+    view = PdfView(render_service=service, debounce_interval_ms=0)
+    wrapper = show_view(qtbot, view)
+
+    view.open_document(document_path)
+    qtbot.waitUntil(lambda: len(backend.render_calls) >= 1)
+
+    view.set_rotation(90)
+    qtbot.waitUntil(lambda: len(backend.render_calls) >= 2)
+
+    assert backend.render_calls[-1] == (0, 1.5, 90, 1.0)
+    assert len(factory_calls) == 1
+    assert backend.close_call_count == 0
+
+    service.shutdown()
+    qtbot.waitUntil(lambda: not service._thread.isRunning())
+    assert not service._thread.isRunning()
+    assert wrapper.isVisible()

@@ -523,7 +523,7 @@ class PdfRenderService(QObject):
         self._update_generation_requested.connect(self._worker.update_document_generation)
         self._shutdown_requested.connect(self._worker.shutdown)
         self._thread.start()
-        self._is_shutdown = False
+        self._shutdown_requested_once = False
 
     def open_document(
         self,
@@ -532,17 +532,17 @@ class PdfRenderService(QObject):
         generation: int,
         revision: DocumentRevision,
     ) -> None:
-        if self._is_shutdown:
+        if self._shutdown_requested_once or not self._thread.isRunning():
             return
         self._open_requested.emit(document_id, path, generation, revision)
 
     def request_render(self, request: RenderRequest) -> None:
-        if self._is_shutdown:
+        if self._shutdown_requested_once or not self._thread.isRunning():
             return
         self._render_requested.emit(request)
 
     def close_document(self, document_id: str, generation: int) -> None:
-        if self._is_shutdown:
+        if self._shutdown_requested_once or not self._thread.isRunning():
             return
         self._close_requested.emit(document_id, generation)
 
@@ -552,17 +552,16 @@ class PdfRenderService(QObject):
         generation: int,
         revision: DocumentRevision,
     ) -> None:
-        if self._is_shutdown:
+        if self._shutdown_requested_once or not self._thread.isRunning():
             return
         self._update_generation_requested.emit(document_id, generation, revision)
 
     def shutdown(self, timeout_ms: int = 3000) -> bool:
-        if self._is_shutdown:
-            return True
-        self._is_shutdown = True
         if not self._thread.isRunning():
             return True
-        self._shutdown_requested.emit()
+        if not self._shutdown_requested_once:
+            self._shutdown_requested_once = True
+            self._shutdown_requested.emit()
         if not self._thread.wait(timeout_ms):
             logger.warning("Timed out while waiting for PdfRenderService worker thread shutdown")
             return False
