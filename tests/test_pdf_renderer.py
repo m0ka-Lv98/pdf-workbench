@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 from PySide6.QtGui import QImage
+from pytestqt.qtbot import QtBot
 
 from pdf_workbench.services.pdf_renderer import (
     DocumentMetadata,
@@ -59,6 +60,13 @@ class FakeBackend:
 
     def close(self) -> None:
         self.closed = True
+
+
+class FailingMetadataBackend(FakeBackend):
+    def page_metadata(self, page_index: int) -> PageMetadata:
+        if page_index == 0:
+            raise RuntimeError("metadata failure")
+        return super().page_metadata(page_index)
 
 
 def test_render_cache_hits_existing_entry(tmp_path: Path) -> None:
@@ -184,6 +192,16 @@ def test_render_worker_closes_only_target_document_and_keeps_others(tmp_path: Pa
     assert backends["b"].render_calls == [0]
 
 
+def test_service_shutdown_returns_bool(qtbot: QtBot) -> None:
+    from pdf_workbench.services.pdf_renderer import PdfRenderService as Service
+
+    service = Service()
+    qtbot.waitUntil(service._thread.isRunning)
+
+    assert service.shutdown() is True
+    assert service.shutdown() is True
+
+
 def test_render_worker_deduplicates_identical_requests_per_document(tmp_path: Path) -> None:
     cache = RenderImageCache(max_bytes=1024 * 1024)
     backend = FakeBackend("sample")
@@ -207,3 +225,43 @@ def test_render_worker_deduplicates_identical_requests_per_document(tmp_path: Pa
     worker.enqueue_render(request)
 
     assert len(worker._pending_requests) == 1
+
+
+def test_worker_updates_generation_without_reopening_backend(tmp_path: Path) -> None:
+    cache = RenderImageCache(max_bytes=1024 * 1024)
+    backend = FakeBackend("sample")
+    worker = PdfRenderWorker(lambda _path: backend, cache)
+    revision = make_revision(tmp_path)
+    path = tmp_path / "sample.pdf"
+
+    worker.open_document("doc-1", path, 1, revision)
+    worker.enqueue_render(
+        RenderRequest(
+            document_id="doc-1",
+            generation=1,
+            page_index=0,
+            logical_zoom=1.0,
+            rotation=0,
+            device_pixel_ratio=1.0,
+            priority=0,
+            revision=revision,
+        )
+    )
+    worker.update_document_generation("doc-1", 2, revision)
+
+    assert backend.closed is False
+    assert worker._documents["doc-1"].generation == 2
+    assert worker._pending_requests == []
+
+
+def test_worker_closes_backend_when_metadata_read_fails(tmp_path: Path) -> None:
+    cache = RenderImageCache(max_bytes=1024 * 1024)
+    backend = FailingMetadataBackend("broken")
+    worker = PdfRenderWorker(lambda _path: backend, cache)
+    revision = make_revision(tmp_path)
+    path = tmp_path / "broken.pdf"
+
+    worker.open_document("doc-err", path, 1, revision)
+
+    assert backend.closed is True
+    assert "doc-err" not in worker._documents

@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from pypdf import PdfWriter
 from PySide6.QtCore import QMimeData, QPoint, QPointF, QSettings, Qt, QUrl
-from PySide6.QtGui import QDragEnterEvent, QDropEvent
+from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import QMessageBox
 from pytestqt.qtbot import QtBot
 
@@ -235,3 +235,24 @@ def test_main_window_shares_one_render_service_across_tabs(
 
     assert window._documents[0].view._render_service is window._render_service
     assert window._documents[1].view._render_service is window._render_service
+
+
+def test_main_window_keeps_open_when_render_service_shutdown_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    window = MainWindow(settings)
+    qtbot.addWidget(window)
+
+    monkeypatch.setattr(window._render_service, "shutdown", lambda timeout_ms=3000: False)
+
+    event = QCloseEvent()
+    window.closeEvent(event)
+
+    assert event.isAccepted() is False
+    monkeypatch.undo()
+    window._render_service._thread.quit()
+    assert window._render_service._thread.wait(5000) is True

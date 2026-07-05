@@ -138,6 +138,13 @@ class PdfRenderServiceProtocol(Protocol):
 
     def close_document(self, document_id: str, generation: int) -> None: ...
 
+    def update_document_generation(
+        self,
+        document_id: str,
+        generation: int,
+        revision: DocumentRevision,
+    ) -> None: ...
+
 
 class PdfiumDocumentBackend:
     def __init__(self, path: Path) -> None:
@@ -266,10 +273,16 @@ class PdfRenderWorker(QObject):
         self._close_document_backend(document_id)
         self._drop_pending_for_document(document_id)
 
+        backend: PdfDocumentBackend | None = None
         try:
             backend = self._backend_factory(path)
             pages = tuple(backend.page_metadata(index) for index in range(backend.page_count()))
         except Exception as exc:
+            if backend is not None:
+                try:
+                    backend.close()
+                except Exception:
+                    logger.exception("Failed to close backend after document open failure")
             self.document_failed.emit(document_id, generation, str(exc))
             return
 
@@ -330,6 +343,29 @@ class PdfRenderWorker(QObject):
             return
         self._drop_pending_for_document(document_id)
         self._close_document_backend(document_id)
+
+    @Slot(str, int, object)
+    def update_document_generation(
+        self,
+        document_id: str,
+        generation: int,
+        revision: object,
+    ) -> None:
+        if self._shutting_down:
+            return
+        if not isinstance(revision, DocumentRevision):
+            raise TypeError("revision must be DocumentRevision")
+
+        context = self._documents.get(document_id)
+        if context is None:
+            return
+        if context.revision != revision:
+            return
+        if generation < context.generation:
+            return
+
+        self._drop_pending_for_document(document_id)
+        context.generation = generation
 
     @Slot()
     def shutdown(self) -> None:
@@ -456,6 +492,7 @@ class PdfRenderService(QObject):
     _open_requested = Signal(str, Path, int, object)
     _render_requested = Signal(object)
     _close_requested = Signal(str, int)
+    _update_generation_requested = Signal(str, int, object)
     _shutdown_requested = Signal()
 
     def __init__(
@@ -476,14 +513,15 @@ class PdfRenderService(QObject):
         self._worker.document_failed.connect(self.document_failed)
         self._worker.render_succeeded.connect(self.render_succeeded)
         self._worker.render_failed.connect(self.render_failed)
-        self._worker.shutdown_completed.connect(self._thread.quit)
+        self._worker.shutdown_completed.connect(
+            self._thread.quit,
+            Qt.ConnectionType.DirectConnection,
+        )
         self._open_requested.connect(self._worker.open_document)
         self._render_requested.connect(self._worker.enqueue_render)
         self._close_requested.connect(self._worker.close_document)
-        self._shutdown_requested.connect(
-            self._worker.shutdown,
-            Qt.ConnectionType.BlockingQueuedConnection,
-        )
+        self._update_generation_requested.connect(self._worker.update_document_generation)
+        self._shutdown_requested.connect(self._worker.shutdown)
         self._thread.start()
         self._is_shutdown = False
 
@@ -508,12 +546,24 @@ class PdfRenderService(QObject):
             return
         self._close_requested.emit(document_id, generation)
 
-    def shutdown(self, timeout_ms: int = 3000) -> None:
+    def update_document_generation(
+        self,
+        document_id: str,
+        generation: int,
+        revision: DocumentRevision,
+    ) -> None:
         if self._is_shutdown:
             return
+        self._update_generation_requested.emit(document_id, generation, revision)
+
+    def shutdown(self, timeout_ms: int = 3000) -> bool:
+        if self._is_shutdown:
+            return True
         self._is_shutdown = True
         if not self._thread.isRunning():
-            return
+            return True
         self._shutdown_requested.emit()
         if not self._thread.wait(timeout_ms):
             logger.warning("Timed out while waiting for PdfRenderService worker thread shutdown")
+            return False
+        return True

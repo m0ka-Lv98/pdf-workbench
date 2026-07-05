@@ -31,6 +31,7 @@ class FakeRenderService(QObject):
         self.open_calls: list[tuple[str, Path, int, DocumentRevision]] = []
         self.render_requests: list[RenderRequest] = []
         self.close_calls: list[tuple[str, int]] = []
+        self.generation_updates: list[tuple[str, int, DocumentRevision]] = []
         self.shutdown_called = False
 
     def open_document(
@@ -48,6 +49,14 @@ class FakeRenderService(QObject):
 
     def close_document(self, document_id: str, generation: int) -> None:
         self.close_calls.append((document_id, generation))
+
+    def update_document_generation(
+        self,
+        document_id: str,
+        generation: int,
+        revision: DocumentRevision,
+    ) -> None:
+        self.generation_updates.append((document_id, generation, revision))
 
     def shutdown(self, timeout_ms: int = 3000) -> None:
         self.shutdown_called = True
@@ -166,6 +175,7 @@ def test_zoom_change_discards_old_generation_results(
     stale_request = service.render_requests[0]
 
     view.set_zoom(2.0)
+    assert service.generation_updates[-1][1] == 2
     view._request_visible_pages()
     fresh_request = service.render_requests[-1]
 
@@ -174,6 +184,27 @@ def test_zoom_change_discards_old_generation_results(
 
     service.render_succeeded.emit(make_render_result(fresh_request))
     assert view._canvas.pages[fresh_request.page_index].state == PlaceholderState.DISPLAYED
+
+
+def test_rotation_change_notifies_worker_generation(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    document_path = create_pdf(tmp_path / "rotation.pdf", 3)
+    service = FakeRenderService(create_metadata(document_path, 3))
+    view = PdfView(render_service=service, debounce_interval_ms=0)
+    _wrapper = show_view(qtbot, view)
+
+    view.open_document(document_path)
+    qtbot.waitUntil(lambda: view.page_count == 3)
+    qtbot.waitUntil(
+        lambda: view._canvas.pages[-1].geometry().top() > view._canvas.pages[0].geometry().top()
+    )
+
+    view.set_rotation(90)
+
+    assert service.generation_updates[-1][1] == 2
+    assert service.generation_updates[-1][0] == view._document_id
 
 
 def test_fast_scroll_does_not_apply_old_offscreen_result(

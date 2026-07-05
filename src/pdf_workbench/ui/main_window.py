@@ -234,7 +234,11 @@ class MainWindow(QMainWindow):
             if not self.close_document_at(index):
                 event.ignore()
                 return
-        self._render_service.shutdown()
+        shutdown_succeeded = self._render_service.shutdown()
+        if not shutdown_succeeded:
+            self.statusBar().showMessage("PDFレンダラーの終了を待ち切れませんでした", 5000)
+            event.ignore()
+            return
         self._save_window_state()
         event.accept()
 

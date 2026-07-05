@@ -247,6 +247,15 @@ class PdfView(QWidget):
             revision,
         )
 
+    def _advance_render_generation(self) -> None:
+        self._generation += 1
+        if self._metadata is not None:
+            self._render_service.update_document_generation(
+                self._document_id,
+                self._generation,
+                self._metadata.revision,
+            )
+
     def set_page(self, page_index: int) -> None:
         if self._metadata is None:
             return
@@ -261,7 +270,8 @@ class PdfView(QWidget):
             self._logical_zoom = max(0.25, min(scale, 5.0))
             return
         self._logical_zoom = max(0.25, min(scale, 5.0))
-        self._bump_generation()
+        self._desired_pages.clear()
+        self._advance_render_generation()
         for index, page in enumerate(self._canvas.pages):
             page.configure(self._metadata.pages[index], self._logical_zoom)
             page.clear_pixmap("待機中")
@@ -276,7 +286,8 @@ class PdfView(QWidget):
         self._rotation = normalized
         if self._metadata is None:
             return
-        self._bump_generation()
+        self._desired_pages.clear()
+        self._advance_render_generation()
         for page in self._canvas.pages:
             page.clear_pixmap("待機中")
         self._content.adjustSize()
