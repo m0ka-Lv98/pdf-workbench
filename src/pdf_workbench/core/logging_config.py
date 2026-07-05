@@ -3,13 +3,11 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from platformdirs import user_log_dir
+from pdf_workbench.core.app_paths import ensure_app_directories
 
 
 def configure_logging() -> Path:
-    log_dir = Path(user_log_dir("PDF Workbench", "m0ka-Lv98"))
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / "pdf-workbench.log"
+    log_path = ensure_app_directories().log_dir / "pdf-workbench.log"
 
     logging.basicConfig(
         level=logging.INFO,
