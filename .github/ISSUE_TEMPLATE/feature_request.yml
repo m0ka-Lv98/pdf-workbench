@@ -1,0 +1,21 @@
+name: Feature request
+description: 新しい機能または改善を提案する
+title: "[Feature]: "
+labels: ["type:feature"]
+body:
+  - type: textarea
+    id: usecase
+    attributes:
+      label: 利用場面
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 提案内容
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 受け入れ条件

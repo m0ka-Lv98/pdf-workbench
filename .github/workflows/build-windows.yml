@@ -1,0 +1,47 @@
+name: Build Windows executable
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build-onedir:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - run: uv sync --extra dev --frozen
+      - run: uv run pyinstaller packaging/pdf_workbench_onedir.spec --noconfirm --clean
+      - name: Smoke test CLI version
+        shell: pwsh
+        run: '& ".\dist\PDF Workbench\PDF Workbench.exe" --version'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pdf-workbench-windows-onedir
+          path: dist/PDF Workbench/
+          if-no-files-found: error
+
+  build-onefile-experimental:
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - run: uv sync --extra dev --frozen
+      - run: uv run pyinstaller packaging/pdf_workbench_onefile.spec --noconfirm --clean
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pdf-workbench-windows-onefile-experimental
+          path: dist/PDF Workbench.exe
+          if-no-files-found: error
