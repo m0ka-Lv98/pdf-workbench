@@ -1,0 +1,83 @@
+name: Build macOS application
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/build-macos.yml"
+      - "packaging/pdf_workbench_macos.spec"
+      - "src/**"
+      - "pyproject.toml"
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            architecture: arm64
+            artifact_name: pdf-workbench-macos-arm64
+            archive_name: PDF-Workbench-macOS-arm64.zip
+          - runner: macos-15-intel
+            architecture: x86_64
+            artifact_name: pdf-workbench-macos-x86_64
+            archive_name: PDF-Workbench-macOS-x86_64.zip
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev]"
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: mypy src/pdf_workbench
+      - run: pytest --cov=pdf_workbench
+      - name: Build macOS app
+        run: pyinstaller packaging/pdf_workbench_macos.spec --noconfirm --clean
+      - name: Verify app bundle structure
+        run: |
+          test -d "dist/PDF Workbench.app"
+          test -f "dist/PDF Workbench.app/Contents/Info.plist"
+          test -x "dist/PDF Workbench.app/Contents/MacOS/PDF Workbench"
+      - name: Verify app architecture
+        run: |
+          actual_architecture=$(uname -m)
+          file "dist/PDF Workbench.app/Contents/MacOS/PDF Workbench"
+          lipo -archs "dist/PDF Workbench.app/Contents/MacOS/PDF Workbench"
+          case "${{ matrix.architecture }}" in
+            arm64)
+              test "$actual_architecture" = "arm64"
+              lipo -archs "dist/PDF Workbench.app/Contents/MacOS/PDF Workbench" | grep -q 'arm64'
+              ;;
+            x86_64)
+              test "$actual_architecture" = "x86_64"
+              lipo -archs "dist/PDF Workbench.app/Contents/MacOS/PDF Workbench" | grep -q 'x86_64'
+              ;;
+            *)
+              echo "Unsupported architecture: ${{ matrix.architecture }}"
+              exit 1
+              ;;
+          esac
+      - name: Smoke test CLI version
+        run: '"dist/PDF Workbench.app/Contents/MacOS/PDF Workbench" --version'
+      - name: Package app bundle
+        run: |
+          mkdir -p artifacts
+          ditto -c -k --sequesterRsrc --keepParent \
+            "dist/PDF Workbench.app" \
+            "artifacts/${{ matrix.archive_name }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: artifacts/${{ matrix.archive_name }}
+          if-no-files-found: error

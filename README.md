@@ -11,6 +11,7 @@ Acrobat Proの全機能再現ではなく、日常的に使う閲覧・ページ
 - PDF表示とPDF書き換えのエンジンを分離する
 - Windows向け配布物はPyInstallerで作る
 - 初期リリースは安定性を優先して`onedir`、`onefile`は実験的ターゲットとする
+- macOS向けにはGitHub Actionsでarm64/x86_64の`.app`配布物を生成する
 
 ## 技術スタック
 
@@ -100,6 +101,17 @@ pyinstaller packaging/pdf_workbench_onefile.spec --noconfirm --clean
 ```
 
 出力先は`dist/`です。GitHub Actionsの`Build Windows executable`からも生成できます。Windows EXEはWindowsランナー上でのみ生成します。
+
+## macOSアプリ
+
+GitHub Actionsの`Build macOS application`で、Apple Silicon用とIntel Mac用の`.app` ZIPを生成できます。
+
+配布物名:
+
+- `PDF-Workbench-macOS-arm64.zip`
+- `PDF-Workbench-macOS-x86_64.zip`
+
+展開後は`PDF Workbench.app`が得られます。個人検証用のad-hoc署名ビルドで、notarizationは行いません。
 
 ## GitHubリポジトリの初期化
 

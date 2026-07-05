@@ -34,6 +34,8 @@ OCRmyPDFはPythonパッケージ以外にもTesseract等の外部依存を必要
 
 macOS と Windows は開発・検証対象とする。Ubuntu は GUI 配布対象ではなく、移植性と単体テスト検証の対象とする。最終配布物の検証と PyInstaller の EXE 生成は Windows で行う。
 
+macOS では GitHub Actions で arm64 / x86_64 の `.app` ZIP を生成し、個人検証用にダウンロードして起動できる配布物を作る。
+
 ## 起動
 
 ```bash
