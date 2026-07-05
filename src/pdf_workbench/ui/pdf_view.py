@@ -5,10 +5,11 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QCloseEvent, QColor, QPainter, QPaintEvent, QPixmap
 from PySide6.QtWidgets import QFrame, QLabel, QScrollArea, QSizePolicy, QVBoxLayout, QWidget
 
+from pdf_workbench.services.page_coordinates import PageCoordinateMapper, PageGeometry, PdfRect
 from pdf_workbench.services.pdf_renderer import (
     DocumentMetadata,
     DocumentRevision,
@@ -37,6 +38,8 @@ class PagePlaceholder(QFrame):
         self._state = PlaceholderState.NOT_REQUESTED
         self._metadata = PageMetadata(595.0, 842.0)
         self._logical_zoom = 1.5
+        self._rotation = 0
+        self._device_pixel_ratio = 1.0
         self._pixmap: QPixmap | None = None
         self._message = f"Page {page_index + 1}"
         self.setFrameShape(QFrame.Shape.Box)
@@ -48,9 +51,17 @@ class PagePlaceholder(QFrame):
     def state(self) -> PlaceholderState:
         return self._state
 
-    def configure(self, metadata: PageMetadata, logical_zoom: float) -> None:
+    def configure(
+        self,
+        metadata: PageMetadata,
+        logical_zoom: float,
+        rotation: int,
+        device_pixel_ratio: float,
+    ) -> None:
         self._metadata = metadata
         self._logical_zoom = logical_zoom
+        self._rotation = rotation
+        self._device_pixel_ratio = device_pixel_ratio
         self._update_size()
 
     def set_state(self, state: PlaceholderState, message: str | None = None) -> None:
@@ -71,9 +82,42 @@ class PagePlaceholder(QFrame):
         self.update()
 
     def sizeHint(self) -> QSize:
-        width = max(200, round(self._metadata.width_points * self._logical_zoom))
-        height = max(200, round(self._metadata.height_points * self._logical_zoom))
+        content_rect = self._content_rect()
+        width = max(200, round(content_rect.width()))
+        height = max(200, round(content_rect.height()))
         return QSize(width, height)
+
+    def _content_rect(self) -> QRectF:
+        geometry = self._metadata.geometry
+        if geometry is None:
+            geometry = PageGeometry(
+                media_box=PdfRect(
+                    0.0,
+                    0.0,
+                    self._metadata.width_points,
+                    self._metadata.height_points,
+                ),
+                crop_box=PdfRect(
+                    0.0,
+                    0.0,
+                    self._metadata.width_points,
+                    self._metadata.height_points,
+                ),
+                visible_box=PdfRect(
+                    0.0,
+                    0.0,
+                    self._metadata.width_points,
+                    self._metadata.height_points,
+                ),
+                intrinsic_rotation=0,
+            )
+        mapper = PageCoordinateMapper(
+            geometry=geometry,
+            additional_rotation=self._rotation,
+            logical_zoom=self._logical_zoom,
+            device_pixel_ratio=self._device_pixel_ratio,
+        )
+        return QRectF(0.0, 0.0, mapper.view_size.width(), mapper.view_size.height())
 
     def _update_size(self) -> None:
         hint = self.sizeHint()
@@ -273,7 +317,12 @@ class PdfView(QWidget):
         self._desired_pages.clear()
         self._advance_render_generation()
         for index, page in enumerate(self._canvas.pages):
-            page.configure(self._metadata.pages[index], self._logical_zoom)
+            page.configure(
+                self._metadata.pages[index],
+                self._logical_zoom,
+                self._rotation,
+                self.devicePixelRatioF(),
+            )
             page.clear_pixmap("待機中")
         self._content.adjustSize()
         self._schedule_visible_page_update()
@@ -288,7 +337,13 @@ class PdfView(QWidget):
             return
         self._desired_pages.clear()
         self._advance_render_generation()
-        for page in self._canvas.pages:
+        for index, page in enumerate(self._canvas.pages):
+            page.configure(
+                self._metadata.pages[index],
+                self._logical_zoom,
+                self._rotation,
+                self.devicePixelRatioF(),
+            )
             page.clear_pixmap("待機中")
         self._content.adjustSize()
         self._schedule_visible_page_update()
@@ -340,7 +395,12 @@ class PdfView(QWidget):
         self._metadata = metadata
         pages = [PagePlaceholder(index, self._canvas) for index in range(metadata.page_count)]
         for index, page in enumerate(pages):
-            page.configure(metadata.pages[index], self._logical_zoom)
+            page.configure(
+                metadata.pages[index],
+                self._logical_zoom,
+                self._rotation,
+                self.devicePixelRatioF(),
+            )
         self._canvas.set_pages(pages)
         self._status_label.hide()
         self._canvas.show()
@@ -474,7 +534,7 @@ class PdfView(QWidget):
         viewport_bottom = scroll_value + viewport_height
         visible: list[int] = []
         for page in self._canvas.pages:
-            rect = page.geometry()
+            rect = self.page_content_rect(page.page_index)
             page_top = rect.top()
             page_bottom = rect.bottom()
             if page_bottom >= viewport_top and page_top <= viewport_bottom:
@@ -491,10 +551,10 @@ class PdfView(QWidget):
         viewport_bottom = scroll_value + viewport_height
         viewport_center_y = scroll_value + (viewport_height // 2)
         best_page = self._current_page_index
-        best_area = -1
-        best_center_distance = 10**9
+        best_area = -1.0
+        best_center_distance = 1_000_000_000.0
         for page in self._canvas.pages:
-            rect = page.geometry()
+            rect = self.page_content_rect(page.page_index)
             overlap_top = max(viewport_top, rect.top())
             overlap_bottom = min(viewport_bottom, rect.bottom())
             overlap_height = overlap_bottom - overlap_top
@@ -511,8 +571,16 @@ class PdfView(QWidget):
     def _scroll_to_page(self, page_index: int) -> None:
         if not 0 <= page_index < len(self._canvas.pages):
             return
+        self._scroll_area.verticalScrollBar().setValue(
+            round(self.page_content_rect(page_index).top())
+        )
+
+    def page_content_rect(self, page_index: int) -> QRectF:
+        if self._metadata is None:
+            return QRectF()
         page = self._canvas.pages[page_index]
-        self._scroll_area.verticalScrollBar().setValue(page.geometry().top())
+        rect = page.geometry()
+        return QRectF(rect)
 
     def _bump_generation(self) -> None:
         self._generation += 1

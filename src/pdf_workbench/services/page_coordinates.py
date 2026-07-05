@@ -1,24 +1,32 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, cast
+
+from PySide6.QtCore import QPointF, QRectF, QSizeF
+from PySide6.QtGui import QPolygonF
 
 
-def _require_finite(name: str, value: float) -> float:
-    if not math.isfinite(value):
+def _require_finite_number(name: str, value: float) -> float:
+    numeric_value = float(value)
+    if not math.isfinite(numeric_value):
         raise ValueError(f"{name} must be finite")
-    return float(value)
+    return numeric_value
+
+
+def _require_positive_finite(name: str, value: float) -> float:
+    numeric_value = _require_finite_number(name, value)
+    if numeric_value <= 0:
+        raise ValueError(f"{name} must be greater than zero")
+    return numeric_value
 
 
 def _normalize_rotation(rotation: int) -> int:
-    if rotation % 90 != 0:
-        raise ValueError("rotation must be a multiple of 90 degrees")
-    normalized = rotation % 360
-    if normalized not in {0, 90, 180, 270}:
+    if rotation not in {0, 90, 180, 270}:
         raise ValueError("rotation must be one of 0, 90, 180, 270")
-    return normalized
+    return rotation
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,11 +35,14 @@ class PdfPoint:
     y: float
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "x", _require_finite("x", self.x))
-        object.__setattr__(self, "y", _require_finite("y", self.y))
+        object.__setattr__(self, "x", _require_finite_number("x", self.x))
+        object.__setattr__(self, "y", _require_finite_number("y", self.y))
 
     def as_tuple(self) -> tuple[float, float]:
         return self.x, self.y
+
+    def to_qpointf(self) -> QPointF:
+        return QPointF(self.x, self.y)
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,34 +53,30 @@ class PdfRect:
     top: float
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "left", _require_finite("left", self.left))
-        object.__setattr__(self, "bottom", _require_finite("bottom", self.bottom))
-        object.__setattr__(self, "right", _require_finite("right", self.right))
-        object.__setattr__(self, "top", _require_finite("top", self.top))
+        object.__setattr__(self, "left", _require_finite_number("left", self.left))
+        object.__setattr__(self, "bottom", _require_finite_number("bottom", self.bottom))
+        object.__setattr__(self, "right", _require_finite_number("right", self.right))
+        object.__setattr__(self, "top", _require_finite_number("top", self.top))
         if self.right <= self.left:
             raise ValueError("right must be greater than left")
         if self.top <= self.bottom:
             raise ValueError("top must be greater than bottom")
 
     @classmethod
-    def from_tuple(cls, values: Iterable[float]) -> PdfRect:
-        left, bottom, right, top = tuple(values)
+    def from_tuple(cls, values: tuple[float, float, float, float]) -> PdfRect:
+        left, bottom, right, top = values
         return cls(left=left, bottom=bottom, right=right, top=top)
 
     @classmethod
-    def normalized(cls, values: Iterable[float]) -> PdfRect:
-        left, bottom, right, top = tuple(values)
-        if not all(math.isfinite(value) for value in (left, bottom, right, top)):
+    def normalized(cls, values: tuple[float, float, float, float]) -> PdfRect:
+        left, bottom, right, top = values
+        if not all(math.isfinite(float(value)) for value in values):
             raise ValueError("rect values must be finite")
-        normalized_left = min(left, right)
-        normalized_right = max(left, right)
-        normalized_bottom = min(bottom, top)
-        normalized_top = max(bottom, top)
         return cls(
-            left=normalized_left,
-            bottom=normalized_bottom,
-            right=normalized_right,
-            top=normalized_top,
+            left=min(left, right),
+            bottom=min(bottom, top),
+            right=max(left, right),
+            top=max(bottom, top),
         )
 
     @property
@@ -100,6 +107,9 @@ class PdfRect:
     def top_right(self) -> PdfPoint:
         return PdfPoint(self.right, self.top)
 
+    def corners(self) -> tuple[PdfPoint, PdfPoint, PdfPoint, PdfPoint]:
+        return self.bottom_left, self.bottom_right, self.top_right, self.top_left
+
     def intersection(self, other: PdfRect) -> PdfRect | None:
         left = max(self.left, other.left)
         bottom = max(self.bottom, other.bottom)
@@ -112,8 +122,8 @@ class PdfRect:
     def as_tuple(self) -> tuple[float, float, float, float]:
         return self.left, self.bottom, self.right, self.top
 
-    def corners(self) -> tuple[PdfPoint, PdfPoint, PdfPoint, PdfPoint]:
-        return (self.bottom_left, self.bottom_right, self.top_right, self.top_left)
+    def to_qrectf(self) -> QRectF:
+        return QRectF(self.left, self.bottom, self.width, self.height)
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,14 +138,12 @@ class PageGeometry:
 
     @classmethod
     def from_pdfium_page(cls, page: _PdfiumPageProtocol) -> PageGeometry:
-        mediabox = PdfRect.normalized(page.get_mediabox())
-        cropbox = PdfRect.normalized(page.get_cropbox())
-        visible_box = cropbox.intersection(mediabox)
-        if visible_box is None:
-            raise ValueError("crop box must intersect media box")
+        media_box = PdfRect.normalized(_as_rect_tuple(page.get_mediabox(fallback_ok=True)))
+        crop_box = PdfRect.normalized(_as_rect_tuple(page.get_cropbox(fallback_ok=True)))
+        visible_box = PdfRect.normalized(_as_rect_tuple(page.get_bbox()))
         return cls(
-            media_box=mediabox,
-            crop_box=cropbox,
+            media_box=media_box,
+            crop_box=crop_box,
             visible_box=visible_box,
             intrinsic_rotation=_normalize_rotation(page.get_rotation()),
         )
@@ -149,91 +157,104 @@ class PageCoordinateMapper:
     device_pixel_ratio: float
 
     def __post_init__(self) -> None:
-        if self.logical_zoom <= 0:
-            raise ValueError("logical_zoom must be positive")
-        if self.device_pixel_ratio <= 0:
-            raise ValueError("device_pixel_ratio must be positive")
-        normalized_rotation = _normalize_rotation(self.additional_rotation)
-        object.__setattr__(self, "additional_rotation", normalized_rotation)
+        object.__setattr__(
+            self,
+            "additional_rotation",
+            _normalize_rotation(self.additional_rotation),
+        )
+        object.__setattr__(
+            self,
+            "logical_zoom",
+            _require_positive_finite("logical_zoom", self.logical_zoom),
+        )
+        object.__setattr__(
+            self,
+            "device_pixel_ratio",
+            _require_positive_finite("device_pixel_ratio", self.device_pixel_ratio),
+        )
 
     @property
     def effective_rotation(self) -> int:
         return (self.geometry.intrinsic_rotation + self.additional_rotation) % 360
 
     @property
-    def view_scale(self) -> float:
-        return self.logical_zoom
+    def view_size(self) -> QSizeF:
+        width, height = self._unscaled_dimensions()
+        return QSizeF(width * self.logical_zoom, height * self.logical_zoom)
 
     @property
-    def device_scale(self) -> float:
-        return self.logical_zoom * self.device_pixel_ratio
+    def device_size(self) -> QSizeF:
+        width, height = self._unscaled_dimensions()
+        scale = self.logical_zoom * self.device_pixel_ratio
+        return QSizeF(width * scale, height * scale)
 
-    @property
-    def _local_width(self) -> float:
-        return self.geometry.visible_box.width
-
-    @property
-    def _local_height(self) -> float:
-        return self.geometry.visible_box.height
-
-    def pdf_to_view_point(self, point: PdfPoint) -> PdfPoint:
+    def pdf_to_view_point(self, point: PdfPoint) -> QPointF:
         x0, y0 = self._local_coordinates(point)
-        view_x, view_y = self._rotate_local_point(x0, y0)
-        return PdfPoint(view_x * self.view_scale, view_y * self.view_scale)
+        rotated_x, rotated_y = self._rotate_local_point(x0, y0)
+        return QPointF(rotated_x * self.logical_zoom, rotated_y * self.logical_zoom)
 
-    def view_to_pdf_point(self, point: PdfPoint) -> PdfPoint:
-        x = point.x / self.view_scale
-        y = point.y / self.view_scale
-        x0, y0 = self._unrotate_local_point(x, y)
+    def view_to_pdf_point(self, point: QPointF) -> PdfPoint:
+        scaled_x = point.x() / self.logical_zoom
+        scaled_y = point.y() / self.logical_zoom
+        x0, y0 = self._unrotate_local_point(scaled_x, scaled_y)
         return self._to_pdf_point(x0, y0)
 
-    def pdf_to_device_point(self, point: PdfPoint) -> PdfPoint:
+    def pdf_to_device_point(self, point: PdfPoint) -> QPointF:
         x0, y0 = self._local_coordinates(point)
-        view_x, view_y = self._rotate_local_point(x0, y0)
-        return PdfPoint(view_x * self.device_scale, view_y * self.device_scale)
+        rotated_x, rotated_y = self._rotate_local_point(x0, y0)
+        scale = self.logical_zoom * self.device_pixel_ratio
+        return QPointF(rotated_x * scale, rotated_y * scale)
 
-    def device_to_pdf_point(self, point: PdfPoint) -> PdfPoint:
-        x = point.x / self.device_scale
-        y = point.y / self.device_scale
-        x0, y0 = self._unrotate_local_point(x, y)
+    def device_to_pdf_point(self, point: QPointF) -> PdfPoint:
+        scale = self.logical_zoom * self.device_pixel_ratio
+        scaled_x = point.x() / scale
+        scaled_y = point.y() / scale
+        x0, y0 = self._unrotate_local_point(scaled_x, scaled_y)
         return self._to_pdf_point(x0, y0)
 
-    def pdf_to_view_rect(self, rect: PdfRect) -> PdfRect:
-        return self._rect_from_points(self.pdf_to_view_point(point) for point in rect.corners())
+    def pdf_to_view_rect(self, rect: PdfRect) -> QRectF:
+        return self.pdf_to_view_polygon(rect.corners()).boundingRect()
 
-    def view_to_pdf_rect(self, rect: PdfRect) -> PdfRect:
-        return self._rect_from_points(self.view_to_pdf_point(point) for point in rect.corners())
+    def view_to_pdf_rect(self, rect: QRectF) -> PdfRect:
+        return self._rect_from_points(self.view_to_pdf_polygon(self._rect_to_polygon(rect)))
 
-    def pdf_to_device_rect(self, rect: PdfRect) -> PdfRect:
-        return self._rect_from_points(self.pdf_to_device_point(point) for point in rect.corners())
+    def pdf_to_device_rect(self, rect: PdfRect) -> QRectF:
+        return self.pdf_to_device_polygon(rect.corners()).boundingRect()
 
-    def device_to_pdf_rect(self, rect: PdfRect) -> PdfRect:
-        return self._rect_from_points(self.device_to_pdf_point(point) for point in rect.corners())
+    def device_to_pdf_rect(self, rect: QRectF) -> PdfRect:
+        return self._rect_from_points(self.device_to_pdf_polygon(self._rect_to_polygon(rect)))
 
-    def pdf_to_view_polygon(self, points: Iterable[PdfPoint]) -> tuple[PdfPoint, ...]:
-        return tuple(self.pdf_to_view_point(point) for point in points)
+    def pdf_to_view_polygon(self, points: Sequence[PdfPoint]) -> QPolygonF:
+        return QPolygonF([self.pdf_to_view_point(point) for point in points])
 
-    def view_to_pdf_polygon(self, points: Iterable[PdfPoint]) -> tuple[PdfPoint, ...]:
-        return tuple(self.view_to_pdf_point(point) for point in points)
+    def view_to_pdf_polygon(self, polygon: QPolygonF) -> tuple[PdfPoint, ...]:
+        return tuple(self.view_to_pdf_point(polygon.at(index)) for index in range(polygon.count()))
 
-    def pdf_to_device_polygon(self, points: Iterable[PdfPoint]) -> tuple[PdfPoint, ...]:
-        return tuple(self.pdf_to_device_point(point) for point in points)
+    def pdf_to_device_polygon(self, points: Sequence[PdfPoint]) -> QPolygonF:
+        return QPolygonF([self.pdf_to_device_point(point) for point in points])
 
-    def device_to_pdf_polygon(self, points: Iterable[PdfPoint]) -> tuple[PdfPoint, ...]:
-        return tuple(self.device_to_pdf_point(point) for point in points)
-
-    def _local_coordinates(self, point: PdfPoint) -> tuple[float, float]:
-        return point.x - self.geometry.visible_box.left, point.y - self.geometry.visible_box.bottom
-
-    def _to_pdf_point(self, x0: float, y0: float) -> PdfPoint:
-        return PdfPoint(
-            self.geometry.visible_box.left + x0,
-            self.geometry.visible_box.bottom + y0,
+    def device_to_pdf_polygon(self, polygon: QPolygonF) -> tuple[PdfPoint, ...]:
+        return tuple(
+            self.device_to_pdf_point(polygon.at(index)) for index in range(polygon.count())
         )
 
+    def _unscaled_dimensions(self) -> tuple[float, float]:
+        if self.effective_rotation in {0, 180}:
+            return self.geometry.visible_box.width, self.geometry.visible_box.height
+        return self.geometry.visible_box.height, self.geometry.visible_box.width
+
+    def _local_coordinates(self, point: PdfPoint) -> tuple[float, float]:
+        return (
+            point.x - self.geometry.visible_box.left,
+            point.y - self.geometry.visible_box.bottom,
+        )
+
+    def _to_pdf_point(self, x0: float, y0: float) -> PdfPoint:
+        return PdfPoint(self.geometry.visible_box.left + x0, self.geometry.visible_box.bottom + y0)
+
     def _rotate_local_point(self, x0: float, y0: float) -> tuple[float, float]:
-        width = self._local_width
-        height = self._local_height
+        width = self.geometry.visible_box.width
+        height = self.geometry.visible_box.height
         match self.effective_rotation:
             case 0:
                 return x0, height - y0
@@ -247,8 +268,8 @@ class PageCoordinateMapper:
                 raise AssertionError("rotation must be normalized")
 
     def _unrotate_local_point(self, view_x: float, view_y: float) -> tuple[float, float]:
-        width = self._local_width
-        height = self._local_height
+        width = self.geometry.visible_box.width
+        height = self.geometry.visible_box.height
         match self.effective_rotation:
             case 0:
                 return view_x, height - view_y
@@ -262,21 +283,34 @@ class PageCoordinateMapper:
                 raise AssertionError("rotation must be normalized")
 
     @staticmethod
-    def _rect_from_points(points: Iterable[PdfPoint]) -> PdfRect:
-        point_list = tuple(points)
-        xs = [point.x for point in point_list]
-        ys = [point.y for point in point_list]
-        return PdfRect(
-            left=min(xs),
-            bottom=min(ys),
-            right=max(xs),
-            top=max(ys),
+    def _rect_to_polygon(rect: QRectF) -> QPolygonF:
+        return QPolygonF(
+            [
+                QPointF(rect.left(), rect.top()),
+                QPointF(rect.right(), rect.top()),
+                QPointF(rect.right(), rect.bottom()),
+                QPointF(rect.left(), rect.bottom()),
+            ]
         )
+
+    @staticmethod
+    def _rect_from_points(points: tuple[PdfPoint, ...]) -> PdfRect:
+        xs = [point.x for point in points]
+        ys = [point.y for point in points]
+        return PdfRect(min(xs), min(ys), max(xs), max(ys))
+
+
+def _as_rect_tuple(values: Sequence[float]) -> tuple[float, float, float, float]:
+    if len(values) != 4:
+        raise ValueError("rect must contain four values")
+    return cast(tuple[float, float, float, float], tuple(float(value) for value in values))
 
 
 class _PdfiumPageProtocol(Protocol):
-    def get_mediabox(self) -> Iterable[float]: ...
+    def get_mediabox(self, fallback_ok: bool = True) -> tuple[float, float, float, float]: ...
 
-    def get_cropbox(self) -> Iterable[float]: ...
+    def get_cropbox(self, fallback_ok: bool = True) -> tuple[float, float, float, float]: ...
+
+    def get_bbox(self) -> tuple[float, float, float, float]: ...
 
     def get_rotation(self) -> int: ...
