@@ -1,6 +1,6 @@
 # Planned GitHub Issues
 
-- [M0: Stabilize project bootstrap and Windows development environment](issues/001-bootstrap.md)
+- [M0: Stabilize project bootstrap and macOS/Windows development environment](issues/001-bootstrap.md)
 - [M1: Implement the document tab and application shell](issues/002-viewer-shell.md)
 - [M1: Add lazy PDFium page rendering and render cache](issues/003-renderer.md)
 - [M1: Centralize PDF-to-view coordinate mapping](issues/004-coordinate-mapper.md)

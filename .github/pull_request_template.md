@@ -12,7 +12,7 @@ Closes #
 - [ ] `uv run ruff format --check .`
 - [ ] `uv run mypy src/pdf_workbench`
 - [ ] `uv run pytest`
-- [ ] Windows GUI behavior checked when applicable
+- [ ] GUI behavior checked on macOS or Windows as applicable
 - [ ] PDF-writing changes include round-trip validation
 
 ## Risks

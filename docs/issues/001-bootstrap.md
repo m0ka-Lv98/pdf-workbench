@@ -1,10 +1,10 @@
 ---
-title: "M0: Stabilize project bootstrap and Windows development environment"
+title: "M0: Stabilize project bootstrap and macOS/Windows development environment"
 labels: "type:chore,area:build,priority:p0"
 ---
 ## Goal
 
-Make a fresh clone reproducibly installable, testable, and runnable on Windows 10/11.
+Make a fresh clone reproducibly installable, testable, and runnable on macOS and Windows 10/11.
 
 ## Tasks
 
@@ -12,10 +12,10 @@ Make a fresh clone reproducibly installable, testable, and runnable on Windows 1
 - [ ] Generate and commit `uv.lock`
 - [ ] Verify `uv sync --extra dev --frozen`
 - [ ] Run Ruff, mypy, and pytest in CI
-- [ ] Document Windows prerequisites
+- [ ] Document macOS and Windows prerequisites
 - [ ] Confirm logs and settings are written under the user profile
 
 ## Acceptance criteria
 
-- A clean Windows runner starts the application from the locked environment.
-- CI passes on Windows and Ubuntu for Python 3.12 and 3.13.
+- A clean macOS runner and a clean Windows runner start the application from the locked environment.
+- CI passes on macOS, Windows, and Ubuntu for Python 3.12 and 3.13.

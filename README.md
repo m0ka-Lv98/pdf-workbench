@@ -1,6 +1,6 @@
 # PDF Workbench
 
-Windowsで個人利用することを主目的とした、完全ローカル動作のPython製PDFデスクトップアプリです。
+Windowsで個人利用することを主目的としつつ、macOSとWindowsの両方で開発できる、完全ローカル動作のPython製PDFデスクトップアプリです。
 Acrobat Proの全機能再現ではなく、日常的に使う閲覧・ページ整理・注釈・OCR・墨消し・圧縮・フォーム入力を段階的に実装します。
 
 ## 方針
@@ -31,7 +31,7 @@ Acrobat Proの全機能再現ではなく、日常的に使う閲覧・ページ
 
 前提:
 
-- Windows 10/11 x64
+- macOS 14+ または Windows 10/11 x64
 - Python 3.12または3.13
 - uv
 - Git
@@ -61,6 +61,8 @@ uv run mypy src/pdf_workbench
 - Qt設定はレジストリではなく、ユーザープロファイル配下の設定ディレクトリへINIファイルとして保存する
 - 実行ファイルの隣には設定やログを書き込まない
 
+macOSでも同じコマンドでローカル起動できます。最終配布ターゲットはWindowsです。
+
 ## Windows実行ファイル
 
 安定性確認用の`onedir`ビルド:
@@ -75,11 +77,11 @@ uv run pyinstaller packaging/pdf_workbench_onedir.spec --noconfirm --clean
 uv run pyinstaller packaging/pdf_workbench_onefile.spec --noconfirm --clean
 ```
 
-出力先は`dist/`です。GitHub Actionsの`Build Windows executable`からも生成できます。
+出力先は`dist/`です。GitHub Actionsの`Build Windows executable`からも生成できます。Windows EXEはWindowsランナー上でのみ生成します。
 
 ## GitHubリポジトリの初期化
 
-GitHub CLIで認証済みのWindows PowerShellから実行します。
+GitHub CLIで認証済みのPowerShellまたはターミナルから実行します。
 
 ```powershell
 .\scripts\bootstrap_github.ps1

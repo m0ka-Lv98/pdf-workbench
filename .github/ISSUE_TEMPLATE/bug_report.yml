@@ -26,6 +26,6 @@ body:
     id: environment
     attributes:
       label: 環境
-      placeholder: "Windows、アプリバージョン、PDFの特徴"
+      placeholder: "macOS/Windows、アプリバージョン、PDFの特徴"
     validations:
       required: true
