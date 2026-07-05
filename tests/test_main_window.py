@@ -204,6 +204,7 @@ def test_main_window_opens_real_pdf_document(
         writer.write(output)
 
     window.open_document(document_path)
+    qtbot.waitUntil(lambda: window._documents[0].view.page_count == 1)
 
     assert window._tabs.count() == 1
     assert window._documents[0].session.source_path == document_path.resolve()

@@ -145,6 +145,7 @@ class MainWindow(QMainWindow):
             return
 
         view.state_changed.connect(self._update_status)
+        view.error_occurred.connect(lambda message: self.statusBar().showMessage(message, 5000))
         document = DocumentTab(session=session, view=view)
         self._documents.append(document)
         tab_index = self._tabs.addTab(view, self._tab_title(document))
@@ -174,6 +175,8 @@ class MainWindow(QMainWindow):
         self._tabs.removeTab(index)
         self._documents.pop(index)
         if widget is not None:
+            if isinstance(widget, PdfView):
+                widget.shutdown()
             widget.deleteLater()
 
         self._update_window_title()
@@ -216,9 +219,11 @@ class MainWindow(QMainWindow):
         if document is None:
             self.statusBar().showMessage("準備完了")
             return
+        page_count = document.view.page_count
+        current_page = 0 if page_count == 0 else document.view.page_index + 1
         self.statusBar().showMessage(
             f"{document.session.source_path.name}  "
-            f"{document.view.page_index + 1} / {document.view.page_count} ページ  "
+            f"{current_page} / {page_count} ページ  "
             f"ズーム {document.session.zoom_factor:.0%}"
         )
 
