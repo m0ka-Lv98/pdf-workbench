@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import QLabel, QScrollArea, QVBoxLayout, QWidget
 
@@ -10,6 +10,8 @@ from pdf_workbench.services.pdf_renderer import PdfiumRenderer
 
 
 class PdfView(QWidget):
+    state_changed = Signal()
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._renderer = PdfiumRenderer()
@@ -39,6 +41,10 @@ class PdfView(QWidget):
     def page_index(self) -> int:
         return self._page_index
 
+    @property
+    def path(self) -> Path | None:
+        return self._path
+
     def open_document(self, path: Path) -> None:
         self._path = path
         self._page_index = 0
@@ -64,3 +70,4 @@ class PdfView(QWidget):
         self._page_count = rendered.page_count
         self._image_label.setPixmap(QPixmap.fromImage(rendered.image))
         self._image_label.adjustSize()
+        self.state_changed.emit()

@@ -28,9 +28,9 @@ def main() -> int:
     app.setApplicationName(APP_NAME)
     app.setOrganizationName(APP_AUTHOR)
     app.setApplicationVersion(__version__)
-    configure_qsettings()
+    settings = configure_qsettings()
 
-    window = MainWindow()
+    window = MainWindow(settings)
     window.show()
 
     if args.pdf is not None:
