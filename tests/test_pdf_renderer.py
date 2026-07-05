@@ -8,9 +8,12 @@ from PySide6.QtGui import QImage
 from pdf_workbench.services.pdf_renderer import (
     DocumentMetadata,
     DocumentRevision,
+    PageMetadata,
     PdfiumDocumentBackend,
+    PdfRenderWorker,
     RenderCacheKey,
     RenderImageCache,
+    RenderRequest,
 )
 
 
@@ -28,6 +31,34 @@ def make_revision(
     path = tmp_path / name
     path.write_bytes(content)
     return DocumentRevision.from_path(path)
+
+
+class FakeBackend:
+    def __init__(self, label: str) -> None:
+        self.label = label
+        self.closed = False
+        self.render_calls: list[int] = []
+
+    def page_count(self) -> int:
+        return 2
+
+    def page_metadata(self, page_index: int) -> PageMetadata:
+        return PageMetadata(width_points=100.0 + page_index, height_points=200.0)
+
+    def render_page(
+        self,
+        page_index: int,
+        logical_zoom: float,
+        rotation: int,
+        device_pixel_ratio: float,
+    ) -> QImage:
+        self.render_calls.append(page_index)
+        image = make_image()
+        image.setDevicePixelRatio(device_pixel_ratio)
+        return image
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def test_render_cache_hits_existing_entry(tmp_path: Path) -> None:
@@ -113,3 +144,66 @@ def test_pdfium_backend_sets_device_pixel_ratio(tmp_path: Path) -> None:
     assert image.devicePixelRatio() == 2.0
     assert metadata.page_count == 1
     assert metadata.pages[0].width_points > 0
+
+
+def test_render_worker_closes_only_target_document_and_keeps_others(tmp_path: Path) -> None:
+    cache = RenderImageCache(max_bytes=1024 * 1024)
+    backends: dict[str, FakeBackend] = {}
+
+    def factory(path: Path) -> FakeBackend:
+        backend = FakeBackend(path.stem)
+        backends[path.stem] = backend
+        return backend
+
+    worker = PdfRenderWorker(factory, cache)
+    revision_a = make_revision(tmp_path, name="a.pdf")
+    revision_b = make_revision(tmp_path, name="b.pdf")
+
+    worker.open_document("doc-a", tmp_path / "a.pdf", 1, revision_a)
+    worker.open_document("doc-b", tmp_path / "b.pdf", 1, revision_b)
+
+    worker.close_document("doc-a", 1)
+
+    assert backends["a"].closed is True
+    assert backends["b"].closed is False
+
+    worker.enqueue_render(
+        RenderRequest(
+            document_id="doc-b",
+            generation=1,
+            page_index=0,
+            logical_zoom=1.0,
+            rotation=0,
+            device_pixel_ratio=1.0,
+            priority=0,
+            revision=revision_b,
+        )
+    )
+    worker._process_next()
+
+    assert backends["b"].render_calls == [0]
+
+
+def test_render_worker_deduplicates_identical_requests_per_document(tmp_path: Path) -> None:
+    cache = RenderImageCache(max_bytes=1024 * 1024)
+    backend = FakeBackend("sample")
+    worker = PdfRenderWorker(lambda _path: backend, cache)
+    revision = make_revision(tmp_path)
+    path = tmp_path / "sample.pdf"
+
+    worker.open_document("doc-1", path, 2, revision)
+    request = RenderRequest(
+        document_id="doc-1",
+        generation=2,
+        page_index=1,
+        logical_zoom=1.5,
+        rotation=90,
+        device_pixel_ratio=2.0,
+        priority=0,
+        revision=revision,
+    )
+
+    worker.enqueue_render(request)
+    worker.enqueue_render(request)
+
+    assert len(worker._pending_requests) == 1

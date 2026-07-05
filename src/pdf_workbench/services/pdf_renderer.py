@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import logging
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 import pypdfium2 as pdfium  # type: ignore[import-untyped]
 from PIL.ImageQt import ImageQt
-from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QImage
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +87,19 @@ class RenderResult:
     cache_key: RenderCacheKey
 
 
+@dataclass(slots=True)
+class WorkerDocumentContext:
+    backend: PdfDocumentBackend
+    generation: int
+    revision: DocumentRevision
+
+
+@dataclass(frozen=True, slots=True)
+class QueuedRenderRequest:
+    sequence: int
+    request: RenderRequest
+
+
 class PdfDocumentBackend(Protocol):
     def page_count(self) -> int: ...
 
@@ -102,6 +118,25 @@ class PdfDocumentBackend(Protocol):
 
 class PdfBackendFactory(Protocol):
     def __call__(self, path: Path) -> PdfDocumentBackend: ...
+
+
+class PdfRenderServiceProtocol(Protocol):
+    document_loaded: Any
+    document_failed: Any
+    render_succeeded: Any
+    render_failed: Any
+
+    def open_document(
+        self,
+        document_id: str,
+        path: Path,
+        generation: int,
+        revision: DocumentRevision,
+    ) -> None: ...
+
+    def request_render(self, request: RenderRequest) -> None: ...
+
+    def close_document(self, document_id: str, generation: int) -> None: ...
 
 
 class PdfiumDocumentBackend:
@@ -159,6 +194,10 @@ class RenderImageCache:
     def total_bytes(self) -> int:
         return self._total_bytes
 
+    def clear(self) -> None:
+        self._items.clear()
+        self._total_bytes = 0
+
     def get(self, key: RenderCacheKey) -> QImage | None:
         image = self._items.get(key)
         if image is None:
@@ -186,11 +225,6 @@ class RenderImageCache:
 
 
 DEFAULT_RENDER_CACHE_BYTES = 128 * 1024 * 1024
-_shared_cache = RenderImageCache(DEFAULT_RENDER_CACHE_BYTES)
-
-
-def shared_render_cache() -> RenderImageCache:
-    return _shared_cache
 
 
 class PdfRenderWorker(QObject):
@@ -198,6 +232,7 @@ class PdfRenderWorker(QObject):
     document_failed = Signal(object, int, str)
     render_succeeded = Signal(object)
     render_failed = Signal(object, int, int, str)
+    shutdown_completed = Signal()
 
     def __init__(
         self,
@@ -207,12 +242,12 @@ class PdfRenderWorker(QObject):
         super().__init__()
         self._backend_factory = backend_factory
         self._cache = cache
-        self._backend: PdfDocumentBackend | None = None
-        self._document_id: str | None = None
-        self._generation = -1
-        self._closed = False
-        self._pending_requests: list[RenderRequest] = []
+        self._documents: dict[str, WorkerDocumentContext] = {}
+        self._pending_requests: list[QueuedRenderRequest] = []
+        self._pending_keys: set[tuple[str, int, int, float, int, float, DocumentRevision]] = set()
+        self._sequence = 0
         self._processing = False
+        self._shutting_down = False
 
     @Slot(str, Path, int, object)
     def open_document(
@@ -222,35 +257,44 @@ class PdfRenderWorker(QObject):
         generation: int,
         revision: object,
     ) -> None:
-        if self._closed:
+        if self._shutting_down:
             self.document_failed.emit(document_id, generation, "renderer is shutting down")
             return
         if not isinstance(revision, DocumentRevision):
             raise TypeError("revision must be DocumentRevision")
 
-        self._clear_pending()
-        self._close_backend()
-        self._document_id = document_id
-        self._generation = generation
+        self._close_document_backend(document_id)
+        self._drop_pending_for_document(document_id)
+
         try:
             backend = self._backend_factory(path)
             pages = tuple(backend.page_metadata(index) for index in range(backend.page_count()))
-            metadata = DocumentMetadata(revision=revision, pages=pages)
         except Exception as exc:
-            self._backend = None
             self.document_failed.emit(document_id, generation, str(exc))
             return
 
-        self._backend = backend
-        self.document_loaded.emit(document_id, generation, metadata)
+        self._documents[document_id] = WorkerDocumentContext(
+            backend=backend,
+            generation=generation,
+            revision=revision,
+        )
+        self.document_loaded.emit(
+            document_id,
+            generation,
+            DocumentMetadata(revision=revision, pages=pages),
+        )
 
     @Slot(object)
     def enqueue_render(self, request: object) -> None:
-        if self._closed:
+        if self._shutting_down:
             return
         if not isinstance(request, RenderRequest):
             raise TypeError("request must be RenderRequest")
-        if request.document_id != self._document_id or request.generation != self._generation:
+
+        context = self._documents.get(request.document_id)
+        if context is None:
+            return
+        if request.generation != context.generation or request.revision != context.revision:
             return
 
         cached = self._cache.get(request.cache_key)
@@ -266,90 +310,142 @@ class PdfRenderWorker(QObject):
             )
             return
 
-        for index, pending in enumerate(self._pending_requests):
-            if (
-                pending.document_id == request.document_id
-                and pending.generation == request.generation
-                and pending.page_index == request.page_index
-            ):
-                if request.priority < pending.priority:
-                    self._pending_requests[index] = request
-                break
-        else:
-            self._pending_requests.append(request)
-        self._pending_requests.sort(key=lambda item: (item.priority, item.page_index))
+        request_key = self._request_key(request)
+        if request_key in self._pending_keys:
+            return
+
+        queued_request = QueuedRenderRequest(sequence=self._sequence, request=request)
+        self._sequence += 1
+        self._pending_requests.append(queued_request)
+        self._pending_keys.add(request_key)
+        self._pending_requests.sort(key=lambda item: (item.request.priority, item.sequence))
         self._schedule_processing()
 
     @Slot(str, int)
     def close_document(self, document_id: str, generation: int) -> None:
-        if document_id == self._document_id and generation >= self._generation:
-            self._generation = generation
-            self._clear_pending()
-            self._close_backend()
-            self._document_id = None
+        context = self._documents.get(document_id)
+        if context is None:
+            return
+        if generation < context.generation:
+            return
+        self._drop_pending_for_document(document_id)
+        self._close_document_backend(document_id)
 
     @Slot()
     def shutdown(self) -> None:
-        self._closed = True
-        self._clear_pending()
-        self._close_backend()
+        if self._shutting_down:
+            self.shutdown_completed.emit()
+            return
+
+        self._shutting_down = True
+        self._pending_requests.clear()
+        self._pending_keys.clear()
+        for document_id in list(self._documents):
+            self._close_document_backend(document_id)
+        self._documents.clear()
+        self._cache.clear()
+        self.shutdown_completed.emit()
 
     def _schedule_processing(self) -> None:
-        if self._processing or not self._pending_requests:
+        if self._processing or not self._pending_requests or self._shutting_down:
             return
         self._processing = True
         QTimer.singleShot(0, self._process_next)
 
     def _process_next(self) -> None:
-        if self._closed:
+        if self._shutting_down:
             self._processing = False
             return
-        if self._backend is None or self._document_id is None:
+
+        next_request = self._pop_next_valid_request()
+        if next_request is None:
             self._processing = False
             return
-        while self._pending_requests:
-            request = self._pending_requests.pop(0)
-            if request.document_id != self._document_id or request.generation != self._generation:
-                continue
-            try:
-                image = self._backend.render_page(
-                    request.page_index,
-                    request.logical_zoom,
-                    request.rotation,
-                    request.device_pixel_ratio,
-                )
-            except Exception as exc:
+
+        context = self._documents.get(next_request.document_id)
+        if context is None:
+            self._processing = False
+            self._schedule_processing()
+            return
+
+        try:
+            image = context.backend.render_page(
+                next_request.page_index,
+                next_request.logical_zoom,
+                next_request.rotation,
+                next_request.device_pixel_ratio,
+            )
+        except Exception as exc:
+            if self._is_request_current(next_request):
                 self.render_failed.emit(
-                    request.document_id,
-                    request.generation,
-                    request.page_index,
+                    next_request.document_id,
+                    next_request.generation,
+                    next_request.page_index,
                     str(exc),
                 )
-            else:
-                self._cache.put(request.cache_key, image)
+        else:
+            if self._is_request_current(next_request):
+                self._cache.put(next_request.cache_key, image)
                 self.render_succeeded.emit(
                     RenderResult(
-                        document_id=request.document_id,
-                        generation=request.generation,
-                        page_index=request.page_index,
+                        document_id=next_request.document_id,
+                        generation=next_request.generation,
+                        page_index=next_request.page_index,
                         image=image,
-                        cache_key=request.cache_key,
+                        cache_key=next_request.cache_key,
                     )
                 )
-            break
 
         self._processing = False
-        if self._pending_requests:
+        if self._pending_requests and not self._shutting_down:
             self._schedule_processing()
 
-    def _clear_pending(self) -> None:
-        self._pending_requests.clear()
+    def _pop_next_valid_request(self) -> RenderRequest | None:
+        while self._pending_requests:
+            queued_request = self._pending_requests.pop(0)
+            request = queued_request.request
+            self._pending_keys.discard(self._request_key(request))
+            if self._is_request_current(request):
+                return request
+        return None
 
-    def _close_backend(self) -> None:
-        if self._backend is None:
+    def _is_request_current(self, request: RenderRequest) -> bool:
+        if self._shutting_down:
+            return False
+        context = self._documents.get(request.document_id)
+        if context is None:
+            return False
+        return request.generation == context.generation and request.revision == context.revision
+
+    def _drop_pending_for_document(self, document_id: str) -> None:
+        kept_requests: list[QueuedRenderRequest] = []
+        self._pending_keys.clear()
+        for queued_request in self._pending_requests:
+            if queued_request.request.document_id == document_id:
+                continue
+            kept_requests.append(queued_request)
+            self._pending_keys.add(self._request_key(queued_request.request))
+        self._pending_requests = kept_requests
+
+    def _close_document_backend(self, document_id: str) -> None:
+        context = self._documents.pop(document_id, None)
+        if context is None:
             return
-        self._backend.close()
-        self._backend = None
+        context.backend.close()
+
+    @staticmethod
+    def _request_key(
+        request: RenderRequest,
+    ) -> tuple[str, int, int, float, int, float, DocumentRevision]:
+        return (
+            request.document_id,
+            request.generation,
+            request.page_index,
+            request.logical_zoom,
+            request.rotation,
+            request.device_pixel_ratio,
+            request.revision,
+        )
 
 
 class PdfRenderService(QObject):
@@ -370,21 +466,26 @@ class PdfRenderService(QObject):
         cache: RenderImageCache | None = None,
     ) -> None:
         super().__init__(parent)
-        self._thread = QThread()
+        self._thread = QThread(self)
         self._worker = PdfRenderWorker(
             backend_factory=backend_factory or PdfiumDocumentBackend,
-            cache=cache or shared_render_cache(),
+            cache=cache or RenderImageCache(DEFAULT_RENDER_CACHE_BYTES),
         )
         self._worker.moveToThread(self._thread)
         self._worker.document_loaded.connect(self.document_loaded)
         self._worker.document_failed.connect(self.document_failed)
         self._worker.render_succeeded.connect(self.render_succeeded)
         self._worker.render_failed.connect(self.render_failed)
+        self._worker.shutdown_completed.connect(self._thread.quit)
         self._open_requested.connect(self._worker.open_document)
         self._render_requested.connect(self._worker.enqueue_render)
         self._close_requested.connect(self._worker.close_document)
-        self._shutdown_requested.connect(self._worker.shutdown)
+        self._shutdown_requested.connect(
+            self._worker.shutdown,
+            Qt.ConnectionType.BlockingQueuedConnection,
+        )
         self._thread.start()
+        self._is_shutdown = False
 
     def open_document(
         self,
@@ -393,17 +494,26 @@ class PdfRenderService(QObject):
         generation: int,
         revision: DocumentRevision,
     ) -> None:
+        if self._is_shutdown:
+            return
         self._open_requested.emit(document_id, path, generation, revision)
 
     def request_render(self, request: RenderRequest) -> None:
+        if self._is_shutdown:
+            return
         self._render_requested.emit(request)
 
     def close_document(self, document_id: str, generation: int) -> None:
+        if self._is_shutdown:
+            return
         self._close_requested.emit(document_id, generation)
 
     def shutdown(self, timeout_ms: int = 3000) -> None:
+        if self._is_shutdown:
+            return
+        self._is_shutdown = True
         if not self._thread.isRunning():
             return
         self._shutdown_requested.emit()
-        self._thread.quit()
-        self._thread.wait(timeout_ms)
+        if not self._thread.wait(timeout_ms):
+            logger.warning("Timed out while waiting for PdfRenderService worker thread shutdown")

@@ -13,7 +13,7 @@ from pdf_workbench.services.pdf_renderer import (
     DocumentMetadata,
     DocumentRevision,
     PageMetadata,
-    PdfRenderService,
+    PdfRenderServiceProtocol,
     RenderRequest,
 )
 
@@ -163,14 +163,13 @@ class PdfView(QWidget):
 
     def __init__(
         self,
+        render_service: PdfRenderServiceProtocol,
         parent: QWidget | None = None,
         *,
-        render_service: PdfRenderService | None = None,
         debounce_interval_ms: int = 40,
     ) -> None:
         super().__init__(parent)
-        self._render_service = render_service or PdfRenderService(self)
-        self._owns_render_service = render_service is None
+        self._render_service = render_service
         self._document_id = uuid.uuid4().hex
         self._path: Path | None = None
         self._metadata: DocumentMetadata | None = None
@@ -290,8 +289,16 @@ class PdfView(QWidget):
         self._closed = True
         self._bump_generation()
         self._render_service.close_document(self._document_id, self._generation)
-        if self._owns_render_service:
-            self._render_service.shutdown()
+
+    def close_document(self) -> None:
+        if self._closed:
+            return
+        self._path = None
+        self._metadata = None
+        self._desired_pages.clear()
+        self._bump_generation()
+        self._render_service.close_document(self._document_id, self._generation)
+        self._show_status("PDFを開いてください")
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self.shutdown()

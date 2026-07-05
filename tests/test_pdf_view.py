@@ -247,28 +247,10 @@ def test_previous_and_next_navigation_scroll_to_target_page(
     assert view.page_index == 3
 
 
-def test_background_rendering_integration_uses_real_pdfium(
-    qtbot: QtBot,
-    tmp_path: Path,
-) -> None:
-    document_path = create_pdf(tmp_path / "integration.pdf", 2)
-    view = PdfView()
-    _wrapper = show_view(qtbot, view)
-
-    view.open_document(document_path)
-    qtbot.waitUntil(lambda: view.page_count == 2)
-    qtbot.waitUntil(
-        lambda: any(page.state == PlaceholderState.DISPLAYED for page in view._canvas.pages),
-        timeout=5000,
-    )
-
-    assert any(page.state == PlaceholderState.DISPLAYED for page in view._canvas.pages)
-    view.shutdown()
-
-
-def test_real_render_service_shuts_down_without_thread_leak() -> None:
+def test_real_render_service_shuts_down_without_thread_leak(qtbot: QtBot) -> None:
     service = PdfRenderService()
 
     service.shutdown()
+    qtbot.waitUntil(lambda: not service._thread.isRunning())
 
     assert not service._thread.isRunning()

@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 
 from pdf_workbench.core.settings import configure_qsettings
 from pdf_workbench.domain.document_session import DocumentSession
+from pdf_workbench.services.pdf_renderer import PdfRenderService
 from pdf_workbench.ui.pdf_view import PdfView
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,7 @@ class MainWindow(QMainWindow):
     def __init__(self, settings: QSettings | None = None) -> None:
         super().__init__()
         self._settings = settings if settings is not None else configure_qsettings()
+        self._render_service = PdfRenderService(self)
         self._documents: list[DocumentTab] = []
         self._recent_files: list[Path] = self._load_recent_files()
 
@@ -137,7 +139,7 @@ class MainWindow(QMainWindow):
 
         try:
             session = DocumentSession(normalized_path)
-            view = PdfView(self)
+            view = PdfView(self._render_service, self)
             view.open_document(session.source_path)
         except Exception as exc:
             logger.exception("Failed to open PDF: %s", path)
@@ -176,7 +178,7 @@ class MainWindow(QMainWindow):
         self._documents.pop(index)
         if widget is not None:
             if isinstance(widget, PdfView):
-                widget.shutdown()
+                widget.close_document()
             widget.deleteLater()
 
         self._update_window_title()
@@ -232,6 +234,7 @@ class MainWindow(QMainWindow):
             if not self.close_document_at(index):
                 event.ignore()
                 return
+        self._render_service.shutdown()
         self._save_window_state()
         event.accept()
 
