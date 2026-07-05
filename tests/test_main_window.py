@@ -5,10 +5,11 @@ from pathlib import Path
 import pytest
 from pypdf import PdfWriter
 from PySide6.QtCore import QMimeData, QPoint, QPointF, QSettings, Qt, QUrl
-from PySide6.QtGui import QDragEnterEvent, QDropEvent
+from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import QMessageBox
 from pytestqt.qtbot import QtBot
 
+from pdf_workbench.services.pdf_renderer import DocumentMetadata, DocumentRevision, PageMetadata
 from pdf_workbench.ui.main_window import MainWindow
 from pdf_workbench.ui.pdf_view import PdfView
 
@@ -16,8 +17,11 @@ from pdf_workbench.ui.pdf_view import PdfView
 def patch_pdf_open(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_open_document(self: PdfView, path: Path) -> None:
         self._path = path
-        self._page_index = 0
-        self._page_count = 1
+        self._current_page_index = 0
+        self._metadata = DocumentMetadata(
+            revision=DocumentRevision.from_path(path),
+            pages=(PageMetadata(144.0, 144.0),),
+        )
         self.state_changed.emit()
 
     monkeypatch.setattr(PdfView, "open_document", fake_open_document)
@@ -204,7 +208,51 @@ def test_main_window_opens_real_pdf_document(
         writer.write(output)
 
     window.open_document(document_path)
+    qtbot.waitUntil(lambda: window._documents[0].view.page_count == 1)
 
     assert window._tabs.count() == 1
     assert window._documents[0].session.source_path == document_path.resolve()
     assert window._documents[0].view.page_count == 1
+
+
+def test_main_window_shares_one_render_service_across_tabs(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    window = MainWindow(settings)
+    qtbot.addWidget(window)
+
+    first = tmp_path / "first.pdf"
+    second = tmp_path / "second.pdf"
+    first.touch()
+    second.touch()
+
+    window.open_document(first)
+    window.open_document(second)
+
+    assert window._documents[0].view._render_service is window._render_service
+    assert window._documents[1].view._render_service is window._render_service
+
+
+def test_main_window_keeps_open_when_render_service_shutdown_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    window = MainWindow(settings)
+    qtbot.addWidget(window)
+
+    monkeypatch.setattr(window._render_service, "shutdown", lambda timeout_ms=3000: False)
+
+    event = QCloseEvent()
+    window.closeEvent(event)
+
+    assert event.isAccepted() is False
+    monkeypatch.undo()
+    window._render_service._thread.quit()
+    assert window._render_service._thread.wait(5000) is True

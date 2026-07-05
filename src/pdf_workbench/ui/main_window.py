@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 
 from pdf_workbench.core.settings import configure_qsettings
 from pdf_workbench.domain.document_session import DocumentSession
+from pdf_workbench.services.pdf_renderer import PdfRenderService
 from pdf_workbench.ui.pdf_view import PdfView
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,7 @@ class MainWindow(QMainWindow):
     def __init__(self, settings: QSettings | None = None) -> None:
         super().__init__()
         self._settings = settings if settings is not None else configure_qsettings()
+        self._render_service = PdfRenderService(self)
         self._documents: list[DocumentTab] = []
         self._recent_files: list[Path] = self._load_recent_files()
 
@@ -137,7 +139,7 @@ class MainWindow(QMainWindow):
 
         try:
             session = DocumentSession(normalized_path)
-            view = PdfView(self)
+            view = PdfView(self._render_service, self)
             view.open_document(session.source_path)
         except Exception as exc:
             logger.exception("Failed to open PDF: %s", path)
@@ -145,6 +147,7 @@ class MainWindow(QMainWindow):
             return
 
         view.state_changed.connect(self._update_status)
+        view.error_occurred.connect(lambda message: self.statusBar().showMessage(message, 5000))
         document = DocumentTab(session=session, view=view)
         self._documents.append(document)
         tab_index = self._tabs.addTab(view, self._tab_title(document))
@@ -174,6 +177,8 @@ class MainWindow(QMainWindow):
         self._tabs.removeTab(index)
         self._documents.pop(index)
         if widget is not None:
+            if isinstance(widget, PdfView):
+                widget.close_document()
             widget.deleteLater()
 
         self._update_window_title()
@@ -216,9 +221,11 @@ class MainWindow(QMainWindow):
         if document is None:
             self.statusBar().showMessage("準備完了")
             return
+        page_count = document.view.page_count
+        current_page = 0 if page_count == 0 else document.view.page_index + 1
         self.statusBar().showMessage(
             f"{document.session.source_path.name}  "
-            f"{document.view.page_index + 1} / {document.view.page_count} ページ  "
+            f"{current_page} / {page_count} ページ  "
             f"ズーム {document.session.zoom_factor:.0%}"
         )
 
@@ -227,6 +234,11 @@ class MainWindow(QMainWindow):
             if not self.close_document_at(index):
                 event.ignore()
                 return
+        shutdown_succeeded = self._render_service.shutdown()
+        if not shutdown_succeeded:
+            self.statusBar().showMessage("PDFレンダラーの終了を待ち切れませんでした", 5000)
+            event.ignore()
+            return
         self._save_window_state()
         event.accept()
 
