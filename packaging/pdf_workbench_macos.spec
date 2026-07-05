@@ -46,7 +46,14 @@ exe = EXE(
     disable_windowed_traceback=False,
 )
 app = BUNDLE(
-    exe,
+    COLLECT(
+        exe,
+        analysis.binaries,
+        analysis.datas,
+        strip=False,
+        upx=False,
+        name="PDF Workbench",
+    ),
     name="PDF Workbench.app",
     bundle_identifier="com.m0kalv98.pdfworkbench",
     info_plist={

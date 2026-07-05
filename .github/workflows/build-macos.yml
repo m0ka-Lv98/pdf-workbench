@@ -45,12 +45,23 @@ jobs:
       - name: Build macOS app
         run: pyinstaller packaging/pdf_workbench_macos.spec --noconfirm --clean
       - name: Verify app bundle structure
+        shell: bash
         run: |
+          set -euo pipefail
+
+          find "dist/PDF Workbench.app/Contents" -maxdepth 3 -type d -print
+          find "dist/PDF Workbench.app/Contents" -maxdepth 3 -type f -print | head -200
+          du -sh "dist/PDF Workbench.app"
+          find "dist/PDF Workbench.app" \( -name "*.dylib" -o -name "*.so" \) -print
+          otool -L "dist/PDF Workbench.app/Contents/MacOS/PDF Workbench"
           test -d "dist/PDF Workbench.app"
           test -f "dist/PDF Workbench.app/Contents/Info.plist"
           test -x "dist/PDF Workbench.app/Contents/MacOS/PDF Workbench"
+          find "dist/PDF Workbench.app/Contents" -maxdepth 2 -type d | grep -Eq '/(Frameworks|MacOS|Resources)$'
       - name: Verify app architecture
+        shell: bash
         run: |
+          set -euo pipefail
           actual_architecture=$(uname -m)
           file "dist/PDF Workbench.app/Contents/MacOS/PDF Workbench"
           lipo -archs "dist/PDF Workbench.app/Contents/MacOS/PDF Workbench"
@@ -69,15 +80,63 @@ jobs:
               ;;
           esac
       - name: Smoke test CLI version
-        run: '"dist/PDF Workbench.app/Contents/MacOS/PDF Workbench" --version'
-      - name: Package app bundle
+        shell: bash
         run: |
+          set -euo pipefail
+
+          executable="dist/PDF Workbench.app/Contents/MacOS/PDF Workbench"
+          expected_version=$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+
+          "$executable" --version 2>&1 | tee cli-smoke-test.log
+          grep -F "$expected_version" cli-smoke-test.log
+      - name: Smoke test GUI launch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          executable="dist/PDF Workbench.app/Contents/MacOS/PDF Workbench"
+          log_file="gui-smoke-test.log"
+
+          "$executable" >"$log_file" 2>&1 &
+          app_pid=$!
+
+          started=false
+          for attempt in 1 2 3 4 5; do
+            if kill -0 "$app_pid" 2>/dev/null; then
+              started=true
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$started" != "true" ]; then
+            cat "$log_file"
+            exit 1
+          fi
+
+          kill -TERM "$app_pid"
+          wait "$app_pid" || true
+      - name: Verify codesign
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          codesign --verify --deep --strict --verbose=2 "dist/PDF Workbench.app"
+          codesign -dv --verbose=4 "dist/PDF Workbench.app"
+      - name: Package app bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+
           mkdir -p artifacts
           ditto -c -k --sequesterRsrc --keepParent \
             "dist/PDF Workbench.app" \
             "artifacts/${{ matrix.archive_name }}"
+          shasum -a 256 "artifacts/${{ matrix.archive_name }}" > "artifacts/${{ matrix.archive_name }}.sha256"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
-          path: artifacts/${{ matrix.archive_name }}
+          path: |
+            artifacts/${{ matrix.archive_name }}
+            artifacts/${{ matrix.archive_name }}.sha256
           if-no-files-found: error
