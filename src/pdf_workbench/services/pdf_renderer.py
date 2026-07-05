@@ -11,6 +11,8 @@ from PIL.ImageQt import ImageQt
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QImage
 
+from pdf_workbench.services.page_coordinates import PageGeometry
+
 logger = logging.getLogger(__name__)
 
 
@@ -18,6 +20,7 @@ logger = logging.getLogger(__name__)
 class PageMetadata:
     width_points: float
     height_points: float
+    geometry: PageGeometry | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,9 +160,14 @@ class PdfiumDocumentBackend:
         page = self._document[page_index]
         try:
             width, height = page.get_size()
+            geometry = PageGeometry.from_pdfium_page(page)
         finally:
             page.close()
-        return PageMetadata(width_points=float(width), height_points=float(height))
+        return PageMetadata(
+            width_points=float(width),
+            height_points=float(height),
+            geometry=geometry,
+        )
 
     def render_page(
         self,

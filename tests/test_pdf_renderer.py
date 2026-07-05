@@ -177,6 +177,8 @@ def test_pdfium_backend_sets_device_pixel_ratio(tmp_path: Path) -> None:
     assert image.devicePixelRatio() == 2.0
     assert metadata.page_count == 1
     assert metadata.pages[0].width_points > 0
+    assert metadata.pages[0].geometry is not None
+    assert metadata.pages[0].geometry.visible_box.width > 0
 
 
 def test_render_worker_closes_only_target_document_and_keeps_others(tmp_path: Path) -> None:
