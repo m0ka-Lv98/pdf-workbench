@@ -1,6 +1,6 @@
 # PDF Workbench
 
-Windowsで個人利用することを主目的とした、完全ローカル動作のPython製PDFデスクトップアプリです。
+Windowsで個人利用することを主目的としつつ、macOSとWindowsの両方で開発できる、完全ローカル動作のPython製PDFデスクトップアプリです。
 Acrobat Proの全機能再現ではなく、日常的に使う閲覧・ページ整理・注釈・OCR・墨消し・圧縮・フォーム入力を段階的に実装します。
 
 ## 方針
@@ -20,7 +20,7 @@ Acrobat Proの全機能再現ではなく、日常的に使う閲覧・ページ
 - ページ操作・フォーム: pypdf
 - OCR: OCRmyPDF + Tesseract（後続フェーズ）
 - Windows配布: PyInstaller
-- 依存関係管理: uv
+- 依存関係管理: venv + pip
 
 ## 現在の状態
 
@@ -31,49 +31,79 @@ Acrobat Proの全機能再現ではなく、日常的に使う閲覧・ページ
 
 前提:
 
-- Windows 10/11 x64
+- macOS 14+ または Windows 10/11 x64
 - Python 3.12または3.13
-- uv
 - Git
+- Ubuntu は GUI 配布対象ではなく、移植性と単体テスト検証の対象
+
+```bash
+python -m venv .venv
+python -m pip install --upgrade pip
+python -m pip install -e ".[dev]"
+```
+
+仮想環境の有効化:
+
+macOS / Linux
+
+```bash
+source .venv/bin/activate
+```
+
+Windows PowerShell
 
 ```powershell
-uv sync --extra dev
-uv run pdf-workbench
+.\.venv\Scripts\Activate.ps1
+```
+
+起動:
+
+```bash
+python -m pdf_workbench
 ```
 
 PDFファイルを指定して起動できます。
 
-```powershell
-uv run pdf-workbench C:\path\to\document.pdf
+```bash
+python -m pdf_workbench /path/to/document.pdf
 ```
 
 ## テスト
 
-```powershell
-uv run ruff check .
-uv run pytest
-uv run mypy src/pdf_workbench
+```bash
+ruff check .
+ruff format --check .
+mypy src/pdf_workbench
+pytest --cov=pdf_workbench
 ```
+
+## 設定とログ
+
+- ログは `platformdirs` が返すユーザープロファイル配下のログディレクトリへ保存する
+- Qt設定はレジストリではなく、ユーザープロファイル配下の設定ディレクトリへINIファイルとして保存する
+- 実行ファイルの隣には設定やログを書き込まない
+
+macOS と Windowsを開発・検証対象とし、Ubuntu は移植性と単体テスト検証の対象とします。最終配布ターゲットは Windows です。
 
 ## Windows実行ファイル
 
 安定性確認用の`onedir`ビルド:
 
-```powershell
-uv run pyinstaller packaging/pdf_workbench_onedir.spec --noconfirm --clean
+```bash
+pyinstaller packaging/pdf_workbench_onedir.spec --noconfirm --clean
 ```
 
 単一EXEの実験ビルド:
 
-```powershell
-uv run pyinstaller packaging/pdf_workbench_onefile.spec --noconfirm --clean
+```bash
+pyinstaller packaging/pdf_workbench_onefile.spec --noconfirm --clean
 ```
 
-出力先は`dist/`です。GitHub Actionsの`Build Windows executable`からも生成できます。
+出力先は`dist/`です。GitHub Actionsの`Build Windows executable`からも生成できます。Windows EXEはWindowsランナー上でのみ生成します。
 
 ## GitHubリポジトリの初期化
 
-GitHub CLIで認証済みのWindows PowerShellから実行します。
+GitHub CLIで認証済みのPowerShellまたはターミナルから実行します。
 
 ```powershell
 .\scripts\bootstrap_github.ps1

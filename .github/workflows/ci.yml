@@ -13,19 +13,23 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
         python-version: ["3.12", "3.13"]
     runs-on: ${{ matrix.os }}
     env:
       QT_QPA_PLATFORM: offscreen
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - name: Install Qt runtime dependencies on Ubuntu
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libopengl0
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-          enable-cache: true
-      - run: uv sync --extra dev --frozen
-      - run: uv run ruff check .
-      - run: uv run ruff format --check .
-      - run: uv run mypy src/pdf_workbench
-      - run: uv run pytest --cov=pdf_workbench
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev]"
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: mypy src/pdf_workbench
+      - run: pytest --cov=pdf_workbench

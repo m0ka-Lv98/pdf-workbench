@@ -7,7 +7,9 @@ from pathlib import Path
 from PySide6.QtWidgets import QApplication
 
 from pdf_workbench import __version__
+from pdf_workbench.core.app_paths import APP_AUTHOR, APP_NAME
 from pdf_workbench.core.logging_config import configure_logging
+from pdf_workbench.core.settings import configure_qsettings
 from pdf_workbench.ui.main_window import MainWindow
 
 
@@ -23,9 +25,10 @@ def main() -> int:
     configure_logging()
 
     app = QApplication(sys.argv)
-    app.setApplicationName("PDF Workbench")
-    app.setOrganizationName("m0ka-Lv98")
+    app.setApplicationName(APP_NAME)
+    app.setOrganizationName(APP_AUTHOR)
     app.setApplicationVersion(__version__)
+    configure_qsettings()
 
     window = MainWindow()
     window.show()

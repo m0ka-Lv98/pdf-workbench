@@ -14,12 +14,13 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-          enable-cache: true
-      - run: uv sync --extra dev --frozen
-      - run: uv run pyinstaller packaging/pdf_workbench_onedir.spec --noconfirm --clean
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev]"
+      - run: pyinstaller packaging/pdf_workbench_onedir.spec --noconfirm --clean
       - name: Smoke test CLI version
         shell: pwsh
         run: '& ".\dist\PDF Workbench\PDF Workbench.exe" --version'
@@ -34,12 +35,13 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-          enable-cache: true
-      - run: uv sync --extra dev --frozen
-      - run: uv run pyinstaller packaging/pdf_workbench_onefile.spec --noconfirm --clean
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev]"
+      - run: pyinstaller packaging/pdf_workbench_onefile.spec --noconfirm --clean
       - uses: actions/upload-artifact@v4
         with:
           name: pdf-workbench-windows-onefile-experimental

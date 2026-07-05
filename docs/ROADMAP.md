@@ -10,8 +10,9 @@
 - GitHub Actions
 - PyInstallerのWindowsビルド
 - 最小Qtアプリ
+- macOS/Windowsの開発環境整備
 
-完了条件: CIが成功し、Windowsでアプリを起動できる。
+完了条件: CIが成功し、macOSとWindowsで開発用アプリを起動できる。Windowsで配布向けビルドを作成できる。
 
 ### M1: Viewer
 

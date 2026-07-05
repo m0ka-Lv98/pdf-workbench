@@ -2,33 +2,51 @@
 
 ## セットアップ
 
-```powershell
+```bash
 git clone <repository-url>
 cd pdf-workbench
-uv sync --extra dev
+python -m venv .venv
+python -m pip install --upgrade pip
+python -m pip install -e ".[dev]"
+```
+
+仮想環境の有効化:
+
+macOS / Linux
+
+```bash
+source .venv/bin/activate
+```
+
+Windows PowerShell
+
+```powershell
+.\.venv\Scripts\Activate.ps1
 ```
 
 OCR開発も行う場合:
 
-```powershell
-uv sync --extra dev --extra ocr
+```bash
+python -m pip install -e ".[dev,ocr]"
 ```
 
 OCRmyPDFはPythonパッケージ以外にもTesseract等の外部依存を必要とするため、M4でWindows導入手順を固定する。
 
+macOS と Windows は開発・検証対象とする。Ubuntu は GUI 配布対象ではなく、移植性と単体テスト検証の対象とする。最終配布物の検証と PyInstaller の EXE 生成は Windows で行う。
+
 ## 起動
 
-```powershell
-uv run pdf-workbench
+```bash
+python -m pdf_workbench
 ```
 
 ## 品質確認
 
-```powershell
-uv run ruff check .
-uv run ruff format --check .
-uv run mypy src/pdf_workbench
-uv run pytest --cov=pdf_workbench
+```bash
+ruff check .
+ruff format --check .
+mypy src/pdf_workbench
+pytest --cov=pdf_workbench
 ```
 
 ## ブランチ
@@ -53,5 +71,5 @@ test(redaction): verify removed text is not extractable
 - 単体テストまたは統合テストを追加
 - Ruff、mypy、pytestが成功
 - PDFを書き換える変更は構造検査と再オープン検査を追加
-- UI変更はWindowsで確認
+- UI変更はmacOSまたはWindowsで確認し、Windows向け差分がある場合はWindowsでも確認
 - セキュリティ上の制約をREADMEまたはIssueへ記録
