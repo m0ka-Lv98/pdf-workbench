@@ -151,9 +151,11 @@ class DocumentToolbar(QWidget):
 
         with QSignalBlocker(self.page_field):
             if state.has_document:
+                self.page_field.setMinimum(1)
                 self.page_field.setMaximum(max(1, state.page_count))
                 self.page_field.setValue(max(1, state.page_index + 1))
             else:
+                self.page_field.setMinimum(0)
                 self.page_field.setMaximum(0)
                 self.page_field.setValue(0)
         self._page_label.setText(f"/ {state.page_count}")

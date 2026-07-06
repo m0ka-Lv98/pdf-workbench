@@ -182,6 +182,39 @@ def test_main_window_starts_on_empty_state_and_updates_toolbar(
     assert window._documents[0].view.zoom_factor == pytest.approx(1.5)
 
 
+@pytest.mark.parametrize(
+    ("user_zoom", "logical_zoom"),
+    [
+        (0.25, 0.375),
+        (1.0, 1.5),
+        (1.25, 1.875),
+        (2.0, 3.0),
+        (3.33, pytest.approx(4.995)),
+        (4.0, 6.0),
+        (5.0, 7.5),
+    ],
+)
+def test_main_window_maps_user_zoom_to_logical_zoom(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+    user_zoom: float,
+    logical_zoom: float,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    window = MainWindow(settings)
+    qtbot.addWidget(window)
+
+    document_path = tmp_path / "zoom.pdf"
+    document_path.touch()
+    window.open_document(document_path)
+    window._set_zoom_from_toolbar(user_zoom)
+
+    assert window._documents[0].session.zoom_factor == pytest.approx(user_zoom)
+    assert window._documents[0].view.zoom_factor == pytest.approx(logical_zoom)
+
+
 def test_main_window_accepts_pdf_drag_and_drop(
     monkeypatch: pytest.MonkeyPatch,
     qtbot: QtBot,

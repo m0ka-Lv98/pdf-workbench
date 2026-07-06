@@ -30,15 +30,19 @@ QToolBar#mainToolbar {
 }
 
 QWidget#documentToolbar,
-QWidget#documentToolbar QFrame#toolbarGroup {
+QWidget#documentToolbar QFrame#toolbarGroup,
+QWidget#emptyState,
+QWidget#pdfContent {
   background: transparent;
 }
 
-QToolButton,
-QPushButton,
-QLineEdit,
-QComboBox,
-QSpinBox {
+QWidget#documentToolbar QToolButton,
+QWidget#documentToolbar QPushButton,
+QWidget#documentToolbar QLineEdit,
+QWidget#documentToolbar QComboBox,
+QWidget#documentToolbar QSpinBox,
+QWidget#emptyState QPushButton,
+QWidget#emptyState QLabel {
   min-height: 32px;
   border-radius: 6px;
   border: 1px solid #ced4da;
@@ -46,55 +50,60 @@ QSpinBox {
   padding: 4px 10px;
 }
 
-QToolButton[buttonRole="primary"],
-QPushButton[variant="primary"] {
+QWidget#documentToolbar QToolButton[buttonRole="primary"],
+QWidget#emptyState QPushButton[variant="primary"] {
   background: #0d6efd;
   color: white;
   border-color: #0d6efd;
 }
 
-QToolButton[buttonRole="primary"]:hover,
-QPushButton[variant="primary"]:hover {
+QWidget#documentToolbar QToolButton[buttonRole="primary"]:hover,
+QWidget#emptyState QPushButton[variant="primary"]:hover {
   background: #0b5ed7;
   border-color: #0a58ca;
 }
 
-QToolButton:hover,
-QPushButton:hover,
-QLineEdit:hover,
-QComboBox:hover,
-QSpinBox:hover {
+QWidget#documentToolbar QToolButton:hover,
+QWidget#documentToolbar QPushButton:hover,
+QWidget#documentToolbar QLineEdit:hover,
+QWidget#documentToolbar QComboBox:hover,
+QWidget#documentToolbar QSpinBox:hover,
+QWidget#emptyState QPushButton:hover {
   border-color: #86b7fe;
 }
 
-QToolButton:pressed,
-QPushButton:pressed {
+QWidget#documentToolbar QToolButton:pressed,
+QWidget#documentToolbar QPushButton:pressed,
+QWidget#emptyState QPushButton:pressed {
   background: #e9ecef;
 }
 
-QToolButton:disabled,
-QPushButton:disabled,
-QLineEdit:disabled,
-QComboBox:disabled,
-QSpinBox:disabled {
+QWidget#documentToolbar QToolButton:disabled,
+QWidget#documentToolbar QPushButton:disabled,
+QWidget#documentToolbar QLineEdit:disabled,
+QWidget#documentToolbar QComboBox:disabled,
+QWidget#documentToolbar QSpinBox:disabled,
+QWidget#emptyState QPushButton:disabled {
   color: #6c757d;
   background: #f8f9fa;
 }
 
-QToolButton:focus,
-QPushButton:focus,
-QLineEdit:focus,
-QComboBox:focus,
-QSpinBox:focus,
-QTabBar::tab:focus {
+QWidget#documentToolbar QToolButton:focus,
+QWidget#documentToolbar QPushButton:focus,
+QWidget#documentToolbar QLineEdit:focus,
+QWidget#documentToolbar QComboBox:focus,
+QWidget#documentToolbar QSpinBox:focus,
+QWidget#emptyState QPushButton:focus,
+QTabWidget#documentTabs QTabBar::tab:focus {
   border-color: #0d6efd;
 }
 
+QWidget#emptyState QLabel[muted="true"],
 QLabel[muted="true"] {
   color: #6c757d;
 }
 
-QTabBar::tab {
+QTabWidget#documentTabs QTabBar::tab {
   background: #f8f9fa;
   border: 1px solid #dee2e6;
   border-bottom: none;
@@ -104,11 +113,31 @@ QTabBar::tab {
   margin-right: 4px;
 }
 
-QTabBar::tab:selected {
+QTabWidget#documentTabs QTabBar::tab:selected {
   background: #ffffff;
   color: #0d6efd;
 }
 
 QScrollArea#pdfScrollArea {
   border: none;
+}
+
+QFrame#pageCard[renderState="not_requested"],
+QFrame#pageCard[renderState="queued"],
+QFrame#pageCard[renderState="rendering"] {
+  background: #ffffff;
+  color: #6c757d;
+}
+
+QFrame#pageCard[renderState="error"] {
+  background: #fff5f5;
+  color: #dc3545;
+}
+
+QLabel#pdfStatusLabel[renderState="not_requested"] {
+  color: #6c757d;
+}
+
+QLabel#pdfStatusLabel[renderState="error"] {
+  color: #dc3545;
 }

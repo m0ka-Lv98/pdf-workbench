@@ -26,6 +26,7 @@ def test_document_toolbar_updates_state_and_emits_signals(qtbot: QtBot) -> None:
     assert toolbar.zoom_field.currentText() == "125%"
     assert toolbar.previous_button.isEnabled()
     assert toolbar.next_button.isEnabled()
+    assert toolbar.page_field.minimum() == 1
 
     page_requests: list[int] = []
     zoom_requests: list[float] = []
@@ -62,6 +63,37 @@ def test_document_toolbar_rejects_invalid_zoom_and_keeps_previous_value(
     assert emitted == []
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("25%", 0.25),
+        ("100%", 1.0),
+        ("125%", 1.25),
+        ("200%", 2.0),
+        ("333%", pytest.approx(3.33)),
+        ("400%", 4.0),
+        ("500%", 5.0),
+    ],
+)
+def test_document_toolbar_parses_full_user_zoom_range(
+    qtbot: QtBot,
+    text: str,
+    expected: float,
+) -> None:
+    toolbar = DocumentToolbar()
+    qtbot.addWidget(toolbar)
+
+    emitted: list[float] = []
+    toolbar.zoom_requested.connect(emitted.append)
+    toolbar.zoom_field.lineEdit().setText(text)
+    toolbar.zoom_field.lineEdit().editingFinished.emit()
+
+    if text == "100%":
+        assert emitted == []
+    else:
+        assert emitted == [expected]
+
+
 def test_document_toolbar_zoom_buttons_nudge_by_factor(qtbot: QtBot) -> None:
     toolbar = DocumentToolbar()
     qtbot.addWidget(toolbar)
@@ -76,6 +108,30 @@ def test_document_toolbar_zoom_buttons_nudge_by_factor(qtbot: QtBot) -> None:
 
     assert emitted[0] == 1.2
     assert emitted[1] == pytest.approx(1.0)
+
+
+def test_document_toolbar_page_state_switches_minimum(qtbot: QtBot) -> None:
+    toolbar = DocumentToolbar()
+    qtbot.addWidget(toolbar)
+
+    toolbar.setState(ToolbarState(False, 0, 0, 1.0))
+    assert toolbar.page_field.minimum() == 0
+    assert toolbar.page_field.maximum() == 0
+    assert toolbar.page_field.value() == 0
+    assert toolbar.page_field.specialValueText() == "—"
+
+    emitted: list[int] = []
+    toolbar.page_requested.connect(emitted.append)
+    toolbar.setState(ToolbarState(True, 0, 12, 1.0))
+    assert toolbar.page_field.minimum() == 1
+    assert toolbar.page_field.maximum() == 12
+    assert toolbar.page_field.value() == 1
+    assert toolbar._page_label.text() == "/ 12"
+    assert emitted == []
+
+    toolbar.page_field.setValue(0)
+    assert toolbar.page_field.value() == 1
+    assert emitted == []
 
 
 def test_empty_state_shows_recent_files_and_emits_selection(qtbot: QtBot, tmp_path: Path) -> None:
@@ -110,3 +166,21 @@ def test_empty_state_shows_muted_message_for_no_recent_files(qtbot: QtBot) -> No
     empty_state.set_recent_files([])
 
     assert empty_state._recent_message.isVisible() is True
+
+
+def test_empty_state_recent_files_are_limited_to_five(qtbot: QtBot, tmp_path: Path) -> None:
+    empty_state = EmptyState()
+    qtbot.addWidget(empty_state)
+
+    empty_state.show()
+    qtbot.waitExposed(empty_state)
+
+    paths = [tmp_path / f"{index}.pdf" for index in range(7)]
+    empty_state.set_recent_files(paths)
+    buttons = [
+        button
+        for button in empty_state.findChildren(type(empty_state.open_button))
+        if button.text().endswith(".pdf")
+    ]
+
+    assert len(buttons) == 5

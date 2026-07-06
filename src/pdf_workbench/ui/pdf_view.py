@@ -35,6 +35,11 @@ def _clamp(value: int, minimum: int, maximum: int) -> int:
 
 _CONTENT_MARGIN = 8.0
 _MINIMUM_PAGE_EXTENT = 200
+_MIN_USER_ZOOM = 0.25
+_MAX_USER_ZOOM = 5.0
+_BASE_RENDER_SCALE = 1.5
+_MIN_LOGICAL_ZOOM = _BASE_RENDER_SCALE * _MIN_USER_ZOOM
+_MAX_LOGICAL_ZOOM = _BASE_RENDER_SCALE * _MAX_USER_ZOOM
 
 
 class PlaceholderState(StrEnum):
@@ -51,7 +56,7 @@ class PagePlaceholder(QFrame):
         self.page_index = page_index
         self._state = PlaceholderState.NOT_REQUESTED
         self._metadata: PageMetadata | None = None
-        self._logical_zoom = 1.5
+        self._logical_zoom = _BASE_RENDER_SCALE
         self._rotation = 0
         self._device_pixel_ratio = 1.0
         self._pixmap: QPixmap | None = None
@@ -82,6 +87,7 @@ class PagePlaceholder(QFrame):
     def set_state(self, state: PlaceholderState, message: str | None = None) -> None:
         self._state = state
         self.setProperty("renderState", state.value)
+        self._repolish()
         if message is not None:
             self._message = message
         self.update()
@@ -90,6 +96,7 @@ class PagePlaceholder(QFrame):
         self._pixmap = pixmap
         self._state = PlaceholderState.DISPLAYED
         self.setProperty("renderState", self._state.value)
+        self._repolish()
         self.update()
 
     def clear_pixmap(self, message: str) -> None:
@@ -97,6 +104,7 @@ class PagePlaceholder(QFrame):
         self._message = message
         self._state = PlaceholderState.NOT_REQUESTED
         self.setProperty("renderState", self._state.value)
+        self._repolish()
         self.update()
 
     def sizeHint(self) -> QSize:
@@ -153,12 +161,7 @@ class PagePlaceholder(QFrame):
             target = self.page_content_rect()
             painter.drawPixmap(target, self._pixmap, QRectF(self._pixmap.rect()))
         else:
-            pen_role = (
-                QPalette.ColorRole.BrightText
-                if self._state == PlaceholderState.ERROR
-                else QPalette.ColorRole.WindowText
-            )
-            painter.setPen(self.palette().color(pen_role))
+            painter.setPen(self.palette().color(QPalette.ColorRole.WindowText))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._status_text())
 
         painter.setPen(self.palette().color(QPalette.ColorRole.Mid))
@@ -176,6 +179,11 @@ class PagePlaceholder(QFrame):
         if self._state == PlaceholderState.DISPLAYED:
             return ""
         return f"{self.page_index + 1}\n{labels[self._state]}"
+
+    def _repolish(self) -> None:
+        style = self.style()
+        style.unpolish(self)
+        style.polish(self)
 
 
 class ContinuousPageCanvas(QWidget):
@@ -348,9 +356,9 @@ class PdfView(QWidget):
         if not math.isfinite(scale):
             raise ValueError("scale must be finite")
         if self._metadata is None:
-            self._logical_zoom = max(0.25, min(scale, 5.0))
+            self._logical_zoom = max(_MIN_LOGICAL_ZOOM, min(scale, _MAX_LOGICAL_ZOOM))
             return
-        self._logical_zoom = max(0.25, min(scale, 5.0))
+        self._logical_zoom = max(_MIN_LOGICAL_ZOOM, min(scale, _MAX_LOGICAL_ZOOM))
         self._desired_pages.clear()
         self._advance_render_generation()
         for index, page in enumerate(self._canvas.pages):
@@ -416,6 +424,7 @@ class PdfView(QWidget):
     def _show_status(self, message: str, *, render_state: str = "not_requested") -> None:
         self._status_label.setText(message)
         self._status_label.setProperty("renderState", render_state)
+        self._repolish(self._status_label)
         self._status_label.show()
         self._canvas.hide()
         self._content.adjustSize()
@@ -625,3 +634,9 @@ class PdfView(QWidget):
 
     def _bump_generation(self) -> None:
         self._generation += 1
+
+    @staticmethod
+    def _repolish(widget: QWidget) -> None:
+        style = widget.style()
+        style.unpolish(widget)
+        style.polish(widget)

@@ -24,9 +24,6 @@ class _ThemeRenderService(QObject):
     render_succeeded = Signal(object)
     render_failed = Signal(object, int, int, str)
 
-    def __init__(self) -> None:
-        super().__init__()
-
     def open_document(self, *args, **kwargs) -> None:
         return None
 
@@ -49,10 +46,13 @@ def test_load_stylesheet_returns_bootstrap_like_styles() -> None:
 
     assert "QToolButton" in light
     assert "QToolButton" in dark
+    assert "QToolButton {" not in light
+    assert "QPushButton {" not in light
     assert "QMenu" not in light
-    assert "QWidget {" not in light
     assert "QTabBar::close-button" not in light
     assert "QToolButton:focus" in light
+    assert "QWidget#documentToolbar QComboBox" in light
+    assert 'QFrame#pageCard[renderState="error"]' in light
     assert light != dark
 
 
