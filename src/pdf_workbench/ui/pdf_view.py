@@ -443,6 +443,12 @@ class PdfView(QWidget):
         text_index_failed = getattr(self._render_service, "text_index_failed", None)
         if text_index_failed is not None:
             text_index_failed.connect(self._on_text_index_failed)
+        text_index_progress = getattr(self._render_service, "text_index_progress", None)
+        if text_index_progress is not None:
+            text_index_progress.connect(self._on_text_index_progress)
+        text_index_completed = getattr(self._render_service, "text_index_completed", None)
+        if text_index_completed is not None:
+            text_index_completed.connect(self._on_text_index_completed)
 
     @property
     def page_count(self) -> int:
@@ -469,18 +475,7 @@ class PdfView(QWidget):
         self._path = resolved_path
         self._current_page_index = 0
         self._metadata = None
-        self._text_indexes.clear()
-        self._normalized_page_texts.clear()
-        self._search_query = ""
-        self._search_matches.clear()
-        self._current_match_index = -1
-        self._selection = None
-        self._selection_anchor = None
-        self._selection_active = False
-        self._indexed_page_count = 0
-        self._failed_page_count = 0
-        self._index_total_page_count = 0
-        self._indexing_completed = False
+        self._clear_text_state(clear_query=True)
         self._bump_generation()
         self._show_status("PDFを読み込み中です")
         try:
@@ -561,6 +556,7 @@ class PdfView(QWidget):
         if self._closed:
             return
         self._closed = True
+        self._release_mouse_grab()
         self._bump_generation()
         self._render_service.close_document(self._document_id, self._generation)
 
@@ -568,13 +564,9 @@ class PdfView(QWidget):
         if self._closed:
             return
         self._path = None
-        self._metadata = None
         self._desired_pages.clear()
-        self._text_indexes.clear()
-        self._normalized_page_texts.clear()
-        self._search_matches.clear()
-        self._selection = None
-        self._selection_anchor = None
+        self._clear_text_state(clear_query=True)
+        self._metadata = None
         self._bump_generation()
         self._render_service.close_document(self._document_id, self._generation)
         self._show_status("PDFを開いてください")
@@ -598,6 +590,7 @@ class PdfView(QWidget):
         self.state_changed.emit()
 
     def _show_error(self, message: str) -> None:
+        self._release_mouse_grab()
         self._metadata = None
         self._show_status(message, render_state="error")
         self.error_occurred.emit(message)
@@ -679,14 +672,20 @@ class PdfView(QWidget):
     def _on_text_index_ready(
         self,
         document_id: object,
-        _generation: int,
+        revision: object,
         page_text: object,
     ) -> None:
         if document_id != self._document_id or self._closed:
             return
+        if not isinstance(revision, DocumentRevision):
+            raise TypeError("revision must be DocumentRevision")
         if not isinstance(page_text, PageTextIndex):
             raise TypeError("page_text must be PageTextIndex")
-        if self._metadata is None or page_text.revision != self._metadata.revision:
+        if self._metadata is None:
+            return
+        if revision != self._metadata.revision:
+            return
+        if page_text.revision != revision:
             return
         self._text_indexes[page_text.page_index] = page_text
         self._normalized_page_texts[page_text.page_index] = self._normalize_page_text(page_text)
@@ -695,6 +694,44 @@ class PdfView(QWidget):
             self._recompute_search_matches()
         self.search_state_changed.emit()
         self._refresh_page_overlays(page_text.page_index)
+
+    def _on_text_index_progress(
+        self,
+        document_id: object,
+        revision: object,
+        indexed_pages: int,
+        total_pages: int,
+        failed_pages: int,
+    ) -> None:
+        if document_id != self._document_id or self._closed:
+            return
+        if not isinstance(revision, DocumentRevision):
+            raise TypeError("revision must be DocumentRevision")
+        if self._metadata is None or revision != self._metadata.revision:
+            return
+        self._indexed_page_count = indexed_pages
+        self._index_total_page_count = total_pages
+        self._failed_page_count = failed_pages
+        self._indexing_completed = indexed_pages + failed_pages >= total_pages
+        self.search_state_changed.emit()
+
+    def _on_text_index_completed(
+        self,
+        document_id: object,
+        revision: object,
+        indexed_pages: int,
+        failed_pages: int,
+    ) -> None:
+        if document_id != self._document_id or self._closed:
+            return
+        if not isinstance(revision, DocumentRevision):
+            raise TypeError("revision must be DocumentRevision")
+        if self._metadata is None or revision != self._metadata.revision:
+            return
+        self._indexed_page_count = indexed_pages
+        self._failed_page_count = failed_pages
+        self._indexing_completed = True
+        self.search_state_changed.emit()
 
     def _on_text_index_failed(
         self,
@@ -802,19 +839,23 @@ class PdfView(QWidget):
         self.state_changed.emit()
 
     def _match_rect_in_content(self, match: SearchMatch) -> QRectF | None:
-        if self._metadata is None or not match.boxes:
+        if self._metadata is None or not 0 <= match.page_index < len(self._canvas.pages):
             return None
-        if not 0 <= match.page_index < len(self._canvas.pages):
+        if not match.boxes:
             return None
         page = self._canvas.pages[match.page_index]
         box = next((candidate for candidate in match.boxes if candidate is not None), None)
         if box is None:
             return None
         mapper = page._coordinate_mapper()
-        local_rect = mapper.pdf_to_view_rect(box)
+        box_in_page_content = mapper.pdf_to_view_rect(box)
+        page_origin_in_content = page.mapTo(self._content, QPoint(0, 0))
+        page_content_origin_in_content = (
+            QPointF(page_origin_in_content) + page.page_content_rect().topLeft()
+        )
         return QRectF(
-            QPointF(page.page_content_rect().topLeft() + local_rect.topLeft()),
-            local_rect.size(),
+            page_content_origin_in_content + box_in_page_content.topLeft(),
+            box_in_page_content.size(),
         )
 
     def _recompute_search_matches(self) -> None:
@@ -927,18 +968,13 @@ class PdfView(QWidget):
                 current_boxes_by_page.get(index, []),
             )
 
-    def _begin_selection(self, page_index: int, position: object) -> None:
+    def _begin_selection(self, global_position: object) -> None:
         text_position = self._text_position_from_global(
-            position,
+            global_position,
             allow_page_edge_fallback=False,
         )
         if text_position is None:
-            text_position = self._position_to_text_position(
-                page_index,
-                position,
-                allow_page_edge_fallback=False,
-            )
-        if text_position is None:
+            self._release_mouse_grab()
             return
         self._selection_anchor = text_position
         self._selection_active = True
@@ -946,29 +982,24 @@ class PdfView(QWidget):
         self.selection_changed.emit()
         self._refresh_page_overlays()
 
-    def _update_selection(self, page_index: int, position: object) -> None:
+    def _update_selection(self, global_position: object) -> None:
         if not self._selection_active or self._selection_anchor is None:
             return
         text_position = self._text_position_from_global(
-            position,
+            global_position,
             allow_page_edge_fallback=True,
         )
-        if text_position is None:
-            text_position = self._position_to_text_position(
-                page_index,
-                position,
-                allow_page_edge_fallback=True,
-            )
         if text_position is None:
             return
         self._selection = DocumentTextSelection(anchor=self._selection_anchor, focus=text_position)
         self.selection_changed.emit()
         self._refresh_page_overlays()
 
-    def _finish_selection(self, page_index: int, position: object) -> None:
-        self._update_selection(page_index, position)
+    def _finish_selection(self, global_position: object) -> None:
+        self._update_selection(global_position)
         self._selection_active = False
         self._selection_anchor = None
+        self._release_mouse_grab()
         self.selection_changed.emit()
 
     def _text_position_from_global(
@@ -979,66 +1010,58 @@ class PdfView(QWidget):
     ) -> TextPosition | None:
         if not isinstance(global_position, QPointF):
             return None
-        local_position = self._content.mapFromGlobal(global_position.toPoint())
-        position = QPointF(local_position)
+        global_point = global_position.toPoint()
         for page_index, page in enumerate(self._canvas.pages):
-            content_rect = page.page_content_rect()
-            page_rect = self.page_content_rect(page_index)
-            if not page_rect.contains(position):
+            page_local_point = page.mapFromGlobal(global_point)
+            if not page.rect().contains(page_local_point):
                 continue
-            local = position - content_rect.topLeft()
+            page_local = QPointF(page_local_point)
+            content_local = page_local - page.page_content_rect().topLeft()
+            content_rect = page.page_content_rect()
             mapper = page._coordinate_mapper()
-            pdf_point = mapper.view_to_pdf_point(local)
-            char_index = self._character_index_for_point(page_index, pdf_point, local)
-            if char_index is None and allow_page_edge_fallback:
-                if local.y() < 0 and page_index > 0:
-                    previous = self._text_indexes.get(page_index - 1)
-                    if previous and previous.characters:
-                        return TextPosition(
-                            page_index=page_index - 1,
-                            pdfium_index=previous.characters[-1].pdfium_index,
-                        )
-                if local.y() > content_rect.height() and page_index + 1 < len(self._canvas.pages):
-                    following = self._text_indexes.get(page_index + 1)
-                    if following and following.characters:
-                        return TextPosition(
-                            page_index=page_index + 1,
-                            pdfium_index=following.characters[0].pdfium_index,
-                        )
+            pdf_point = mapper.view_to_pdf_point(content_local)
+            char_index = self._character_index_for_point(page_index, pdf_point, content_local)
+            if (
+                char_index is None
+                and allow_page_edge_fallback
+                and 0.0 <= content_local.x() <= content_rect.width()
+            ):
+                if content_local.y() < 0:
+                    return self._page_edge_text_position(page_index, at_end=False)
+                if content_local.y() > content_rect.height():
+                    return self._page_edge_text_position(page_index, at_end=True)
             if char_index is None:
                 return None
             return TextPosition(page_index=page_index, pdfium_index=char_index)
+        if allow_page_edge_fallback:
+            return self._gap_fallback_text_position(global_point.y())
         return None
 
-    def _position_to_text_position(
-        self,
-        page_index: int,
-        position: object,
-        *,
-        allow_page_edge_fallback: bool,
-    ) -> TextPosition | None:
-        if not isinstance(position, QPointF):
+    def _page_edge_text_position(self, page_index: int, *, at_end: bool) -> TextPosition | None:
+        text_index = self._text_indexes.get(page_index)
+        if text_index is None or not text_index.characters:
             return None
-        if not 0 <= page_index < len(self._canvas.pages):
+        characters = sorted(text_index.characters, key=lambda character: character.pdfium_index)
+        character = characters[-1] if at_end else characters[0]
+        return TextPosition(page_index=page_index, pdfium_index=character.pdfium_index)
+
+    def _gap_fallback_text_position(self, global_y: int) -> TextPosition | None:
+        if self._selection_anchor is None:
             return None
-        page = self._canvas.pages[page_index]
-        local = position - page.page_content_rect().topLeft()
-        mapper = page._coordinate_mapper()
-        pdf_point = mapper.view_to_pdf_point(local)
-        char_index = self._character_index_for_point(page_index, pdf_point, local)
-        if char_index is None:
-            if not allow_page_edge_fallback:
-                return None
-            text_index = self._text_indexes.get(page_index)
-            if text_index is None or not text_index.characters:
-                return None
-            if local.y() < 0:
-                char_index = text_index.characters[0].pdfium_index
-            elif local.y() > page.page_content_rect().height():
-                char_index = text_index.characters[-1].pdfium_index
-            else:
-                return None
-        return TextPosition(page_index=page_index, pdfium_index=char_index)
+        anchor_page_index = self._selection_anchor.page_index
+        for page_index in range(len(self._canvas.pages) - 1):
+            upper = self._canvas.pages[page_index]
+            lower = self._canvas.pages[page_index + 1]
+            upper_top_left = upper.mapToGlobal(QPoint(0, 0))
+            lower_top_left = lower.mapToGlobal(QPoint(0, 0))
+            upper_bottom = upper_top_left.y() + upper.height()
+            lower_top = lower_top_left.y()
+            if not upper_bottom < global_y < lower_top:
+                continue
+            if anchor_page_index <= page_index:
+                return self._page_edge_text_position(page_index, at_end=True)
+            return self._page_edge_text_position(page_index + 1, at_end=False)
+        return None
 
     def _character_index_for_point(
         self,
@@ -1109,6 +1132,7 @@ class PdfView(QWidget):
             self._show_error(str(exc))
             return
         if revision != self._metadata.revision:
+            self._clear_text_state(clear_query=True)
             self._metadata = None
             self._bump_generation()
             self._show_status("PDFを再読み込み中です")
@@ -1229,6 +1253,31 @@ class PdfView(QWidget):
 
     def _bump_generation(self) -> None:
         self._generation += 1
+
+    def _clear_text_state(self, *, clear_query: bool) -> None:
+        self._release_mouse_grab()
+        self._text_indexes.clear()
+        self._normalized_page_texts.clear()
+        self._search_matches.clear()
+        self._current_match_index = -1
+        self._selection = None
+        self._selection_anchor = None
+        self._selection_active = False
+        self._indexed_page_count = 0
+        self._failed_page_count = 0
+        self._index_total_page_count = 0
+        self._indexing_completed = False
+        if clear_query:
+            self._search_query = ""
+        self._refresh_page_overlays()
+        self.search_state_changed.emit()
+        self.selection_changed.emit()
+
+    @staticmethod
+    def _release_mouse_grab() -> None:
+        grabber = QWidget.mouseGrabber()
+        if grabber is not None:
+            grabber.releaseMouse()
 
     @staticmethod
     def _repolish(widget: QWidget) -> None:
