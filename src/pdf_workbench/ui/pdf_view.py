@@ -7,7 +7,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QCloseEvent, QColor, QPainter, QPaintEvent, QPixmap
+from PySide6.QtGui import QCloseEvent, QPainter, QPaintEvent, QPixmap
 from PySide6.QtWidgets import QFrame, QLabel, QScrollArea, QSizePolicy, QVBoxLayout, QWidget
 
 from pdf_workbench.services.page_coordinates import PageCoordinateMapper, PageMetadata
@@ -46,9 +46,9 @@ class PagePlaceholder(QFrame):
         self._device_pixel_ratio = 1.0
         self._pixmap: QPixmap | None = None
         self._message = f"Page {page_index + 1}"
+        self.setObjectName("pageCard")
         self.setFrameShape(QFrame.Shape.Box)
         self.setLineWidth(1)
-        self.setStyleSheet("background: white; border: 1px solid #c8c8c8;")
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
 
     @property
@@ -125,13 +125,12 @@ class PagePlaceholder(QFrame):
     def paintEvent(self, event: QPaintEvent) -> None:
         super().paintEvent(event)
         painter = QPainter(self)
-        painter.fillRect(self.rect().adjusted(1, 1, -1, -1), QColor("#f7f7f7"))
         if self._pixmap is not None:
             target = self.page_content_rect()
             painter.drawPixmap(target, self._pixmap, QRectF(self._pixmap.rect()))
             return
 
-        painter.setPen(QColor("#666666"))
+        painter.setPen(self.palette().color(self.foregroundRole()))
         painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._status_text())
 
     def _status_text(self) -> str:
@@ -256,6 +255,14 @@ class PdfView(QWidget):
     @property
     def page_index(self) -> int:
         return self._current_page_index
+
+    @property
+    def zoom_factor(self) -> float:
+        return self._logical_zoom
+
+    @property
+    def rotation(self) -> int:
+        return self._rotation
 
     @property
     def path(self) -> Path | None:

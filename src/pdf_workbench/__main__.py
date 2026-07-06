@@ -11,6 +11,7 @@ from pdf_workbench.core.app_paths import APP_AUTHOR, APP_NAME
 from pdf_workbench.core.logging_config import configure_logging
 from pdf_workbench.core.settings import configure_qsettings
 from pdf_workbench.ui.main_window import MainWindow
+from pdf_workbench.ui.theme import ThemeController
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -28,6 +29,8 @@ def main() -> int:
     app.setApplicationName(APP_NAME)
     app.setOrganizationName(APP_AUTHOR)
     app.setApplicationVersion(__version__)
+    theme_controller = ThemeController(app)
+    theme_controller.start()
     settings = configure_qsettings()
 
     window = MainWindow(settings)

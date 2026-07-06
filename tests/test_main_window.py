@@ -53,6 +53,7 @@ def test_main_window_opens_and_closes_multiple_documents(
     assert window._tabs.count() == 2
     assert window._documents[0].session.source_path == first.resolve()
     assert window._documents[1].session.source_path == second.resolve()
+    assert window._stack.currentWidget() is window._tabs
 
     assert window.close_document_at(1) is True
     assert window._tabs.count() == 1
@@ -154,6 +155,29 @@ def test_main_window_drops_missing_recent_files_from_menu(
 
     assert window._recent_files == []
     assert window.recent_files_menu.actions()[0].isEnabled() is False
+
+
+def test_main_window_starts_on_empty_state_and_updates_toolbar(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    window = MainWindow(settings)
+    qtbot.addWidget(window)
+
+    assert window._stack.currentWidget() is window._empty_state
+    assert window._toolbar_widget.page_field.value() == 1
+    assert window._toolbar_widget.zoom_field.currentText() == "150%"
+
+    document_path = tmp_path / "state.pdf"
+    document_path.touch()
+    window.open_document(document_path)
+
+    assert window._stack.currentWidget() is window._tabs
+    assert window._toolbar_widget.page_field.value() == 1
+    assert window._toolbar_widget.zoom_field.currentText() == "150%"
 
 
 def test_main_window_accepts_pdf_drag_and_drop(
