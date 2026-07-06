@@ -37,6 +37,7 @@ from pdf_workbench.services.page_coordinates import (
 from pdf_workbench.services.pdf_renderer import (
     DocumentMetadata,
     DocumentRevision,
+    NormalizedPageText,
     PageTextIndex,
     PdfRenderServiceProtocol,
     RenderRequest,
@@ -65,15 +66,23 @@ _SELECTION_OUTLINE = QColor(13, 71, 161, 200)
 
 
 @dataclass(frozen=True, slots=True)
-class PageTextSelection:
+class TextPosition:
     page_index: int
-    start: int
-    end: int
+    pdfium_index: int
 
-    def normalized(self) -> PageTextSelection:
-        if (self.page_index, self.start) <= (self.page_index, self.end):
-            return self
-        return PageTextSelection(self.page_index, self.end, self.start)
+
+@dataclass(frozen=True, slots=True)
+class DocumentTextSelection:
+    anchor: TextPosition
+    focus: TextPosition
+
+    def normalized(self) -> tuple[TextPosition, TextPosition]:
+        if (self.anchor.page_index, self.anchor.pdfium_index) <= (
+            self.focus.page_index,
+            self.focus.pdfium_index,
+        ):
+            return self.anchor, self.focus
+        return self.focus, self.anchor
 
 
 class PlaceholderState(StrEnum):
@@ -357,9 +366,10 @@ class PdfView(QWidget):
         self._search_query: str = ""
         self._search_matches: list[SearchMatch] = []
         self._current_match_index = -1
-        self._selection: PageTextSelection | None = None
-        self._selection_anchor: tuple[int, int] | None = None
+        self._selection: DocumentTextSelection | None = None
+        self._selection_anchor: TextPosition | None = None
         self._selection_active = False
+        self._normalized_page_texts: dict[int, NormalizedPageText] = {}
 
         self._content = QWidget(self)
         self._content.setObjectName("pdfContent")
@@ -434,6 +444,7 @@ class PdfView(QWidget):
         self._current_page_index = 0
         self._metadata = None
         self._text_indexes.clear()
+        self._normalized_page_texts.clear()
         self._search_query = ""
         self._search_matches.clear()
         self._current_match_index = -1
@@ -530,6 +541,7 @@ class PdfView(QWidget):
         self._metadata = None
         self._desired_pages.clear()
         self._text_indexes.clear()
+        self._normalized_page_texts.clear()
         self._search_matches.clear()
         self._selection = None
         self._selection_anchor = None
@@ -643,6 +655,7 @@ class PdfView(QWidget):
         if self._metadata is None or page_text.revision != self._metadata.revision:
             return
         self._text_indexes[page_text.page_index] = page_text
+        self._normalized_page_texts[page_text.page_index] = self._normalize_page_text(page_text)
         if self._search_query:
             self._recompute_search_matches()
         self._refresh_page_overlays(page_text.page_index)
@@ -691,11 +704,41 @@ class PdfView(QWidget):
     def selected_text(self) -> str:
         if self._selection is None:
             return ""
-        selection = self._selection.normalized()
-        if selection.page_index not in self._text_indexes:
+        start, end = self._selection.normalized()
+        parts: list[str] = []
+        for page_index in range(start.page_index, end.page_index + 1):
+            text_index = self._text_indexes.get(page_index)
+            if text_index is None:
+                continue
+            if page_index == start.page_index == end.page_index:
+                parts.append(
+                    self._text_slice(text_index, start.pdfium_index, end.pdfium_index + 1)
+                )
+            elif page_index == start.page_index:
+                parts.append(
+                    self._text_slice(
+                        text_index,
+                        start.pdfium_index,
+                        len(text_index.characters),
+                    )
+                )
+            elif page_index == end.page_index:
+                parts.append(self._text_slice(text_index, 0, end.pdfium_index + 1))
+            else:
+                parts.append(self._text_slice(text_index, 0, len(text_index.characters)))
+        result = "\n".join(part for part in parts if part)
+        if result or start.page_index != end.page_index:
+            return result
+        text_index = self._text_indexes.get(start.page_index)
+        if text_index is None:
             return ""
-        text_index = self._text_indexes[selection.page_index]
-        return text_index.text[selection.start : selection.end]
+        begin = min(start.pdfium_index, end.pdfium_index)
+        finish = max(start.pdfium_index, end.pdfium_index) + 1
+        return "".join(
+            character.text
+            for character in text_index.characters
+            if begin <= character.pdfium_index < finish
+        ).replace("\x00", "")
 
     def _goto_match(self, match_index: int) -> None:
         if not 0 <= match_index < len(self._search_matches):
@@ -714,37 +757,62 @@ class PdfView(QWidget):
             return
         lowered = query.casefold()
         for page_index in sorted(self._text_indexes):
+            normalized = self._normalized_page_texts.get(page_index)
             text_index = self._text_indexes[page_index]
-            text = text_index.text.casefold()
+            if normalized is None:
+                continue
             start = 0
             while True:
-                found = text.find(lowered, start)
+                found = normalized.text.find(lowered, start)
                 if found == -1:
                     break
                 end = found + len(lowered)
-                boxes = self._boxes_for_range(text_index, found, end)
+                source_indexes = normalized.source_character_indexes[found:end]
+                boxes = self._boxes_for_source_indexes(text_index, source_indexes)
                 self._search_matches.append(
                     SearchMatch(
                         page_index=page_index,
                         start=found,
                         end=end,
-                        text=text_index.text[found:end],
+                        text="".join(text_index.characters[index].text for index in source_indexes),
                         boxes=tuple(boxes),
                     )
                 )
                 start = found + max(1, len(lowered))
 
-    def _boxes_for_range(
+    def _boxes_for_source_indexes(
         self,
         text_index: PageTextIndex,
-        start: int,
-        end: int,
+        source_indexes: tuple[int, ...],
     ) -> list[PdfRect]:
         boxes: list[PdfRect] = []
         for character in text_index.characters:
-            if start <= character.pdfium_index < end and character.box is not None:
+            if character.pdfium_index in source_indexes and character.box is not None:
                 boxes.append(character.box)
         return boxes
+
+    def _normalize_page_text(self, text_index: PageTextIndex) -> NormalizedPageText:
+        normalized_parts: list[str] = []
+        source_character_indexes: list[int] = []
+        for index, character in enumerate(text_index.characters):
+            folded = character.text.casefold().replace("\x00", "")
+            if not folded:
+                continue
+            normalized_parts.append(folded)
+            source_character_indexes.extend([index] * len(folded))
+        return NormalizedPageText(
+            text="".join(normalized_parts),
+            source_character_indexes=tuple(source_character_indexes),
+        )
+
+    @staticmethod
+    def _text_slice(text_index: PageTextIndex, start: int, end: int) -> str:
+        characters = [
+            character.text
+            for character in text_index.characters
+            if start <= character.pdfium_index < end
+        ]
+        return "".join(characters).replace("\x00", "")
 
     def _refresh_page_overlays(self, page_index: int | None = None) -> None:
         if self._metadata is None or not self._canvas.pages:
@@ -758,14 +826,15 @@ class PdfView(QWidget):
                     current_boxes_by_page.setdefault(match.page_index, []).extend(match.boxes)
         selection_boxes_by_page: dict[int, list[PdfRect]] = {}
         if self._selection is not None:
-            selection = self._selection.normalized()
-            text_index = self._text_indexes.get(selection.page_index)
-            if text_index is not None:
-                selection_boxes_by_page[selection.page_index] = self._boxes_for_range(
-                    text_index,
-                    selection.start,
-                    selection.end,
-                )
+            start_position, end_position = self._selection.normalized()
+            for index, text_index in self._text_indexes.items():
+                if start_position.page_index <= index <= end_position.page_index:
+                    selection_boxes_by_page[index] = self._selection_boxes_for_page(
+                        text_index,
+                        index,
+                        start_position,
+                        end_position,
+                    )
         pages = [page_index] if page_index is not None else list(range(len(self._canvas.pages)))
         for index in pages:
             if not 0 <= index < len(self._canvas.pages):
@@ -778,32 +847,27 @@ class PdfView(QWidget):
             )
 
     def _begin_selection(self, page_index: int, position: object) -> None:
-        point = self._position_to_page_point(page_index, position)
-        if point is None:
+        text_position = self._position_to_text_position(page_index, position)
+        if text_position is None:
             return
-        char_index = self._character_index_for_point(page_index, point)
-        if char_index is None:
-            return
-        self._selection_anchor = (page_index, char_index)
+        self._selection_anchor = text_position
         self._selection_active = True
-        self._selection = PageTextSelection(page_index, char_index, char_index + 1)
+        self._selection = DocumentTextSelection(anchor=text_position, focus=text_position)
         self._refresh_page_overlays(page_index)
 
     def _update_selection(self, page_index: int, position: object) -> None:
         if not self._selection_active or self._selection_anchor is None:
             return
-        point = self._position_to_page_point(page_index, position)
-        if point is None:
+        text_position = self._position_to_text_position(page_index, position)
+        if text_position is None:
+            text_index = self._text_indexes.get(page_index)
+            if text_index is None or not text_index.characters:
+                return
+            fallback_index = text_index.characters[-1].pdfium_index
+            text_position = TextPosition(page_index=page_index, pdfium_index=fallback_index)
+        if text_position is None:
             return
-        char_index = self._character_index_for_point(page_index, point)
-        if char_index is None:
-            return
-        anchor_page, anchor_index = self._selection_anchor
-        if page_index != anchor_page:
-            return
-        start = min(anchor_index, char_index)
-        end = max(anchor_index, char_index) + 1
-        self._selection = PageTextSelection(page_index, start, end)
+        self._selection = DocumentTextSelection(anchor=self._selection_anchor, focus=text_position)
         self._refresh_page_overlays(page_index)
 
     def _finish_selection(self, page_index: int, position: object) -> None:
@@ -811,7 +875,7 @@ class PdfView(QWidget):
         self._selection_active = False
         self._selection_anchor = None
 
-    def _position_to_page_point(self, page_index: int, position: object) -> PdfPoint | None:
+    def _position_to_text_position(self, page_index: int, position: object) -> TextPosition | None:
         if not isinstance(position, QPointF):
             return None
         if not 0 <= page_index < len(self._canvas.pages):
@@ -819,9 +883,26 @@ class PdfView(QWidget):
         page = self._canvas.pages[page_index]
         local = position - page.page_content_rect().topLeft()
         mapper = page._coordinate_mapper()
-        return mapper.view_to_pdf_point(local)
+        pdf_point = mapper.view_to_pdf_point(local)
+        char_index = self._character_index_for_point(page_index, pdf_point, local)
+        if char_index is None:
+            text_index = self._text_indexes.get(page_index)
+            if text_index is None or not text_index.characters:
+                return None
+            midpoint = page.page_content_rect().width() / 2.0
+            char_index = (
+                text_index.characters[0].pdfium_index
+                if local.x() <= midpoint
+                else text_index.characters[-1].pdfium_index
+            )
+        return TextPosition(page_index=page_index, pdfium_index=char_index)
 
-    def _character_index_for_point(self, page_index: int, point: PdfPoint) -> int | None:
+    def _character_index_for_point(
+        self,
+        page_index: int,
+        point: PdfPoint,
+        view_point: QPointF,
+    ) -> int | None:
         text_index = self._text_indexes.get(page_index)
         if text_index is None or not text_index.characters:
             return None
@@ -831,15 +912,59 @@ class PdfView(QWidget):
             box = character.box
             if box is None:
                 continue
-            center_x = (box.left + box.right) / 2.0
-            center_y = (box.bottom + box.top) / 2.0
-            distance = math.hypot(center_x - point.x, center_y - point.y)
-            if box.left <= point.x <= box.right and box.bottom <= point.y <= box.top:
+            mapper = self._canvas.pages[page_index]._coordinate_mapper()
+            view_rect = mapper.pdf_to_view_rect(box)
+            if view_rect.contains(view_point):
                 return character.pdfium_index
-            if distance < best_distance:
+            distance = self._distance_to_rect(view_rect, view_point)
+            if distance <= 6.0 and distance < best_distance:
                 best_distance = distance
                 best_index = character.pdfium_index
-        return best_index
+        if best_index is not None:
+            return best_index
+
+        fallback_index = None
+        for character in text_index.characters:
+            box = character.box
+            if box is None:
+                continue
+            if view_point.x() + 6.0 >= box.left:
+                fallback_index = character.pdfium_index
+            else:
+                break
+        if fallback_index is not None:
+            return fallback_index
+        return text_index.characters[0].pdfium_index
+
+    def _selection_boxes_for_page(
+        self,
+        text_index: PageTextIndex,
+        page_index: int,
+        start: TextPosition,
+        end: TextPosition,
+    ) -> list[PdfRect]:
+        boxes: list[PdfRect] = []
+        for character in text_index.characters:
+            if character.box is None:
+                continue
+            if page_index == start.page_index and page_index == end.page_index:
+                if start.pdfium_index <= character.pdfium_index <= end.pdfium_index:
+                    boxes.append(character.box)
+            elif page_index == start.page_index:
+                if character.pdfium_index >= start.pdfium_index:
+                    boxes.append(character.box)
+            elif page_index == end.page_index:
+                if character.pdfium_index <= end.pdfium_index:
+                    boxes.append(character.box)
+            elif start.page_index < page_index < end.page_index:
+                boxes.append(character.box)
+        return boxes
+
+    @staticmethod
+    def _distance_to_rect(rect: QRectF, point: QPointF) -> float:
+        dx = max(rect.left() - point.x(), 0.0, point.x() - rect.right())
+        dy = max(rect.top() - point.y(), 0.0, point.y() - rect.bottom())
+        return math.hypot(dx, dy)
 
     def _schedule_visible_page_update(self) -> None:
         if self._metadata is None or self._closed:

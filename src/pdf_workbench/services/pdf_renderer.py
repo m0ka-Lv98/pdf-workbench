@@ -60,6 +60,12 @@ class PageTextIndex:
 
 
 @dataclass(frozen=True, slots=True)
+class NormalizedPageText:
+    text: str
+    source_character_indexes: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class SearchMatch:
     page_index: int
     start: int
