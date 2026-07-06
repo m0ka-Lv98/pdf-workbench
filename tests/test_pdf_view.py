@@ -3,16 +3,17 @@ from __future__ import annotations
 import threading
 from pathlib import Path
 
+import pytest
 from pypdf import PdfWriter
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QWidget
 from pytestqt.qtbot import QtBot
 
+from pdf_workbench.services.page_coordinates import PageMetadata
 from pdf_workbench.services.pdf_renderer import (
     DocumentMetadata,
     DocumentRevision,
-    PageMetadata,
     PdfRenderService,
     RenderRequest,
     RenderResult,
@@ -77,7 +78,7 @@ class RecordingBackend:
 
     def page_metadata(self, page_index: int) -> PageMetadata:
         self.metadata_thread_ids.append(threading.get_ident())
-        return PageMetadata(144.0, 200.0)
+        return PageMetadata.from_size(144.0, 200.0)
 
     def render_page(
         self,
@@ -128,7 +129,7 @@ def create_stub_pdf(path: Path) -> Path:
 def create_metadata(path: Path, page_count: int) -> DocumentMetadata:
     return DocumentMetadata(
         revision=DocumentRevision.from_path(path),
-        pages=tuple(PageMetadata(144.0, 200.0) for _ in range(page_count)),
+        pages=tuple(PageMetadata.from_size(144.0, 200.0) for _ in range(page_count)),
     )
 
 
@@ -254,6 +255,12 @@ def test_rotation_change_notifies_worker_generation(
 
     assert service.generation_updates[-1][1] == 2
     assert service.generation_updates[-1][0] == view._document_id
+    assert view.page_content_rect(0).height() == pytest.approx(
+        view._canvas.pages[0].page_content_rect().height()
+    )
+    assert view.page_content_rect(0).width() == pytest.approx(
+        view._canvas.pages[0].page_content_rect().width()
+    )
 
 
 def test_fast_scroll_does_not_apply_old_offscreen_result(
@@ -325,6 +332,75 @@ def test_previous_and_next_navigation_scroll_to_target_page(
     view.set_page(3)
 
     assert view.page_index == 3
+
+
+def test_page_content_rect_tracks_rotation_and_zoom(qtbot: QtBot, tmp_path: Path) -> None:
+    document_path = create_pdf(tmp_path / "rect.pdf", 1)
+    service = FakeRenderService(create_metadata(document_path, 1))
+    view = PdfView(render_service=service, debounce_interval_ms=0)
+    _wrapper = show_view(qtbot, view)
+
+    view.open_document(document_path)
+    qtbot.waitUntil(lambda: view.page_count == 1)
+    qtbot.waitUntil(lambda: view.page_content_rect(0).width() > 0)
+
+    portrait_rect = view.page_content_rect(0)
+    placeholder = view._canvas.pages[0]
+    local_rect = placeholder.page_content_rect()
+    assert local_rect.width() == pytest.approx(portrait_rect.width())
+    assert local_rect.height() == pytest.approx(portrait_rect.height())
+    assert local_rect.left() == pytest.approx((placeholder.width() - local_rect.width()) / 2.0)
+    assert local_rect.top() == pytest.approx((placeholder.height() - local_rect.height()) / 2.0)
+    view.set_rotation(90)
+    landscape_rect = view.page_content_rect(0)
+    view.set_zoom(2.0)
+    zoomed_rect = view.page_content_rect(0)
+
+    assert portrait_rect.width() != landscape_rect.width()
+    assert zoomed_rect.width() > landscape_rect.width()
+    assert _wrapper.isVisible()
+
+
+def test_page_placeholder_minimum_extent_and_centering(qtbot: QtBot, tmp_path: Path) -> None:
+    document_path = create_pdf(tmp_path / "small.pdf", 1)
+    service = FakeRenderService(create_metadata(document_path, 1))
+    view = PdfView(render_service=service, debounce_interval_ms=0)
+    _wrapper = show_view(qtbot, view)
+
+    view.open_document(document_path)
+    qtbot.waitUntil(lambda: view.page_count == 1)
+    qtbot.waitUntil(lambda: view._canvas.pages[0].width() >= 200)
+
+    placeholder = view._canvas.pages[0]
+    content_rect = placeholder.page_content_rect()
+    assert placeholder.width() >= 200
+    assert placeholder.height() >= 200
+    assert content_rect.left() == pytest.approx((placeholder.width() - content_rect.width()) / 2.0)
+    assert content_rect.top() == pytest.approx((placeholder.height() - content_rect.height()) / 2.0)
+    assert _wrapper.isVisible()
+
+
+def test_page_view_validation_rejects_invalid_rotation_and_zoom(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    document_path = create_pdf(tmp_path / "validation.pdf", 1)
+    service = FakeRenderService(create_metadata(document_path, 1))
+    view = PdfView(render_service=service, debounce_interval_ms=0)
+    _wrapper = show_view(qtbot, view)
+
+    view.open_document(document_path)
+    qtbot.waitUntil(lambda: view.page_count == 1)
+
+    with pytest.raises(ValueError):
+        view.set_rotation(45)
+    with pytest.raises(ValueError):
+        view.set_rotation(360)
+    with pytest.raises(ValueError):
+        view.set_zoom(float("nan"))
+    with pytest.raises(ValueError):
+        view.set_zoom(float("inf"))
+    assert _wrapper.isVisible()
 
 
 def test_real_render_service_shuts_down_without_thread_leak(qtbot: QtBot) -> None:

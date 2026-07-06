@@ -7,10 +7,10 @@ import pytest
 from PySide6.QtGui import QImage
 from pytestqt.qtbot import QtBot
 
+from pdf_workbench.services.page_coordinates import PageMetadata
 from pdf_workbench.services.pdf_renderer import (
     DocumentMetadata,
     DocumentRevision,
-    PageMetadata,
     PdfiumDocumentBackend,
     PdfRenderWorker,
     RenderCacheKey,
@@ -45,7 +45,7 @@ class FakeBackend:
         return 2
 
     def page_metadata(self, page_index: int) -> PageMetadata:
-        return PageMetadata(width_points=100.0 + page_index, height_points=200.0)
+        return PageMetadata.from_size(100.0 + page_index, 200.0)
 
     def render_page(
         self,
@@ -177,6 +177,42 @@ def test_pdfium_backend_sets_device_pixel_ratio(tmp_path: Path) -> None:
     assert image.devicePixelRatio() == 2.0
     assert metadata.page_count == 1
     assert metadata.pages[0].width_points > 0
+    assert metadata.pages[0].height_points > 0
+    assert metadata.pages[0].geometry.visible_box.width > 0
+    assert metadata.pages[0].geometry.visible_box.height > 0
+
+
+@pytest.mark.parametrize(
+    ("logical_zoom", "device_pixel_ratio", "rotation"),
+    [
+        (float("nan"), 1.0, 0),
+        (float("inf"), 1.0, 0),
+        (1.0, float("nan"), 0),
+        (1.0, float("inf"), 0),
+        (1.0, 1.0, 45),
+        (1.0, 1.0, 360),
+    ],
+)
+def test_pdfium_backend_rejects_invalid_render_inputs(
+    tmp_path: Path,
+    logical_zoom: float,
+    device_pixel_ratio: float,
+    rotation: int,
+) -> None:
+    from pypdf import PdfWriter
+
+    pdf_path = tmp_path / "invalid-render.pdf"
+    writer = PdfWriter()
+    writer.add_blank_page(width=144, height=144)
+    with pdf_path.open("wb") as stream:
+        writer.write(stream)
+
+    backend = PdfiumDocumentBackend(pdf_path)
+    try:
+        with pytest.raises(ValueError):
+            backend.render_page(0, logical_zoom, rotation, device_pixel_ratio)
+    finally:
+        backend.close()
 
 
 def test_render_worker_closes_only_target_document_and_keeps_others(tmp_path: Path) -> None:

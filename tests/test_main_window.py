@@ -9,7 +9,8 @@ from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import QMessageBox
 from pytestqt.qtbot import QtBot
 
-from pdf_workbench.services.pdf_renderer import DocumentMetadata, DocumentRevision, PageMetadata
+from pdf_workbench.services.page_coordinates import PageMetadata
+from pdf_workbench.services.pdf_renderer import DocumentMetadata, DocumentRevision
 from pdf_workbench.ui.main_window import MainWindow
 from pdf_workbench.ui.pdf_view import PdfView
 
@@ -20,7 +21,7 @@ def patch_pdf_open(monkeypatch: pytest.MonkeyPatch) -> None:
         self._current_page_index = 0
         self._metadata = DocumentMetadata(
             revision=DocumentRevision.from_path(path),
-            pages=(PageMetadata(144.0, 144.0),),
+            pages=(PageMetadata.from_size(144.0, 144.0),),
         )
         self.state_changed.emit()
 
