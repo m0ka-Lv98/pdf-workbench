@@ -9,6 +9,7 @@ from PySide6.QtCore import QMimeData, QSettings, QSize, Qt
 from PySide6.QtGui import QAction, QCloseEvent, QDragEnterEvent, QDropEvent, QKeySequence
 from PySide6.QtWidgets import (
     QFileDialog,
+    QInputDialog,
     QMainWindow,
     QMessageBox,
     QStackedWidget,
@@ -118,6 +119,22 @@ class MainWindow(QMainWindow):
         self.zoom_out_action.setShortcut(QKeySequence.StandardKey.ZoomOut)
         self.zoom_out_action.triggered.connect(lambda: self._change_zoom(1 / 1.2))
 
+        self.find_action = QAction("検索", self)
+        self.find_action.setShortcut(QKeySequence.StandardKey.Find)
+        self.find_action.triggered.connect(self._prompt_search)
+
+        self.find_next_action = QAction("次の検索結果", self)
+        self.find_next_action.setShortcut(QKeySequence("F3"))
+        self.find_next_action.triggered.connect(self._next_match)
+
+        self.find_previous_action = QAction("前の検索結果", self)
+        self.find_previous_action.setShortcut(QKeySequence("Shift+F3"))
+        self.find_previous_action.triggered.connect(self._previous_match)
+
+        self.copy_action = QAction("コピー", self)
+        self.copy_action.setShortcut(QKeySequence.StandardKey.Copy)
+        self.copy_action.triggered.connect(self._copy_selection)
+
     def _create_menu(self) -> None:
         file_menu = self.menuBar().addMenu("ファイル")
         file_menu.addAction(self.open_action)
@@ -132,6 +149,13 @@ class MainWindow(QMainWindow):
         view_menu.addSeparator()
         view_menu.addAction(self.zoom_in_action)
         view_menu.addAction(self.zoom_out_action)
+
+        edit_menu = self.menuBar().addMenu("編集")
+        edit_menu.addAction(self.find_action)
+        edit_menu.addAction(self.find_next_action)
+        edit_menu.addAction(self.find_previous_action)
+        edit_menu.addSeparator()
+        edit_menu.addAction(self.copy_action)
 
     def _create_toolbar(self) -> None:
         toolbar = QToolBar("メイン", self)
@@ -254,6 +278,41 @@ class MainWindow(QMainWindow):
         self._sync_toolbar(document)
         self._update_status()
 
+    def _prompt_search(self) -> None:
+        document = self._current_document()
+        if document is None:
+            return
+        query, accepted = QInputDialog.getText(self, "検索", "検索キーワード")
+        if not accepted or not query.strip():
+            return
+        count = document.view.search(query)
+        if count == 0:
+            self.statusBar().showMessage("一致する語句が見つかりません", 5000)
+            return
+        document.view.next_match()
+        self.statusBar().showMessage(f"{count} 件の一致", 5000)
+
+    def _next_match(self) -> None:
+        document = self._current_document()
+        if document is None:
+            return
+        if not document.view.next_match():
+            self.statusBar().showMessage("検索結果がありません", 5000)
+
+    def _previous_match(self) -> None:
+        document = self._current_document()
+        if document is None:
+            return
+        if not document.view.previous_match():
+            self.statusBar().showMessage("検索結果がありません", 5000)
+
+    def _copy_selection(self) -> None:
+        document = self._current_document()
+        if document is None:
+            return
+        if not document.view.copy_selected_text():
+            self.statusBar().showMessage("コピーするテキストが選択されていません", 5000)
+
     def _set_page_from_toolbar(self, page_index: int) -> None:
         document = self._current_document()
         if document is None:
@@ -343,6 +402,10 @@ class MainWindow(QMainWindow):
         self.next_action.setEnabled(has_document)
         self.zoom_in_action.setEnabled(has_document)
         self.zoom_out_action.setEnabled(has_document)
+        self.find_action.setEnabled(has_document)
+        self.find_next_action.setEnabled(has_document)
+        self.find_previous_action.setEnabled(has_document)
+        self.copy_action.setEnabled(has_document)
 
     def _on_current_tab_changed(self, _index: int) -> None:
         self._update_window_title()

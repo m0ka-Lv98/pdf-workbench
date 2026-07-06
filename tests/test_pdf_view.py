@@ -5,18 +5,20 @@ from pathlib import Path
 
 import pytest
 from pypdf import PdfWriter
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, QPointF, Signal
 from PySide6.QtGui import QImage
-from PySide6.QtWidgets import QWidget
+from PySide6.QtWidgets import QApplication, QWidget
 from pytestqt.qtbot import QtBot
 
-from pdf_workbench.services.page_coordinates import PageMetadata
+from pdf_workbench.services.page_coordinates import PageMetadata, PdfRect
 from pdf_workbench.services.pdf_renderer import (
     DocumentMetadata,
     DocumentRevision,
+    PageTextIndex,
     PdfRenderService,
     RenderRequest,
     RenderResult,
+    TextCharacterBox,
 )
 from pdf_workbench.ui.pdf_view import PdfView, PlaceholderState
 
@@ -26,6 +28,8 @@ class FakeRenderService(QObject):
     document_failed = Signal(object, int, str)
     render_succeeded = Signal(object)
     render_failed = Signal(object, int, int, str)
+    text_index_ready = Signal(object, int, object)
+    text_index_failed = Signal(object, int, int, str)
 
     def __init__(self, metadata: DocumentMetadata) -> None:
         super().__init__()
@@ -35,6 +39,7 @@ class FakeRenderService(QObject):
         self.close_calls: list[tuple[str, int]] = []
         self.generation_updates: list[tuple[str, int, DocumentRevision]] = []
         self.shutdown_called = False
+        self.text_requests: list[tuple[str, int, int, DocumentRevision]] = []
 
     def open_document(
         self,
@@ -62,6 +67,27 @@ class FakeRenderService(QObject):
 
     def shutdown(self, timeout_ms: int = 3000) -> None:
         self.shutdown_called = True
+
+    def emit_text_index(
+        self,
+        document_id: str,
+        generation: int,
+        page_index: int,
+        text: str,
+        boxes: list[PdfRect],
+    ) -> None:
+        self.text_index_ready.emit(
+            document_id,
+            generation,
+            PageTextIndex(
+                page_index=page_index,
+                text=text,
+                characters=tuple(
+                    TextCharacterBox(index=index, text=text[index], box=box)
+                    for index, box in enumerate(boxes)
+                ),
+            ),
+        )
 
 
 class RecordingBackend:
@@ -123,6 +149,60 @@ def create_pdf(path: Path, page_count: int) -> Path:
 
 def create_stub_pdf(path: Path) -> Path:
     path.write_bytes(b"%PDF-1.7\n")
+    return path
+
+
+def create_text_pdf(path: Path, pages: list[str], rotations: list[int] | None = None) -> Path:
+    rotations = rotations or [0] * len(pages)
+    if len(rotations) != len(pages):
+        raise ValueError("rotations must match pages")
+
+    objects: list[bytes] = [
+        b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n",
+        f"2 0 obj << /Type /Pages /Count {len(pages)} /Kids [".encode("ascii"),
+    ]
+    page_object_numbers = [3 + index * 2 for index in range(len(pages))]
+    content_object_numbers = [4 + index * 2 for index in range(len(pages))]
+    objects[1] += b" ".join(f"{number} 0 R".encode("ascii") for number in page_object_numbers)
+    objects[1] += b"] >> endobj\n"
+    for page_number, content_number, text, rotation in zip(
+        page_object_numbers,
+        content_object_numbers,
+        pages,
+        rotations,
+        strict=True,
+    ):
+        content = f"BT /F1 18 Tf 40 100 Td ({text}) Tj ET".encode("latin-1")
+        page_dict = (
+            f"{page_number} 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] "
+            f"/Resources << /Font << /F1 100 0 R >> >> /Contents {content_number} 0 R"
+        )
+        if rotation:
+            page_dict += f" /Rotate {rotation}"
+        page_dict += " >> endobj\n"
+        objects.append(page_dict.encode("ascii"))
+        objects.append(
+            f"{content_number} 0 obj << /Length {len(content)} >> stream\n".encode("ascii")
+            + content
+            + b"\nendstream\nendobj\n"
+        )
+    objects.append(b"100 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n")
+    pdf = bytearray(b"%PDF-1.4\n")
+    offsets = [0]
+    for obj in objects:
+        offsets.append(len(pdf))
+        pdf.extend(obj)
+    xref_start = len(pdf)
+    pdf.extend(f"xref\n0 {len(offsets)}\n".encode("ascii"))
+    pdf.extend(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        pdf.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
+    pdf.extend(
+        (
+            f"trailer << /Size {len(offsets)} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n"
+        ).encode("ascii")
+    )
+    path.write_bytes(pdf)
     return path
 
 
@@ -458,3 +538,127 @@ def test_real_render_service_rerenders_after_rotation_change(
     qtbot.waitUntil(lambda: not service._thread.isRunning())
     assert not service._thread.isRunning()
     assert wrapper.isVisible()
+
+
+def test_text_search_highlights_matches_and_navigates_between_results(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    document_path = create_pdf(tmp_path / "search.pdf", 1)
+    service = FakeRenderService(create_metadata(document_path, 1))
+    view = PdfView(render_service=service, debounce_interval_ms=0)
+    _wrapper = show_view(qtbot, view)
+
+    view.open_document(document_path)
+    qtbot.waitUntil(lambda: view.page_count == 1)
+
+    page_index = 0
+    service.emit_text_index(
+        view._document_id,
+        view._generation,
+        page_index,
+        "Hello world hello",
+        [
+            PdfRect(10.0, 10.0, 30.0, 30.0),
+            PdfRect(34.0, 10.0, 54.0, 30.0),
+            PdfRect(58.0, 10.0, 78.0, 30.0),
+            PdfRect(82.0, 10.0, 102.0, 30.0),
+            PdfRect(106.0, 10.0, 126.0, 30.0),
+            PdfRect(130.0, 10.0, 150.0, 30.0),
+            PdfRect(154.0, 10.0, 174.0, 30.0),
+            PdfRect(178.0, 10.0, 198.0, 30.0),
+            PdfRect(202.0, 10.0, 222.0, 30.0),
+            PdfRect(226.0, 10.0, 246.0, 30.0),
+            PdfRect(250.0, 10.0, 270.0, 30.0),
+            PdfRect(274.0, 10.0, 294.0, 30.0),
+            PdfRect(298.0, 10.0, 318.0, 30.0),
+            PdfRect(322.0, 10.0, 342.0, 30.0),
+            PdfRect(346.0, 10.0, 366.0, 30.0),
+            PdfRect(370.0, 10.0, 390.0, 30.0),
+            PdfRect(394.0, 10.0, 414.0, 30.0),
+        ],
+    )
+
+    assert view.search("hello") == 2
+    assert view.next_match() is True
+    assert view._current_match_index == 0
+    assert view._canvas.pages[0]._current_match_boxes
+    assert view.next_match() is True
+    assert view._current_match_index == 1
+    assert view.previous_match() is True
+    assert view._current_match_index == 0
+    assert _wrapper.isVisible()
+
+
+def test_text_selection_and_copy_use_character_boxes(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    document_path = create_pdf(tmp_path / "selection.pdf", 1)
+    service = FakeRenderService(create_metadata(document_path, 1))
+    view = PdfView(render_service=service, debounce_interval_ms=0)
+    _wrapper = show_view(qtbot, view)
+
+    view.open_document(document_path)
+    qtbot.waitUntil(lambda: view.page_count == 1)
+
+    boxes = [
+        PdfRect(10.0, 10.0, 20.0, 30.0),
+        PdfRect(22.0, 10.0, 32.0, 30.0),
+        PdfRect(34.0, 10.0, 44.0, 30.0),
+    ]
+    service.emit_text_index(view._document_id, view._generation, 0, "abc", boxes)
+
+    view._begin_selection(0, QPointF(12.0, 12.0))
+    view._update_selection(0, QPointF(80.0, 12.0))
+
+    assert view.selected_text == "abc"
+    assert view.copy_selected_text() is True
+    assert QApplication.clipboard().text() == "abc"
+    assert view._canvas.pages[0]._selection_boxes
+    assert _wrapper.isVisible()
+
+
+def test_real_text_pdf_indexes_search_terms_and_survives_rotation(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    document_path = create_text_pdf(tmp_path / "real-text.pdf", ["Hello PDF Workbench"], [90])
+    service = FakeRenderService(create_metadata(document_path, 1))
+    view = PdfView(render_service=service, debounce_interval_ms=0)
+    _wrapper = show_view(qtbot, view)
+
+    view.open_document(document_path)
+    qtbot.waitUntil(lambda: view.page_count == 1)
+    service.emit_text_index(
+        view._document_id,
+        view._generation,
+        0,
+        "Hello PDF Workbench",
+        [
+            PdfRect(10.0, 10.0, 18.0, 26.0),
+            PdfRect(20.0, 10.0, 28.0, 26.0),
+            PdfRect(30.0, 10.0, 38.0, 26.0),
+            PdfRect(40.0, 10.0, 48.0, 26.0),
+            PdfRect(50.0, 10.0, 58.0, 26.0),
+            PdfRect(60.0, 10.0, 68.0, 26.0),
+            PdfRect(70.0, 10.0, 78.0, 26.0),
+            PdfRect(80.0, 10.0, 88.0, 26.0),
+            PdfRect(90.0, 10.0, 98.0, 26.0),
+            PdfRect(100.0, 10.0, 108.0, 26.0),
+            PdfRect(110.0, 10.0, 118.0, 26.0),
+            PdfRect(120.0, 10.0, 128.0, 26.0),
+            PdfRect(130.0, 10.0, 138.0, 26.0),
+            PdfRect(140.0, 10.0, 148.0, 26.0),
+            PdfRect(150.0, 10.0, 158.0, 26.0),
+            PdfRect(160.0, 10.0, 168.0, 26.0),
+            PdfRect(170.0, 10.0, 178.0, 26.0),
+            PdfRect(180.0, 10.0, 188.0, 26.0),
+            PdfRect(190.0, 10.0, 198.0, 26.0),
+        ],
+    )
+
+    assert view.search("PDF") == 1
+    assert view.next_match() is True
+    assert view._canvas.pages[0]._current_match_boxes
+    assert _wrapper.isVisible()
