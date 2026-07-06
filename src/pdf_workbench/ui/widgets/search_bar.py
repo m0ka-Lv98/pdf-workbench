@@ -17,7 +17,6 @@ class SearchBarState:
 
 class SearchBar(QWidget):
     search_requested = Signal(str)
-    search_changed = Signal(str)
     next_requested = Signal()
     previous_requested = Signal()
     close_requested = Signal()
@@ -81,7 +80,6 @@ class SearchBar(QWidget):
         layout.addWidget(self.progress_label)
         layout.addWidget(self.close_button)
 
-        self.search_input.returnPressed.connect(self.next_requested.emit)
         self.search_input.installEventFilter(self)
 
     def set_state(self, state: SearchBarState) -> None:
@@ -98,8 +96,7 @@ class SearchBar(QWidget):
     def cancel_pending_search(self) -> None:
         self._search_timer.stop()
 
-    def _on_text_changed(self, text: str) -> None:
-        self.search_changed.emit(text)
+    def _on_text_changed(self, _text: str) -> None:
         self._search_timer.start()
 
     def _emit_debounced_search(self) -> None:

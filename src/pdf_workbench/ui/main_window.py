@@ -10,6 +10,7 @@ from PySide6.QtGui import QAction, QCloseEvent, QDragEnterEvent, QDropEvent, QKe
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QStackedWidget,
@@ -328,6 +329,10 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("検索結果がありません", 5000)
 
     def _copy_selection(self) -> None:
+        focus_widget = QApplication.focusWidget()
+        if isinstance(focus_widget, QLineEdit) and focus_widget.hasSelectedText():
+            focus_widget.copy()
+            return
         document = self._current_document()
         if document is None:
             return
@@ -345,12 +350,12 @@ class MainWindow(QMainWindow):
 
     def _close_search(self) -> None:
         document = self._current_document()
-        if document is None:
-            return
         self._search_bar.cancel_pending_search()
-        document.view.search("")
         if self._search_toolbar is not None:
             self._search_toolbar.hide()
+        if document is None:
+            return
+        document.view.search("")
         self._sync_search_bar(document)
 
     def _set_page_from_toolbar(self, page_index: int) -> None:
@@ -456,11 +461,12 @@ class MainWindow(QMainWindow):
         self.find_previous_action.setEnabled(has_document)
         self.copy_action.setEnabled(text_selected or document_selection)
         if not has_document and self._search_toolbar is not None:
+            self._search_bar.cancel_pending_search()
             self._search_toolbar.hide()
 
     def _on_current_tab_changed(self, _index: int) -> None:
         document = self._current_document()
-        if document is not None and self._search_bar.isVisible():
+        if document is not None and self._is_search_open():
             self._search_bar.cancel_pending_search()
             self._sync_search_bar(document)
         self._update_window_title()
@@ -535,41 +541,43 @@ class MainWindow(QMainWindow):
 
     def _sync_search_bar(self, document: DocumentTab) -> None:
         state = document.view.search_state
-        if not self._search_bar.isVisible():
+        if not self._is_search_open():
             return
-        progress_text = (
-            "索引完了"
-            if state.indexing_completed
-            else (
-                f"索引作成中 {state.indexed_pages} / {state.total_pages}"
-                + ("(1ページ失敗)" if state.failed_pages else "")
-            )
-        )
         self._search_bar.set_state(
             SearchBarState(
                 query=state.query,
                 current_index=state.current_index,
                 total_count=state.total_count,
-                progress_text=progress_text,
+                progress_text=self._search_progress_text(state),
             )
         )
 
     def _search_state_for(self, document: DocumentTab) -> SearchBarState:
         state = document.view.search_state
-        progress_text = (
-            "索引完了"
-            if state.indexing_completed
-            else (
-                f"索引作成中 {state.indexed_pages} / {state.total_pages}"
-                + ("(1ページ失敗)" if state.failed_pages else "")
-            )
-        )
         return SearchBarState(
             query=state.query,
             current_index=state.current_index,
             total_count=state.total_count,
-            progress_text=progress_text,
+            progress_text=self._search_progress_text(state),
         )
+
+    def _is_search_open(self) -> bool:
+        return self._search_toolbar is not None and self._search_toolbar.isVisible()
+
+    @staticmethod
+    def _search_progress_text(state: object) -> str:
+        from pdf_workbench.ui.pdf_view import PdfSearchState
+
+        if not isinstance(state, PdfSearchState):
+            raise TypeError("state must be PdfSearchState")
+        if state.indexing_completed:
+            if state.failed_pages:
+                return f"索引完了\uff08{state.failed_pages}ページ失敗\uff09"
+            return "索引完了"
+        text = f"索引作成中 {state.indexed_pages} / {state.total_pages}"
+        if state.failed_pages:
+            text += f"\uff08{state.failed_pages}ページ失敗\uff09"
+        return text
 
     def _report_error(self, title: str, message: str) -> None:
         self.statusBar().showMessage(message, 5000)
