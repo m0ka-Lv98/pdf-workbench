@@ -6,8 +6,18 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QCloseEvent, QColor, QPainter, QPaintEvent, QPixmap
+from PySide6.QtCore import (
+    QEvent,
+    QObject,
+    QPoint,
+    QPointF,
+    QRectF,
+    QSize,
+    Qt,
+    QTimer,
+    Signal,
+)
+from PySide6.QtGui import QCloseEvent, QColor, QPainter, QPaintEvent, QPalette, QPixmap
 from PySide6.QtWidgets import QFrame, QLabel, QScrollArea, QSizePolicy, QVBoxLayout, QWidget
 
 from pdf_workbench.services.page_coordinates import PageCoordinateMapper, PageMetadata
@@ -25,6 +35,12 @@ def _clamp(value: int, minimum: int, maximum: int) -> int:
 
 _CONTENT_MARGIN = 8.0
 _MINIMUM_PAGE_EXTENT = 200
+_MIN_USER_ZOOM = 0.25
+_MAX_USER_ZOOM = 5.0
+_BASE_RENDER_SCALE = 1.5
+_MIN_LOGICAL_ZOOM = _BASE_RENDER_SCALE * _MIN_USER_ZOOM
+_MAX_LOGICAL_ZOOM = _BASE_RENDER_SCALE * _MAX_USER_ZOOM
+_PAGE_CORNER_RADIUS = 6.0
 
 
 class PlaceholderState(StrEnum):
@@ -41,15 +57,16 @@ class PagePlaceholder(QFrame):
         self.page_index = page_index
         self._state = PlaceholderState.NOT_REQUESTED
         self._metadata: PageMetadata | None = None
-        self._logical_zoom = 1.5
+        self._logical_zoom = _BASE_RENDER_SCALE
         self._rotation = 0
         self._device_pixel_ratio = 1.0
         self._pixmap: QPixmap | None = None
         self._message = f"Page {page_index + 1}"
+        self.setObjectName("pageCard")
         self.setFrameShape(QFrame.Shape.Box)
         self.setLineWidth(1)
-        self.setStyleSheet("background: white; border: 1px solid #c8c8c8;")
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.setProperty("renderState", self._state.value)
 
     @property
     def state(self) -> PlaceholderState:
@@ -70,6 +87,8 @@ class PagePlaceholder(QFrame):
 
     def set_state(self, state: PlaceholderState, message: str | None = None) -> None:
         self._state = state
+        self.setProperty("renderState", state.value)
+        self._repolish()
         if message is not None:
             self._message = message
         self.update()
@@ -77,12 +96,16 @@ class PagePlaceholder(QFrame):
     def set_pixmap(self, pixmap: QPixmap) -> None:
         self._pixmap = pixmap
         self._state = PlaceholderState.DISPLAYED
+        self.setProperty("renderState", self._state.value)
+        self._repolish()
         self.update()
 
     def clear_pixmap(self, message: str) -> None:
         self._pixmap = None
         self._message = message
         self._state = PlaceholderState.NOT_REQUESTED
+        self.setProperty("renderState", self._state.value)
+        self._repolish()
         self.update()
 
     def sizeHint(self) -> QSize:
@@ -123,16 +146,28 @@ class PagePlaceholder(QFrame):
         self.update()
 
     def paintEvent(self, event: QPaintEvent) -> None:
-        super().paintEvent(event)
         painter = QPainter(self)
-        painter.fillRect(self.rect().adjusted(1, 1, -1, -1), QColor("#f7f7f7"))
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        rect = self.rect().adjusted(2, 2, -2, -2)
+        shadow = rect.translated(2, 3)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 28))
+        painter.drawRoundedRect(shadow, _PAGE_CORNER_RADIUS, _PAGE_CORNER_RADIUS)
+
+        surface = rect
+        painter.setBrush(self.palette().base())
+        painter.drawRoundedRect(surface, _PAGE_CORNER_RADIUS, _PAGE_CORNER_RADIUS)
+
         if self._pixmap is not None:
             target = self.page_content_rect()
             painter.drawPixmap(target, self._pixmap, QRectF(self._pixmap.rect()))
-            return
+        else:
+            painter.setPen(self.palette().color(QPalette.ColorRole.WindowText))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._status_text())
 
-        painter.setPen(QColor("#666666"))
-        painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._status_text())
+        painter.setPen(self.palette().color(QPalette.ColorRole.Mid))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(surface, _PAGE_CORNER_RADIUS, _PAGE_CORNER_RADIUS)
 
     def _status_text(self) -> str:
         labels = {
@@ -145,6 +180,11 @@ class PagePlaceholder(QFrame):
         if self._state == PlaceholderState.DISPLAYED:
             return ""
         return f"{self.page_index + 1}\n{labels[self._state]}"
+
+    def _repolish(self) -> None:
+        style = self.style()
+        style.unpolish(self)
+        style.polish(self)
 
 
 class ContinuousPageCanvas(QWidget):
@@ -202,6 +242,7 @@ class PdfView(QWidget):
         debounce_interval_ms: int = 40,
     ) -> None:
         super().__init__(parent)
+        self.setObjectName("pdfView")
         self._render_service = render_service
         self._document_id = uuid.uuid4().hex
         self._path: Path | None = None
@@ -214,18 +255,23 @@ class PdfView(QWidget):
         self._desired_pages: set[int] = set()
 
         self._content = QWidget(self)
+        self._content.setObjectName("pdfContent")
         self._content_layout = QVBoxLayout(self._content)
         self._content_layout.setContentsMargins(0, 0, 0, 0)
 
         self._status_label = QLabel("PDFを開いてください", self._content)
+        self._status_label.setObjectName("pdfStatusLabel")
         self._status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._status_label.setProperty("renderState", "not_requested")
 
         self._canvas = ContinuousPageCanvas(self._content)
+        self._canvas.setObjectName("pdfCanvas")
         self._canvas.hide()
         self._content_layout.addWidget(self._status_label)
         self._content_layout.addWidget(self._canvas)
 
         self._scroll_area = QScrollArea(self)
+        self._scroll_area.setObjectName("pdfScrollArea")
         self._scroll_area.setWidgetResizable(False)
         self._scroll_area.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
         self._scroll_area.setWidget(self._content)
@@ -256,6 +302,14 @@ class PdfView(QWidget):
     @property
     def page_index(self) -> int:
         return self._current_page_index
+
+    @property
+    def zoom_factor(self) -> float:
+        return self._logical_zoom
+
+    @property
+    def rotation(self) -> int:
+        return self._rotation
 
     @property
     def path(self) -> Path | None:
@@ -303,9 +357,9 @@ class PdfView(QWidget):
         if not math.isfinite(scale):
             raise ValueError("scale must be finite")
         if self._metadata is None:
-            self._logical_zoom = max(0.25, min(scale, 5.0))
+            self._logical_zoom = max(_MIN_LOGICAL_ZOOM, min(scale, _MAX_LOGICAL_ZOOM))
             return
-        self._logical_zoom = max(0.25, min(scale, 5.0))
+        self._logical_zoom = max(_MIN_LOGICAL_ZOOM, min(scale, _MAX_LOGICAL_ZOOM))
         self._desired_pages.clear()
         self._advance_render_generation()
         for index, page in enumerate(self._canvas.pages):
@@ -368,8 +422,10 @@ class PdfView(QWidget):
             self._schedule_visible_page_update()
         return super().eventFilter(watched, event)
 
-    def _show_status(self, message: str) -> None:
+    def _show_status(self, message: str, *, render_state: str = "not_requested") -> None:
         self._status_label.setText(message)
+        self._status_label.setProperty("renderState", render_state)
+        self._repolish(self._status_label)
         self._status_label.show()
         self._canvas.hide()
         self._content.adjustSize()
@@ -377,7 +433,7 @@ class PdfView(QWidget):
 
     def _show_error(self, message: str) -> None:
         self._metadata = None
-        self._show_status(message)
+        self._show_status(message, render_state="error")
         self.error_occurred.emit(message)
 
     def _on_document_loaded(self, document_id: object, generation: int, metadata: object) -> None:
@@ -579,3 +635,9 @@ class PdfView(QWidget):
 
     def _bump_generation(self) -> None:
         self._generation += 1
+
+    @staticmethod
+    def _repolish(widget: QWidget) -> None:
+        style = widget.style()
+        style.unpolish(widget)
+        style.polish(widget)

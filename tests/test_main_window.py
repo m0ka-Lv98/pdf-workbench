@@ -53,6 +53,10 @@ def test_main_window_opens_and_closes_multiple_documents(
     assert window._tabs.count() == 2
     assert window._documents[0].session.source_path == first.resolve()
     assert window._documents[1].session.source_path == second.resolve()
+    assert window._stack.currentWidget() is window._tabs
+    assert window._tabs.tabBar().elideMode() == Qt.TextElideMode.ElideMiddle
+    assert window._tabs.tabBar().usesScrollButtons() is True
+    assert window._tabs.tabsClosable() is True
 
     assert window.close_document_at(1) is True
     assert window._tabs.count() == 1
@@ -154,6 +158,64 @@ def test_main_window_drops_missing_recent_files_from_menu(
 
     assert window._recent_files == []
     assert window.recent_files_menu.actions()[0].isEnabled() is False
+
+
+def test_main_window_starts_on_empty_state_and_updates_toolbar(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    window = MainWindow(settings)
+    qtbot.addWidget(window)
+
+    assert window._stack.currentWidget() is window._empty_state
+    assert window._toolbar_widget.page_field.text() == "—"
+    assert window._toolbar_widget.zoom_field.currentText() == "100%"
+
+    document_path = tmp_path / "state.pdf"
+    document_path.touch()
+    window.open_document(document_path)
+
+    assert window._stack.currentWidget() is window._tabs
+    assert window._toolbar_widget.page_field.value() == 1
+    assert window._toolbar_widget.zoom_field.currentText() == "100%"
+    assert window._documents[0].session.zoom_factor == 1.0
+    assert window._documents[0].view.zoom_factor == pytest.approx(1.5)
+
+
+@pytest.mark.parametrize(
+    ("user_zoom", "logical_zoom"),
+    [
+        (0.25, 0.375),
+        (1.0, 1.5),
+        (1.25, 1.875),
+        (2.0, 3.0),
+        (3.33, pytest.approx(4.995)),
+        (4.0, 6.0),
+        (5.0, 7.5),
+    ],
+)
+def test_main_window_maps_user_zoom_to_logical_zoom(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+    user_zoom: float,
+    logical_zoom: float,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    window = MainWindow(settings)
+    qtbot.addWidget(window)
+
+    document_path = tmp_path / "zoom.pdf"
+    document_path.touch()
+    window.open_document(document_path)
+    window._set_zoom_from_toolbar(user_zoom)
+
+    assert window._documents[0].session.zoom_factor == pytest.approx(user_zoom)
+    assert window._documents[0].view.zoom_factor == pytest.approx(logical_zoom)
 
 
 def test_main_window_accepts_pdf_drag_and_drop(
