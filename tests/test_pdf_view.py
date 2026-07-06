@@ -28,7 +28,9 @@ class FakeRenderService(QObject):
     document_failed = Signal(object, int, str)
     render_succeeded = Signal(object)
     render_failed = Signal(object, int, int, str)
-    text_index_ready = Signal(object, int, object)
+    text_page_indexed = Signal(object, object, object)
+    text_index_progress = Signal(object, object, int, int, int)
+    text_index_completed = Signal(object, object, int, int)
     text_index_failed = Signal(object, int, int, str)
 
     def __init__(self, metadata: DocumentMetadata) -> None:
@@ -71,19 +73,20 @@ class FakeRenderService(QObject):
     def emit_text_index(
         self,
         document_id: str,
-        generation: int,
+        revision: DocumentRevision,
         page_index: int,
         text: str,
         boxes: list[PdfRect],
     ) -> None:
-        self.text_index_ready.emit(
+        self.text_page_indexed.emit(
             document_id,
-            generation,
+            revision,
             PageTextIndex(
+                revision=revision,
                 page_index=page_index,
                 text=text,
                 characters=tuple(
-                    TextCharacterBox(index=index, text=text[index], box=box)
+                    TextCharacterBox(pdfium_index=index, text=text[index], box=box)
                     for index, box in enumerate(boxes)
                 ),
             ),
@@ -555,7 +558,7 @@ def test_text_search_highlights_matches_and_navigates_between_results(
     page_index = 0
     service.emit_text_index(
         view._document_id,
-        view._generation,
+        create_metadata(document_path, 1).revision,
         page_index,
         "Hello world hello",
         [
@@ -607,7 +610,13 @@ def test_text_selection_and_copy_use_character_boxes(
         PdfRect(22.0, 10.0, 32.0, 30.0),
         PdfRect(34.0, 10.0, 44.0, 30.0),
     ]
-    service.emit_text_index(view._document_id, view._generation, 0, "abc", boxes)
+    service.emit_text_index(
+        view._document_id,
+        create_metadata(document_path, 1).revision,
+        0,
+        "abc",
+        boxes,
+    )
 
     view._begin_selection(0, QPointF(12.0, 12.0))
     view._update_selection(0, QPointF(80.0, 12.0))
@@ -632,7 +641,7 @@ def test_real_text_pdf_indexes_search_terms_and_survives_rotation(
     qtbot.waitUntil(lambda: view.page_count == 1)
     service.emit_text_index(
         view._document_id,
-        view._generation,
+        create_metadata(document_path, 1).revision,
         0,
         "Hello PDF Workbench",
         [

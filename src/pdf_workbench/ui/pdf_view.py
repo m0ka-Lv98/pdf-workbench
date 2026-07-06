@@ -401,7 +401,7 @@ class PdfView(QWidget):
         self._render_service.document_failed.connect(self._on_document_failed)
         self._render_service.render_succeeded.connect(self._on_render_succeeded)
         self._render_service.render_failed.connect(self._on_render_failed)
-        text_index_ready = getattr(self._render_service, "text_index_ready", None)
+        text_index_ready = getattr(self._render_service, "text_page_indexed", None)
         if text_index_ready is not None:
             text_index_ready.connect(self._on_text_index_ready)
         text_index_failed = getattr(self._render_service, "text_index_failed", None)
@@ -640,6 +640,8 @@ class PdfView(QWidget):
             return
         if not isinstance(page_text, PageTextIndex):
             raise TypeError("page_text must be PageTextIndex")
+        if self._metadata is None or page_text.revision != self._metadata.revision:
+            return
         self._text_indexes[page_text.page_index] = page_text
         if self._search_query:
             self._recompute_search_matches()
@@ -740,7 +742,7 @@ class PdfView(QWidget):
     ) -> list[PdfRect]:
         boxes: list[PdfRect] = []
         for character in text_index.characters:
-            if start <= character.index < end:
+            if start <= character.pdfium_index < end and character.box is not None:
                 boxes.append(character.box)
         return boxes
 
@@ -827,14 +829,16 @@ class PdfView(QWidget):
         best_distance = float("inf")
         for character in text_index.characters:
             box = character.box
+            if box is None:
+                continue
             center_x = (box.left + box.right) / 2.0
             center_y = (box.bottom + box.top) / 2.0
             distance = math.hypot(center_x - point.x, center_y - point.y)
             if box.left <= point.x <= box.right and box.bottom <= point.y <= box.top:
-                return character.index
+                return character.pdfium_index
             if distance < best_distance:
                 best_distance = distance
-                best_index = character.index
+                best_index = character.pdfium_index
         return best_index
 
     def _schedule_visible_page_update(self) -> None:

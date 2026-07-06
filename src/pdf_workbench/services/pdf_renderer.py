@@ -46,16 +46,17 @@ class DocumentMetadata:
 
 @dataclass(frozen=True, slots=True)
 class TextCharacterBox:
-    index: int
+    pdfium_index: int
     text: str
-    box: PdfRect
+    box: PdfRect | None
 
 
 @dataclass(frozen=True, slots=True)
 class PageTextIndex:
+    revision: DocumentRevision
     page_index: int
-    text: str
     characters: tuple[TextCharacterBox, ...]
+    text: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,7 +134,11 @@ class PdfDocumentBackend(Protocol):
         device_pixel_ratio: float,
     ) -> QImage: ...
 
-    def extract_text_page(self, page_index: int) -> PageTextIndex: ...
+    def extract_text_page(
+        self,
+        page_index: int,
+        revision: DocumentRevision,
+    ) -> PageTextIndex: ...
 
     def close(self) -> None: ...
 
@@ -147,7 +152,9 @@ class PdfRenderServiceProtocol(Protocol):
     document_failed: Any
     render_succeeded: Any
     render_failed: Any
-    text_index_ready: Any
+    text_page_indexed: Any
+    text_index_progress: Any
+    text_index_completed: Any
     text_index_failed: Any
 
     def open_document(
@@ -211,32 +218,59 @@ class PdfiumDocumentBackend:
         qimage.setDevicePixelRatio(device_pixel_ratio)
         return qimage
 
-    def extract_text_page(self, page_index: int) -> PageTextIndex:
+    def extract_text_page(
+        self,
+        page_index: int,
+        revision: DocumentRevision,
+    ) -> PageTextIndex:
         page = self._document[page_index]
-        text_page = page.get_textpage()
         try:
-            count = text_page.count_chars()
-            text = text_page.get_text_range(0, -1)
-            characters: list[TextCharacterBox] = []
-            for index in range(count):
-                try:
-                    char_box = text_page.get_charbox(index)
-                except Exception:
-                    continue
-                box = PdfRect.normalized(
-                    (
-                        float(char_box[0]),
-                        float(char_box[1]),
-                        float(char_box[2]),
-                        float(char_box[3]),
+            text_page = page.get_textpage()
+            try:
+                count = text_page.count_chars()
+                characters: list[TextCharacterBox] = []
+                text_parts: list[str] = []
+                for index in range(count):
+                    try:
+                        piece = text_page.get_text_range(index, 1)
+                    except Exception:
+                        piece = ""
+                    piece = piece.replace("\x00", "")
+                    text_parts.append(piece)
+                    box: PdfRect | None
+                    try:
+                        char_box = text_page.get_charbox(index)
+                    except Exception:
+                        box = None
+                    else:
+                        try:
+                            box = PdfRect.normalized(
+                                (
+                                    float(char_box[0]),
+                                    float(char_box[1]),
+                                    float(char_box[2]),
+                                    float(char_box[3]),
+                                )
+                            )
+                        except Exception:
+                            box = None
+                    characters.append(
+                        TextCharacterBox(
+                            pdfium_index=index,
+                            text=piece,
+                            box=box,
+                        )
                     )
+                text = "".join(text_parts)
+                return PageTextIndex(
+                    revision=revision,
+                    page_index=page_index,
+                    characters=tuple(characters),
+                    text=text,
                 )
-                characters.append(
-                    TextCharacterBox(index=index, text=text[index : index + 1], box=box)
-                )
-            return PageTextIndex(page_index=page_index, text=text, characters=tuple(characters))
+            finally:
+                text_page.close()
         finally:
-            text_page.close()
             page.close()
 
     def close(self) -> None:
@@ -293,7 +327,9 @@ class PdfRenderWorker(QObject):
     document_failed = Signal(object, int, str)
     render_succeeded = Signal(object)
     render_failed = Signal(object, int, int, str)
-    text_index_ready = Signal(object, int, object)
+    text_page_indexed = Signal(object, object, object)
+    text_index_progress = Signal(object, object, int, int, int)
+    text_index_completed = Signal(object, object, int, int)
     text_index_failed = Signal(object, int, int, str)
     shutdown_completed = Signal()
 
@@ -308,6 +344,8 @@ class PdfRenderWorker(QObject):
         self._documents: dict[str, WorkerDocumentContext] = {}
         self._pending_requests: list[QueuedRenderRequest] = []
         self._pending_text_requests: list[tuple[str, int, int, DocumentRevision]] = []
+        self._processed_text_pages: dict[tuple[str, DocumentRevision], set[int]] = {}
+        self._failed_text_pages: dict[tuple[str, DocumentRevision], set[int]] = {}
         self._pending_keys: set[tuple[str, int, int, float, int, float, DocumentRevision]] = set()
         self._pending_text_keys: set[tuple[str, int, int, DocumentRevision]] = set()
         self._sequence = 0
@@ -329,7 +367,8 @@ class PdfRenderWorker(QObject):
             raise TypeError("revision must be DocumentRevision")
 
         self._close_document_backend(document_id)
-        self._drop_pending_for_document(document_id)
+        self._drop_pending_render_for_document(document_id)
+        self._drop_pending_text_for_document(document_id)
 
         backend: PdfDocumentBackend | None = None
         try:
@@ -420,7 +459,7 @@ class PdfRenderWorker(QObject):
             return
         if generation < context.generation:
             return
-        self._drop_pending_for_document(document_id)
+        self._drop_pending_render_for_document(document_id)
         self._close_document_backend(document_id)
 
     @Slot(str, int, object)
@@ -443,7 +482,7 @@ class PdfRenderWorker(QObject):
         if generation < context.generation:
             return
 
-        self._drop_pending_for_document(document_id)
+        self._drop_pending_render_for_document(document_id)
         context.generation = generation
 
     @Slot()
@@ -457,6 +496,8 @@ class PdfRenderWorker(QObject):
         self._pending_keys.clear()
         self._pending_text_requests.clear()
         self._pending_text_keys.clear()
+        self._processed_text_pages.clear()
+        self._failed_text_pages.clear()
         for document_id in list(self._documents):
             self._close_document_backend(document_id)
         self._documents.clear()
@@ -464,7 +505,11 @@ class PdfRenderWorker(QObject):
         self.shutdown_completed.emit()
 
     def _schedule_processing(self) -> None:
-        if self._processing or not self._pending_requests or self._shutting_down:
+        if (
+            self._processing
+            or self._shutting_down
+            or not (self._pending_requests or self._pending_text_requests)
+        ):
             return
         self._processing = True
         QTimer.singleShot(0, self._process_next)
@@ -487,11 +532,35 @@ class PdfRenderWorker(QObject):
                 self._schedule_processing()
                 return
             try:
-                text_index = context.backend.extract_text_page(page_index)
+                text_index = context.backend.extract_text_page(page_index, context.revision)
             except Exception as exc:
+                self._failed_text_pages.setdefault(
+                    (document_id, context.revision),
+                    set(),
+                ).add(page_index)
                 self.text_index_failed.emit(document_id, generation, page_index, str(exc))
             else:
-                self.text_index_ready.emit(document_id, generation, text_index)
+                self._processed_text_pages.setdefault(
+                    (document_id, context.revision),
+                    set(),
+                ).add(page_index)
+                self.text_page_indexed.emit(document_id, context.revision, text_index)
+            processed = len(self._processed_text_pages.get((document_id, context.revision), set()))
+            failed = len(self._failed_text_pages.get((document_id, context.revision), set()))
+            self.text_index_progress.emit(
+                document_id,
+                context.revision,
+                processed,
+                context.backend.page_count(),
+                failed,
+            )
+            if processed + failed >= context.backend.page_count():
+                self.text_index_completed.emit(
+                    document_id,
+                    context.revision,
+                    processed,
+                    failed,
+                )
             self._processing = False
             if self._pending_requests or self._pending_text_requests:
                 self._schedule_processing()
@@ -532,7 +601,7 @@ class PdfRenderWorker(QObject):
                 )
 
         self._processing = False
-        if self._pending_requests and not self._shutting_down:
+        if (self._pending_requests or self._pending_text_requests) and not self._shutting_down:
             self._schedule_processing()
 
     def _pop_next_valid_request(self) -> RenderRequest | None:
@@ -569,7 +638,7 @@ class PdfRenderWorker(QObject):
             return False
         return context.revision == revision
 
-    def _drop_pending_for_document(self, document_id: str) -> None:
+    def _drop_pending_render_for_document(self, document_id: str) -> None:
         kept_requests: list[QueuedRenderRequest] = []
         self._pending_keys.clear()
         for queued_request in self._pending_requests:
@@ -578,10 +647,18 @@ class PdfRenderWorker(QObject):
             kept_requests.append(queued_request)
             self._pending_keys.add(self._request_key(queued_request.request))
         self._pending_requests = kept_requests
+
+    def _drop_pending_text_for_document(self, document_id: str) -> None:
         self._pending_text_requests = [
             request for request in self._pending_text_requests if request[0] != document_id
         ]
         self._pending_text_keys = set(self._pending_text_requests)
+        for key in list(self._processed_text_pages):
+            if key[0] == document_id:
+                self._processed_text_pages.pop(key, None)
+        for key in list(self._failed_text_pages):
+            if key[0] == document_id:
+                self._failed_text_pages.pop(key, None)
 
     def _close_document_backend(self, document_id: str) -> None:
         context = self._documents.pop(document_id, None)
@@ -624,7 +701,9 @@ class PdfRenderService(QObject):
     document_failed = Signal(object, int, str)
     render_succeeded = Signal(object)
     render_failed = Signal(object, int, int, str)
-    text_index_ready = Signal(object, int, object)
+    text_page_indexed = Signal(object, object, object)
+    text_index_progress = Signal(object, object, int, int, int)
+    text_index_completed = Signal(object, object, int, int)
     text_index_failed = Signal(object, int, int, str)
     _open_requested = Signal(str, Path, int, object)
     _render_requested = Signal(object)
@@ -650,7 +729,9 @@ class PdfRenderService(QObject):
         self._worker.document_failed.connect(self.document_failed)
         self._worker.render_succeeded.connect(self.render_succeeded)
         self._worker.render_failed.connect(self.render_failed)
-        self._worker.text_index_ready.connect(self.text_index_ready)
+        self._worker.text_page_indexed.connect(self.text_page_indexed)
+        self._worker.text_index_progress.connect(self.text_index_progress)
+        self._worker.text_index_completed.connect(self.text_index_completed)
         self._worker.text_index_failed.connect(self.text_index_failed)
         self._worker.shutdown_completed.connect(
             self._thread.quit,

@@ -107,13 +107,16 @@ class FakeBackend:
         image.setDevicePixelRatio(device_pixel_ratio)
         return image
 
-    def extract_text_page(self, page_index: int) -> PageTextIndex:
+    def extract_text_page(self, page_index: int, revision: DocumentRevision) -> PageTextIndex:
         return PageTextIndex(
+            revision=revision,
             page_index=page_index,
             text=f"page {page_index}",
             characters=(
                 TextCharacterBox(
-                    index=0, text="p", box=PageMetadata.from_size(10, 10).geometry.visible_box
+                    pdfium_index=0,
+                    text="p",
+                    box=PageMetadata.from_size(10, 10).geometry.visible_box,
                 ),
             ),
         )
@@ -246,7 +249,10 @@ def test_pdfium_backend_extracts_text_and_character_boxes(tmp_path: Path) -> Non
 
     backend = PdfiumDocumentBackend(pdf_path)
     try:
-        page_text = backend.extract_text_page(0)
+        page_text = backend.extract_text_page(
+            0,
+            DocumentRevision.from_path(pdf_path),
+        )
     finally:
         backend.close()
 
@@ -336,8 +342,8 @@ def test_render_worker_indexes_text_pages_in_background(tmp_path: Path) -> None:
     revision = make_revision(tmp_path)
     path = tmp_path / "sample.pdf"
     text_pages: list[PageTextIndex] = []
-    worker.text_index_ready.connect(
-        lambda _document_id, _generation, page_text: text_pages.append(page_text)
+    worker.text_page_indexed.connect(
+        lambda _document_id, _revision, page_text: text_pages.append(page_text)
     )
 
     worker.open_document("doc-1", path, 1, revision)
