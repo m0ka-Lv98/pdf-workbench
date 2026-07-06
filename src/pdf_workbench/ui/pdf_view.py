@@ -40,6 +40,7 @@ _MAX_USER_ZOOM = 5.0
 _BASE_RENDER_SCALE = 1.5
 _MIN_LOGICAL_ZOOM = _BASE_RENDER_SCALE * _MIN_USER_ZOOM
 _MAX_LOGICAL_ZOOM = _BASE_RENDER_SCALE * _MAX_USER_ZOOM
+_PAGE_CORNER_RADIUS = 6.0
 
 
 class PlaceholderState(StrEnum):
@@ -151,11 +152,11 @@ class PagePlaceholder(QFrame):
         shadow = rect.translated(2, 3)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(0, 0, 0, 28))
-        painter.drawRoundedRect(shadow, 10.0, 10.0)
+        painter.drawRoundedRect(shadow, _PAGE_CORNER_RADIUS, _PAGE_CORNER_RADIUS)
 
         surface = rect
         painter.setBrush(self.palette().base())
-        painter.drawRoundedRect(surface, 10.0, 10.0)
+        painter.drawRoundedRect(surface, _PAGE_CORNER_RADIUS, _PAGE_CORNER_RADIUS)
 
         if self._pixmap is not None:
             target = self.page_content_rect()
@@ -166,7 +167,7 @@ class PagePlaceholder(QFrame):
 
         painter.setPen(self.palette().color(QPalette.ColorRole.Mid))
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawRoundedRect(surface, 10.0, 10.0)
+        painter.drawRoundedRect(surface, _PAGE_CORNER_RADIUS, _PAGE_CORNER_RADIUS)
 
     def _status_text(self) -> str:
         labels = {

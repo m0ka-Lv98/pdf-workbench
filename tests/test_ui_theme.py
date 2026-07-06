@@ -46,13 +46,21 @@ def test_load_stylesheet_returns_bootstrap_like_styles() -> None:
 
     assert "QToolButton" in light
     assert "QToolButton" in dark
-    assert "QToolButton {" not in light
-    assert "QPushButton {" not in light
+    assert not any(line.startswith("QToolButton {") for line in light.splitlines())
+    assert not any(line.startswith("QPushButton {") for line in light.splitlines())
+    assert not any(line.startswith("QLineEdit {") for line in light.splitlines())
+    assert not any(line.startswith("QComboBox {") for line in light.splitlines())
+    assert not any(line.startswith("QSpinBox {") for line in light.splitlines())
+    assert not any(line.startswith("QLabel {") for line in light.splitlines())
     assert "QMenu" not in light
     assert "QTabBar::close-button" not in light
     assert "QToolButton:focus" in light
     assert "QWidget#documentToolbar QComboBox" in light
+    assert "QWidget#documentToolbar QToolButton" in light
+    assert "QWidget#emptyState QPushButton" in light
+    assert "QWidget#emptyState QLabel#emptyStateTitle" in light
     assert 'QFrame#pageCard[renderState="error"]' in light
+    assert "border-radius: 6px" in light
     assert light != dark
 
 

@@ -14,7 +14,7 @@ QTabWidget#documentTabs::pane,
 QFrame#pageCard,
 QFrame#toolbarGroup {
   border: 1px solid #495057;
-  border-radius: 8px;
+  border-radius: 6px;
 }
 
 QTabWidget#documentTabs::pane,
@@ -37,12 +37,18 @@ QWidget#pdfContent {
 }
 
 QWidget#documentToolbar QToolButton,
-QWidget#documentToolbar QPushButton,
 QWidget#documentToolbar QLineEdit,
 QWidget#documentToolbar QComboBox,
-QWidget#documentToolbar QSpinBox,
-QWidget#emptyState QPushButton,
-QWidget#emptyState QLabel {
+QWidget#documentToolbar QSpinBox {
+  min-height: 32px;
+  border-radius: 6px;
+  border: 1px solid #495057;
+  background: #2b3035;
+  color: #f8f9fa;
+  padding: 4px 10px;
+}
+
+QWidget#emptyState QPushButton {
   min-height: 32px;
   border-radius: 6px;
   border: 1px solid #495057;
@@ -65,7 +71,6 @@ QWidget#emptyState QPushButton[variant="primary"]:hover {
 }
 
 QWidget#documentToolbar QToolButton:hover,
-QWidget#documentToolbar QPushButton:hover,
 QWidget#documentToolbar QLineEdit:hover,
 QWidget#documentToolbar QComboBox:hover,
 QWidget#documentToolbar QSpinBox:hover,
@@ -74,13 +79,11 @@ QWidget#emptyState QPushButton:hover {
 }
 
 QWidget#documentToolbar QToolButton:pressed,
-QWidget#documentToolbar QPushButton:pressed,
 QWidget#emptyState QPushButton:pressed {
   background: #343a40;
 }
 
 QWidget#documentToolbar QToolButton:disabled,
-QWidget#documentToolbar QPushButton:disabled,
 QWidget#documentToolbar QLineEdit:disabled,
 QWidget#documentToolbar QComboBox:disabled,
 QWidget#documentToolbar QSpinBox:disabled,
@@ -90,7 +93,6 @@ QWidget#emptyState QPushButton:disabled {
 }
 
 QWidget#documentToolbar QToolButton:focus,
-QWidget#documentToolbar QPushButton:focus,
 QWidget#documentToolbar QLineEdit:focus,
 QWidget#documentToolbar QComboBox:focus,
 QWidget#documentToolbar QSpinBox:focus,
@@ -99,8 +101,20 @@ QTabWidget#documentTabs QTabBar::tab:focus {
   border-color: #6ea8fe;
 }
 
-QWidget#emptyState QLabel[muted="true"],
-QLabel[muted="true"] {
+QWidget#emptyState QLabel#emptyStateTitle {
+  background: transparent;
+  border: none;
+  padding: 0;
+  font-size: 20px;
+  font-weight: 600;
+  color: #f8f9fa;
+}
+
+QWidget#emptyState QLabel#emptyStateSubtitle,
+QWidget#emptyState QLabel#emptyStateRecentMessage {
+  background: transparent;
+  border: none;
+  padding: 0;
   color: #adb5bd;
 }
 

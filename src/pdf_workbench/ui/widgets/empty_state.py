@@ -26,6 +26,7 @@ class EmptyState(QWidget):
             "PDFをドラッグ&ドロップするか、下のボタンから開いてください。",
             self,
         )
+        subtitle.setObjectName("emptyStateSubtitle")
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         subtitle.setProperty("muted", True)
 
@@ -38,6 +39,7 @@ class EmptyState(QWidget):
 
         self._recent_container = QVBoxLayout()
         self._recent_message = QLabel("最近使ったファイルはありません", self)
+        self._recent_message.setObjectName("emptyStateRecentMessage")
         self._recent_message.setProperty("muted", True)
         self._recent_message.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._recent_message.setVisible(True)

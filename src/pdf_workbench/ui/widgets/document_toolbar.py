@@ -49,33 +49,38 @@ class DocumentToolbar(QWidget):
         )
         self.previous_button = self._button(
             "前へ",
-            QStyle.StandardPixmap.SP_ArrowUp,
+            QStyle.StandardPixmap.SP_ArrowLeft,
             object_name="previousPageButton",
             tooltip="前のページ",
+            short_text="←",
         )
         self.next_button = self._button(
             "次へ",
-            QStyle.StandardPixmap.SP_ArrowDown,
+            QStyle.StandardPixmap.SP_ArrowRight,
             object_name="nextPageButton",
             tooltip="次のページ",
+            short_text="→",
         )
         self.rotate_button = self._button(
             "回転",
             QStyle.StandardPixmap.SP_BrowserReload,
             object_name="rotateClockwiseButton",
             tooltip="時計回りに回転",
+            short_text="↻",
         )
         self.zoom_out_button = self._button(
             "縮小",
-            QStyle.StandardPixmap.SP_ArrowBack,
+            None,
             object_name="zoomOutButton",
             tooltip="ズームを縮小",
+            short_text="−",  # noqa: RUF001
         )
         self.zoom_in_button = self._button(
             "拡大",
-            QStyle.StandardPixmap.SP_ArrowForward,
+            None,
             object_name="zoomInButton",
             tooltip="ズームを拡大",
+            short_text="+",
         )
 
         self.page_field = QSpinBox(self)
@@ -166,18 +171,20 @@ class DocumentToolbar(QWidget):
     def _button(
         self,
         text: str,
-        icon: QStyle.StandardPixmap,
+        icon: QStyle.StandardPixmap | None,
         *,
         object_name: str,
         tooltip: str,
+        short_text: str | None = None,
         role: str = "outline",
     ) -> QToolButton:
         button = QToolButton(self)
         button.setObjectName(object_name)
         button.setAccessibleName(text)
         button.setToolTip(tooltip)
-        button.setText(text)
-        button.setIcon(self.style().standardIcon(icon))
+        button.setText(short_text or text)
+        if icon is not None:
+            button.setIcon(self.style().standardIcon(icon))
         button.setProperty("buttonRole", role)
         return button
 

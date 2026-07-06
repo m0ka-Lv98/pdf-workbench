@@ -54,6 +54,9 @@ def test_main_window_opens_and_closes_multiple_documents(
     assert window._documents[0].session.source_path == first.resolve()
     assert window._documents[1].session.source_path == second.resolve()
     assert window._stack.currentWidget() is window._tabs
+    assert window._tabs.tabBar().elideMode() == Qt.TextElideMode.ElideMiddle
+    assert window._tabs.tabBar().usesScrollButtons() is True
+    assert window._tabs.tabsClosable() is True
 
     assert window.close_document_at(1) is True
     assert window._tabs.count() == 1

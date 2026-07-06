@@ -27,6 +27,14 @@ def test_document_toolbar_updates_state_and_emits_signals(qtbot: QtBot) -> None:
     assert toolbar.previous_button.isEnabled()
     assert toolbar.next_button.isEnabled()
     assert toolbar.page_field.minimum() == 1
+    assert toolbar.previous_button.text() == "←"
+    assert toolbar.next_button.text() == "→"
+    assert toolbar.zoom_out_button.text() == "−"  # noqa: RUF001
+    assert toolbar.zoom_in_button.text() == "+"
+    assert toolbar.rotate_button.text() == "↻"
+    assert toolbar.previous_button.toolTip() == "前のページ"
+    assert toolbar.zoom_out_button.toolTip() == "ズームを縮小"
+    assert toolbar.zoom_in_button.toolTip() == "ズームを拡大"
 
     page_requests: list[int] = []
     zoom_requests: list[float] = []
@@ -155,6 +163,11 @@ def test_empty_state_shows_recent_files_and_emits_selection(qtbot: QtBot, tmp_pa
     qtbot.mouseClick(recent_buttons[0], Qt.MouseButton.LeftButton)
 
     assert requested == [files[0]]
+    assert (
+        empty_state.findChild(type(empty_state._recent_message), "emptyStateRecentMessage")
+        is not None
+    )
+    assert empty_state.findChild(type(empty_state.open_button), "openPdfButton") is not None
 
 
 def test_empty_state_shows_muted_message_for_no_recent_files(qtbot: QtBot) -> None:
