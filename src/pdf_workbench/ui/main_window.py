@@ -37,6 +37,7 @@ class MainWindow(QMainWindow):
     _RECENT_FILES_KEY = "main_window/recent_files"
     _GEOMETRY_KEY = "main_window/geometry"
     _MAX_RECENT_FILES = 10
+    _BASE_RENDER_SCALE = 1.5
 
     def __init__(self, settings: QSettings | None = None) -> None:
         super().__init__()
@@ -47,20 +48,25 @@ class MainWindow(QMainWindow):
         self._toolbar_widget = DocumentToolbar(self)
         self._empty_state = EmptyState(self)
 
+        self.setObjectName("mainWindow")
         self.setWindowTitle("PDF Workbench")
         self.resize(1100, 800)
         self.setAcceptDrops(True)
 
         self._tabs = QTabWidget(self)
+        self._tabs.setObjectName("documentTabs")
         self._tabs.setDocumentMode(True)
         self._tabs.setTabsClosable(True)
         self._tabs.currentChanged.connect(self._on_current_tab_changed)
         self._tabs.tabCloseRequested.connect(self.close_document_at)
         self._stack = QStackedWidget(self)
+        self._stack.setObjectName("mainStack")
         self._stack.addWidget(self._empty_state)
         self._stack.addWidget(self._tabs)
         self.setCentralWidget(self._stack)
-        self.setStatusBar(QStatusBar(self))
+        status_bar = QStatusBar(self)
+        status_bar.setObjectName("mainStatusBar")
+        self.setStatusBar(status_bar)
 
         self._empty_state.open_requested.connect(self._choose_document)
         self._empty_state.recent_file_requested.connect(self.open_document)
@@ -126,6 +132,7 @@ class MainWindow(QMainWindow):
 
     def _create_toolbar(self) -> None:
         toolbar = QToolBar("メイン", self)
+        toolbar.setObjectName("mainToolbar")
         toolbar.setMovable(False)
         toolbar.setFloatable(False)
         toolbar.setIconSize(QSize(18, 18))
@@ -152,6 +159,7 @@ class MainWindow(QMainWindow):
         try:
             session = DocumentSession(normalized_path)
             view = PdfView(self._render_service, self)
+            view.set_zoom(self._BASE_RENDER_SCALE * session.zoom_factor)
             view.open_document(session.source_path)
         except Exception as exc:
             logger.exception("Failed to open PDF: %s", path)
@@ -226,8 +234,11 @@ class MainWindow(QMainWindow):
         document = self._current_document()
         if document is None:
             return
-        document.view.set_zoom(document.view.zoom_factor * multiplier)
-        document.session.zoom_factor = document.view.zoom_factor
+        document.session.zoom_factor = max(
+            0.25,
+            min(document.session.zoom_factor * multiplier, 5.0),
+        )
+        document.view.set_zoom(self._BASE_RENDER_SCALE * document.session.zoom_factor)
         self._sync_toolbar(document)
         self._update_status()
 
@@ -253,8 +264,8 @@ class MainWindow(QMainWindow):
         document = self._current_document()
         if document is None:
             return
-        document.view.set_zoom(zoom_factor)
-        document.session.zoom_factor = document.view.zoom_factor
+        document.session.zoom_factor = max(0.25, min(zoom_factor, 5.0))
+        document.view.set_zoom(self._BASE_RENDER_SCALE * document.session.zoom_factor)
         self._sync_toolbar(document)
         self._update_status()
 
@@ -262,14 +273,14 @@ class MainWindow(QMainWindow):
         document = self._current_document()
         if document is None:
             self.statusBar().showMessage("準備完了")
-            self._toolbar_widget.setState(ToolbarState(False, 0, 0, 1.5))
+            self._toolbar_widget.setState(ToolbarState(False, 0, 0, 1.0))
             return
         page_count = document.view.page_count
         current_page = 0 if page_count == 0 else document.view.page_index + 1
         self.statusBar().showMessage(
             f"{document.session.source_path.name}  "
             f"{current_page} / {page_count} ページ  "
-            f"ズーム {document.view.zoom_factor:.0%}"
+            f"ズーム {document.session.zoom_factor:.0%}"
         )
         self._sync_toolbar(document)
 
@@ -366,7 +377,7 @@ class MainWindow(QMainWindow):
                 self._RECENT_FILES_KEY,
                 json.dumps([str(item) for item in self._recent_files], ensure_ascii=True),
             )
-        self._empty_state.set_recent_files(existing_paths)
+        self._empty_state.set_recent_files(existing_paths[:5])
         if not existing_paths:
             action = self.recent_files_menu.addAction("最近使ったファイルはありません")
             action.setEnabled(False)
@@ -393,7 +404,7 @@ class MainWindow(QMainWindow):
                 has_document=True,
                 page_index=document.view.page_index,
                 page_count=document.view.page_count,
-                zoom_factor=document.view.zoom_factor,
+                zoom_factor=document.session.zoom_factor,
             )
         )
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from PySide6.QtCore import Qt
 from pytestqt.qtbot import QtBot
 
@@ -13,10 +14,15 @@ def test_document_toolbar_updates_state_and_emits_signals(qtbot: QtBot) -> None:
     toolbar = DocumentToolbar()
     qtbot.addWidget(toolbar)
 
-    toolbar.setState(ToolbarState(True, 2, 8, 1.25))
+    assert toolbar.zoom_field.currentText() == "100%"
+    assert toolbar.page_field.value() == 0
+    assert toolbar.page_field.text() == "—"
 
+    toolbar.setState(ToolbarState(True, 2, 8, 1.25))
     assert toolbar.page_field.value() == 3
-    assert toolbar.page_field.suffix() == " / 8"
+    assert toolbar.page_field.text() == "3"
+    assert toolbar.page_field.maximum() == 8
+    assert toolbar._page_label.text() == "/ 8"
     assert toolbar.zoom_field.currentText() == "125%"
     assert toolbar.previous_button.isEnabled()
     assert toolbar.next_button.isEnabled()
@@ -27,27 +33,80 @@ def test_document_toolbar_updates_state_and_emits_signals(qtbot: QtBot) -> None:
     toolbar.zoom_requested.connect(zoom_requests.append)
 
     toolbar.page_field.setValue(4)
-    toolbar.zoom_field.setCurrentText("150%")
+    toolbar.zoom_field.activated.emit(toolbar.zoom_field.findText("150%"))
+    toolbar.zoom_field.lineEdit().setText("150%")
+    toolbar.zoom_field.lineEdit().editingFinished.emit()
 
     assert page_requests == [3]
     assert zoom_requests == [1.5]
+
+    toolbar.zoom_field.lineEdit().setText("150%")
+    toolbar.zoom_field.lineEdit().editingFinished.emit()
+    assert zoom_requests == [1.5]
+
+
+def test_document_toolbar_rejects_invalid_zoom_and_keeps_previous_value(
+    qtbot: QtBot,
+) -> None:
+    toolbar = DocumentToolbar()
+    qtbot.addWidget(toolbar)
+
+    emitted: list[float] = []
+    toolbar.zoom_requested.connect(emitted.append)
+
+    for invalid in ["", "abc", "NaN", "inf", "-infinity", "0%", "24%", "501%"]:
+        toolbar.zoom_field.lineEdit().setText(invalid)
+        toolbar.zoom_field.lineEdit().editingFinished.emit()
+        assert toolbar.zoom_field.currentText() == "100%"
+
+    assert emitted == []
+
+
+def test_document_toolbar_zoom_buttons_nudge_by_factor(qtbot: QtBot) -> None:
+    toolbar = DocumentToolbar()
+    qtbot.addWidget(toolbar)
+    toolbar.show()
+    qtbot.waitExposed(toolbar)
+
+    emitted: list[float] = []
+    toolbar.zoom_requested.connect(emitted.append)
+
+    toolbar._nudge_zoom(0.2)
+    toolbar._nudge_zoom(-1 / 6)
+
+    assert emitted[0] == 1.2
+    assert emitted[1] == pytest.approx(1.0)
 
 
 def test_empty_state_shows_recent_files_and_emits_selection(qtbot: QtBot, tmp_path: Path) -> None:
     empty_state = EmptyState()
     qtbot.addWidget(empty_state)
 
-    file_a = tmp_path / "a.pdf"
-    file_b = tmp_path / "b.pdf"
-    empty_state.set_recent_files([file_a, file_b])
+    files = [tmp_path / f"{index}.pdf" for index in range(6)]
+    empty_state.set_recent_files(files)
 
     buttons = empty_state.findChildren(type(empty_state.open_button))
-    recent_buttons = [button for button in buttons if button.text() in {file_a.name, file_b.name}]
+    file_names = {path.name for path in files}
+    recent_buttons = [button for button in buttons if button.text() in file_names]
 
-    assert len(recent_buttons) == 2
+    assert len(recent_buttons) == 5
+    assert empty_state._recent_message.isVisible() is False
+    assert recent_buttons[0].toolTip() == str(files[0])
+    assert recent_buttons[0].focusPolicy() == Qt.FocusPolicy.StrongFocus
 
     requested: list[Path] = []
     empty_state.recent_file_requested.connect(requested.append)
     qtbot.mouseClick(recent_buttons[0], Qt.MouseButton.LeftButton)
 
-    assert requested == [file_a]
+    assert requested == [files[0]]
+
+
+def test_empty_state_shows_muted_message_for_no_recent_files(qtbot: QtBot) -> None:
+    empty_state = EmptyState()
+    qtbot.addWidget(empty_state)
+    empty_state.show()
+    qtbot.waitExposed(empty_state)
+
+    empty_state.set_recent_files([])
+
+    assert empty_state._recent_message.isVisible() is True

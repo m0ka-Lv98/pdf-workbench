@@ -6,8 +6,18 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QCloseEvent, QPainter, QPaintEvent, QPixmap
+from PySide6.QtCore import (
+    QEvent,
+    QObject,
+    QPoint,
+    QPointF,
+    QRectF,
+    QSize,
+    Qt,
+    QTimer,
+    Signal,
+)
+from PySide6.QtGui import QCloseEvent, QColor, QPainter, QPaintEvent, QPalette, QPixmap
 from PySide6.QtWidgets import QFrame, QLabel, QScrollArea, QSizePolicy, QVBoxLayout, QWidget
 
 from pdf_workbench.services.page_coordinates import PageCoordinateMapper, PageMetadata
@@ -50,6 +60,7 @@ class PagePlaceholder(QFrame):
         self.setFrameShape(QFrame.Shape.Box)
         self.setLineWidth(1)
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.setProperty("renderState", self._state.value)
 
     @property
     def state(self) -> PlaceholderState:
@@ -70,6 +81,7 @@ class PagePlaceholder(QFrame):
 
     def set_state(self, state: PlaceholderState, message: str | None = None) -> None:
         self._state = state
+        self.setProperty("renderState", state.value)
         if message is not None:
             self._message = message
         self.update()
@@ -77,12 +89,14 @@ class PagePlaceholder(QFrame):
     def set_pixmap(self, pixmap: QPixmap) -> None:
         self._pixmap = pixmap
         self._state = PlaceholderState.DISPLAYED
+        self.setProperty("renderState", self._state.value)
         self.update()
 
     def clear_pixmap(self, message: str) -> None:
         self._pixmap = None
         self._message = message
         self._state = PlaceholderState.NOT_REQUESTED
+        self.setProperty("renderState", self._state.value)
         self.update()
 
     def sizeHint(self) -> QSize:
@@ -123,15 +137,33 @@ class PagePlaceholder(QFrame):
         self.update()
 
     def paintEvent(self, event: QPaintEvent) -> None:
-        super().paintEvent(event)
         painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        rect = self.rect().adjusted(2, 2, -2, -2)
+        shadow = rect.translated(2, 3)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 28))
+        painter.drawRoundedRect(shadow, 10.0, 10.0)
+
+        surface = rect
+        painter.setBrush(self.palette().base())
+        painter.drawRoundedRect(surface, 10.0, 10.0)
+
         if self._pixmap is not None:
             target = self.page_content_rect()
             painter.drawPixmap(target, self._pixmap, QRectF(self._pixmap.rect()))
-            return
+        else:
+            pen_role = (
+                QPalette.ColorRole.BrightText
+                if self._state == PlaceholderState.ERROR
+                else QPalette.ColorRole.WindowText
+            )
+            painter.setPen(self.palette().color(pen_role))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._status_text())
 
-        painter.setPen(self.palette().color(self.foregroundRole()))
-        painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._status_text())
+        painter.setPen(self.palette().color(QPalette.ColorRole.Mid))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(surface, 10.0, 10.0)
 
     def _status_text(self) -> str:
         labels = {
@@ -201,6 +233,7 @@ class PdfView(QWidget):
         debounce_interval_ms: int = 40,
     ) -> None:
         super().__init__(parent)
+        self.setObjectName("pdfView")
         self._render_service = render_service
         self._document_id = uuid.uuid4().hex
         self._path: Path | None = None
@@ -213,18 +246,23 @@ class PdfView(QWidget):
         self._desired_pages: set[int] = set()
 
         self._content = QWidget(self)
+        self._content.setObjectName("pdfContent")
         self._content_layout = QVBoxLayout(self._content)
         self._content_layout.setContentsMargins(0, 0, 0, 0)
 
         self._status_label = QLabel("PDFを開いてください", self._content)
+        self._status_label.setObjectName("pdfStatusLabel")
         self._status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._status_label.setProperty("renderState", "not_requested")
 
         self._canvas = ContinuousPageCanvas(self._content)
+        self._canvas.setObjectName("pdfCanvas")
         self._canvas.hide()
         self._content_layout.addWidget(self._status_label)
         self._content_layout.addWidget(self._canvas)
 
         self._scroll_area = QScrollArea(self)
+        self._scroll_area.setObjectName("pdfScrollArea")
         self._scroll_area.setWidgetResizable(False)
         self._scroll_area.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
         self._scroll_area.setWidget(self._content)
@@ -375,8 +413,9 @@ class PdfView(QWidget):
             self._schedule_visible_page_update()
         return super().eventFilter(watched, event)
 
-    def _show_status(self, message: str) -> None:
+    def _show_status(self, message: str, *, render_state: str = "not_requested") -> None:
         self._status_label.setText(message)
+        self._status_label.setProperty("renderState", render_state)
         self._status_label.show()
         self._canvas.hide()
         self._content.adjustSize()
@@ -384,7 +423,7 @@ class PdfView(QWidget):
 
     def _show_error(self, message: str) -> None:
         self._metadata = None
-        self._show_status(message)
+        self._show_status(message, render_state="error")
         self.error_occurred.emit(message)
 
     def _on_document_loaded(self, document_id: object, generation: int, metadata: object) -> None:

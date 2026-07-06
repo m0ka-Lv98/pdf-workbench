@@ -19,6 +19,8 @@ def _stylesheet_name(scheme: ColorScheme) -> str:
 
 def load_stylesheet(scheme: ColorScheme) -> str:
     resource = files("pdf_workbench.ui.styles").joinpath(_stylesheet_name(scheme))
+    if not resource.is_file():
+        raise FileNotFoundError(f"missing theme resource: {resource}")
     return resource.read_text(encoding="utf-8")
 
 
@@ -36,6 +38,7 @@ def detect_system_color_scheme() -> ColorScheme:
 
 
 def apply_application_theme(app: QApplication, scheme: ColorScheme) -> None:
+    app.setProperty("colorScheme", scheme.value)
     app.setStyleSheet(load_stylesheet(scheme))
 
 
@@ -49,7 +52,7 @@ class ThemeController(QObject):
     def __init__(self, app: QApplication, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self._app = app
-        self._current_scheme = ColorScheme.LIGHT
+        self._current_scheme = detect_system_color_scheme()
 
     def start(self) -> None:
         self.apply_system_scheme()
@@ -64,3 +67,7 @@ class ThemeController(QObject):
         self._current_scheme = scheme
         apply_application_theme(self._app, scheme)
         self.scheme_changed.emit(scheme)
+
+    @property
+    def current_scheme(self) -> ColorScheme:
+        return self._current_scheme

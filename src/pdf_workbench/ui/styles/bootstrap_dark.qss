@@ -1,22 +1,44 @@
-QWidget {
+QMainWindow#mainWindow,
+QWidget#mainStack,
+QStatusBar#mainStatusBar,
+QWidget#emptyState,
+QWidget#pdfView,
+QWidget#pdfContent,
+QScrollArea#pdfScrollArea,
+QWidget#pdfCanvas {
   background: #212529;
   color: #f8f9fa;
 }
 
-QFrame#surfaceCard, QFrame#pageCard, QTabWidget::pane, QMenu {
-  background: #2b3035;
+QTabWidget#documentTabs::pane,
+QFrame#pageCard,
+QFrame#toolbarGroup {
   border: 1px solid #495057;
-  border-radius: 6px;
+  border-radius: 8px;
 }
 
-QToolBar {
+QTabWidget#documentTabs::pane,
+QFrame#pageCard {
+  background: #2b3035;
+}
+
+QToolBar#mainToolbar {
   background: #212529;
   spacing: 6px;
   padding: 4px 6px;
   border: none;
 }
 
-QToolButton, QPushButton, QLineEdit, QComboBox, QSpinBox {
+QWidget#documentToolbar,
+QWidget#documentToolbar QFrame#toolbarGroup {
+  background: transparent;
+}
+
+QToolButton,
+QPushButton,
+QLineEdit,
+QComboBox,
+QSpinBox {
   min-height: 32px;
   border-radius: 6px;
   border: 1px solid #495057;
@@ -25,28 +47,48 @@ QToolButton, QPushButton, QLineEdit, QComboBox, QSpinBox {
   padding: 4px 10px;
 }
 
-QToolButton:hover, QPushButton:hover, QLineEdit:hover, QComboBox:hover, QSpinBox:hover {
-  border-color: #6ea8fe;
-}
-
-QToolButton:pressed, QPushButton:pressed {
-  background: #343a40;
-}
-
-QToolButton:disabled, QPushButton:disabled, QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled {
-  color: #adb5bd;
-  background: #212529;
-}
-
-QToolButton[variant="primary"], QPushButton[variant="primary"] {
+QToolButton[buttonRole="primary"],
+QPushButton[variant="primary"] {
   background: #0d6efd;
   color: white;
   border-color: #0d6efd;
 }
 
-QToolButton[variant="primary"]:hover, QPushButton[variant="primary"]:hover {
+QToolButton[buttonRole="primary"]:hover,
+QPushButton[variant="primary"]:hover {
   background: #3d8bfd;
   border-color: #3d8bfd;
+}
+
+QToolButton:hover,
+QPushButton:hover,
+QLineEdit:hover,
+QComboBox:hover,
+QSpinBox:hover {
+  border-color: #6ea8fe;
+}
+
+QToolButton:pressed,
+QPushButton:pressed {
+  background: #343a40;
+}
+
+QToolButton:disabled,
+QPushButton:disabled,
+QLineEdit:disabled,
+QComboBox:disabled,
+QSpinBox:disabled {
+  color: #adb5bd;
+  background: #212529;
+}
+
+QToolButton:focus,
+QPushButton:focus,
+QLineEdit:focus,
+QComboBox:focus,
+QSpinBox:focus,
+QTabBar::tab:focus {
+  border-color: #6ea8fe;
 }
 
 QLabel[muted="true"] {
@@ -68,12 +110,6 @@ QTabBar::tab:selected {
   color: #6ea8fe;
 }
 
-QScrollArea {
-  border: none;
-  background: #212529;
-}
-
-QFrame#toolbarGroup {
-  background: transparent;
+QScrollArea#pdfScrollArea {
   border: none;
 }

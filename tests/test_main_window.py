@@ -168,8 +168,8 @@ def test_main_window_starts_on_empty_state_and_updates_toolbar(
     qtbot.addWidget(window)
 
     assert window._stack.currentWidget() is window._empty_state
-    assert window._toolbar_widget.page_field.value() == 1
-    assert window._toolbar_widget.zoom_field.currentText() == "150%"
+    assert window._toolbar_widget.page_field.text() == "—"
+    assert window._toolbar_widget.zoom_field.currentText() == "100%"
 
     document_path = tmp_path / "state.pdf"
     document_path.touch()
@@ -177,7 +177,9 @@ def test_main_window_starts_on_empty_state_and_updates_toolbar(
 
     assert window._stack.currentWidget() is window._tabs
     assert window._toolbar_widget.page_field.value() == 1
-    assert window._toolbar_widget.zoom_field.currentText() == "150%"
+    assert window._toolbar_widget.zoom_field.currentText() == "100%"
+    assert window._documents[0].session.zoom_factor == 1.0
+    assert window._documents[0].view.zoom_factor == pytest.approx(1.5)
 
 
 def test_main_window_accepts_pdf_drag_and_drop(
