@@ -6,6 +6,7 @@ import pytest
 from pypdf import PdfWriter
 from PySide6.QtCore import QMimeData, QPoint, QPointF, QSettings, Qt, QUrl
 from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMessageBox
 from pytestqt.qtbot import QtBot
 
@@ -229,6 +230,137 @@ def test_main_window_copy_action_tracks_focus_and_selection(
     window._on_focus_changed(line_edit, document.view)
 
     assert QApplication.focusWidget() is not None
+
+
+def test_main_window_copy_action_prefers_line_edit_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    window = MainWindow(settings)
+    qtbot.addWidget(window)
+
+    document_path = tmp_path / "copy-priority.pdf"
+    document_path.touch()
+    window.open_document(document_path)
+    window._prompt_search()
+
+    line_edit = window._search_bar.search_input
+    line_edit.setText("line-edit")
+    line_edit.setSelection(0, 4)
+    document = window._documents[0]
+    document.view._selection = object()  # type: ignore[assignment]
+    monkeypatch.setattr(QApplication, "focusWidget", staticmethod(lambda: line_edit))
+
+    copied: list[str] = []
+    monkeypatch.setattr(line_edit, "copy", lambda: copied.append(line_edit.selectedText()))
+    monkeypatch.setattr(document.view, "copy_selected_text", lambda: False)
+
+    window._copy_selection()
+
+    assert copied == ["line"]
+
+
+def test_main_window_search_bar_enter_and_shift_enter_fire_once(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    window = MainWindow(settings)
+    qtbot.addWidget(window)
+
+    document_path = tmp_path / "search-events.pdf"
+    document_path.touch()
+    window.open_document(document_path)
+    window._prompt_search()
+
+    next_calls = 0
+    previous_calls = 0
+
+    def record_next() -> bool:
+        nonlocal next_calls
+        next_calls += 1
+        return False
+
+    def record_previous() -> bool:
+        nonlocal previous_calls
+        previous_calls += 1
+        return False
+
+    monkeypatch.setattr(window._documents[0].view, "next_match", record_next)
+    monkeypatch.setattr(window._documents[0].view, "previous_match", record_previous)
+
+    QTest.keyClick(window._search_bar.search_input, Qt.Key.Key_Return)
+    QTest.keyClick(
+        window._search_bar.search_input,
+        Qt.Key.Key_Return,
+        Qt.KeyboardModifier.ShiftModifier,
+    )
+
+    assert next_calls == 1
+    assert previous_calls == 1
+
+
+def test_main_window_search_progress_text_uses_failed_page_count() -> None:
+    from pdf_workbench.ui.pdf_view import PdfSearchState
+
+    state = PdfSearchState(
+        query="",
+        current_index=0,
+        total_count=0,
+        indexed_pages=2,
+        total_pages=10,
+        failed_pages=2,
+        indexing_completed=False,
+    )
+    completed = PdfSearchState(
+        query="",
+        current_index=0,
+        total_count=0,
+        indexed_pages=8,
+        total_pages=10,
+        failed_pages=2,
+        indexing_completed=True,
+    )
+
+    assert MainWindow._search_progress_text(state) == "索引作成中 2 / 10\uff082ページ失敗\uff09"
+    assert MainWindow._search_progress_text(completed) == "索引完了\uff082ページ失敗\uff09"
+
+
+def test_main_window_copy_action_falls_back_to_pdf_view_when_line_edit_has_no_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    window = MainWindow(settings)
+    qtbot.addWidget(window)
+
+    document_path = tmp_path / "copy-fallback.pdf"
+    document_path.touch()
+    window.open_document(document_path)
+    window._prompt_search()
+
+    line_edit = window._search_bar.search_input
+    line_edit.setText("line-edit")
+    line_edit.deselect()
+    monkeypatch.setattr(QApplication, "focusWidget", staticmethod(lambda: line_edit))
+
+    copied = {"pdf": 0}
+    monkeypatch.setattr(
+        window._documents[0].view,
+        "copy_selected_text",
+        lambda: copied.__setitem__("pdf", copied["pdf"] + 1) or True,
+    )
+
+    window._copy_selection()
+
+    assert copied["pdf"] == 1
 
 
 @pytest.mark.parametrize(

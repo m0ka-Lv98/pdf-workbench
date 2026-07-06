@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 from pypdf import PdfWriter
-from PySide6.QtCore import QObject, QPointF, Signal
-from PySide6.QtGui import QImage
+from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, Qt, Signal
+from PySide6.QtGui import QImage, QMouseEvent
 from PySide6.QtWidgets import QApplication, QWidget
 from pytestqt.qtbot import QtBot
 
@@ -31,7 +31,7 @@ class FakeRenderService(QObject):
     text_page_indexed = Signal(object, object, object)
     text_index_progress = Signal(object, object, int, int, int)
     text_index_completed = Signal(object, object, int, int)
-    text_index_failed = Signal(object, int, int, str)
+    text_index_failed = Signal(object, object, int, str)
 
     def __init__(self, metadata: DocumentMetadata) -> None:
         super().__init__()
@@ -91,6 +91,45 @@ class FakeRenderService(QObject):
                 ),
             ),
         )
+
+    def emit_text_progress(
+        self,
+        document_id: str,
+        revision: DocumentRevision,
+        indexed_pages: int,
+        total_pages: int,
+        failed_pages: int,
+    ) -> None:
+        self.text_index_progress.emit(
+            document_id,
+            revision,
+            indexed_pages,
+            total_pages,
+            failed_pages,
+        )
+
+    def emit_text_completed(
+        self,
+        document_id: str,
+        revision: DocumentRevision,
+        indexed_pages: int,
+        failed_pages: int,
+    ) -> None:
+        self.text_index_completed.emit(
+            document_id,
+            revision,
+            indexed_pages,
+            failed_pages,
+        )
+
+    def emit_text_failure(
+        self,
+        document_id: str,
+        revision: DocumentRevision,
+        page_index: int,
+        message: str,
+    ) -> None:
+        self.text_index_failed.emit(document_id, revision, page_index, message)
 
 
 class RecordingBackend:
@@ -241,6 +280,37 @@ def show_view(qtbot: QtBot, view: PdfView) -> QWidget:
     qtbot.addWidget(wrapper)
     qtbot.waitUntil(wrapper.isVisible)
     return wrapper
+
+
+def page_point_for_box(view: PdfView, page_index: int, box: PdfRect) -> QPoint:
+    page = view._canvas.pages[page_index]
+    rect = page._coordinate_mapper().pdf_to_view_rect(box)
+    point = page.page_content_rect().topLeft() + rect.center()
+    return point.toPoint()
+
+
+def send_page_mouse_event(
+    page: QWidget,
+    event_type: QEvent.Type,
+    local_point: QPoint,
+    *,
+    global_point: QPoint | None = None,
+    buttons: Qt.MouseButton = Qt.MouseButton.LeftButton,
+) -> None:
+    actual_global = global_point or page.mapToGlobal(local_point)
+    if event_type in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonRelease):
+        button = Qt.MouseButton.LeftButton
+    else:
+        button = Qt.MouseButton.NoButton
+    event = QMouseEvent(
+        event_type,
+        QPointF(local_point),
+        QPointF(actual_global),
+        button,
+        buttons,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    QApplication.sendEvent(page, event)
 
 
 def test_visible_and_adjacent_pages_only_are_requested(
@@ -617,14 +687,150 @@ def test_text_selection_and_copy_use_character_boxes(
         "abc",
         boxes,
     )
-
-    view._begin_selection(0, QPointF(25.0, 280.0))
-    view._update_selection(0, QPointF(60.0, 280.0))
+    page = view._canvas.pages[0]
+    start_point = page_point_for_box(view, 0, boxes[0])
+    end_point = page_point_for_box(view, 0, boxes[2])
+    send_page_mouse_event(page, QEvent.Type.MouseButtonPress, start_point)
+    send_page_mouse_event(page, QEvent.Type.MouseMove, end_point)
+    send_page_mouse_event(
+        page,
+        QEvent.Type.MouseButtonRelease,
+        end_point,
+        buttons=Qt.MouseButton.NoButton,
+    )
 
     assert view.selected_text == "abc"
     assert view.copy_selected_text() is True
     assert QApplication.clipboard().text() == "abc"
     assert view._canvas.pages[0]._selection_boxes
+    assert QWidget.mouseGrabber() is None
+    assert _wrapper.isVisible()
+
+
+def test_live_mouse_selection_ignores_page_margin_press(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    document_path = create_pdf(tmp_path / "margin-selection.pdf", 1)
+    service = FakeRenderService(create_metadata(document_path, 1))
+    view = PdfView(render_service=service, debounce_interval_ms=0)
+    _wrapper = show_view(qtbot, view)
+
+    view.open_document(document_path)
+    qtbot.waitUntil(lambda: view.page_count == 1)
+    service.emit_text_index(
+        view._document_id,
+        create_metadata(document_path, 1).revision,
+        0,
+        "abc",
+        [
+            PdfRect(10.0, 10.0, 20.0, 30.0),
+            PdfRect(22.0, 10.0, 32.0, 30.0),
+            PdfRect(34.0, 10.0, 44.0, 30.0),
+        ],
+    )
+    page = view._canvas.pages[0]
+    margin_point = QPoint(2, 2)
+
+    send_page_mouse_event(page, QEvent.Type.MouseButtonPress, margin_point)
+
+    assert view.selected_text == ""
+    assert QWidget.mouseGrabber() is None
+    assert _wrapper.isVisible()
+
+
+def test_live_mouse_selection_crosses_pages_with_global_positions(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    document_path = create_pdf(tmp_path / "cross-pages.pdf", 2)
+    service = FakeRenderService(create_metadata(document_path, 2))
+    view = PdfView(render_service=service, debounce_interval_ms=0)
+    _wrapper = show_view(qtbot, view)
+
+    view.open_document(document_path)
+    qtbot.waitUntil(lambda: view.page_count == 2)
+    service.emit_text_index(
+        view._document_id,
+        create_metadata(document_path, 2).revision,
+        0,
+        "abc",
+        [
+            PdfRect(10.0, 10.0, 20.0, 30.0),
+            PdfRect(22.0, 10.0, 32.0, 30.0),
+            PdfRect(34.0, 10.0, 44.0, 30.0),
+        ],
+    )
+    service.emit_text_index(
+        view._document_id,
+        create_metadata(document_path, 2).revision,
+        1,
+        "def",
+        [
+            PdfRect(10.0, 10.0, 20.0, 30.0),
+            PdfRect(22.0, 10.0, 32.0, 30.0),
+            PdfRect(34.0, 10.0, 44.0, 30.0),
+        ],
+    )
+    first_page = view._canvas.pages[0]
+    second_page = view._canvas.pages[1]
+    start_point = page_point_for_box(view, 0, PdfRect(10.0, 10.0, 20.0, 30.0))
+    second_local = page_point_for_box(view, 1, PdfRect(34.0, 10.0, 44.0, 30.0))
+    second_global = second_page.mapToGlobal(second_local)
+
+    send_page_mouse_event(first_page, QEvent.Type.MouseButtonPress, start_point)
+    send_page_mouse_event(
+        first_page,
+        QEvent.Type.MouseMove,
+        first_page.mapFromGlobal(second_global),
+        global_point=second_global,
+    )
+    send_page_mouse_event(
+        first_page,
+        QEvent.Type.MouseButtonRelease,
+        first_page.mapFromGlobal(second_global),
+        global_point=second_global,
+        buttons=Qt.MouseButton.NoButton,
+    )
+
+    assert view.selected_text == "abc\ndef"
+    assert view._canvas.pages[0]._selection_boxes
+    assert view._canvas.pages[1]._selection_boxes
+    assert QWidget.mouseGrabber() is None
+    assert _wrapper.isVisible()
+
+
+def test_text_index_progress_updates_search_state_and_ignores_stale_revision(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    document_path = create_pdf(tmp_path / "progress.pdf", 1)
+    metadata = create_metadata(document_path, 1)
+    service = FakeRenderService(metadata)
+    view = PdfView(render_service=service, debounce_interval_ms=0)
+    _wrapper = show_view(qtbot, view)
+
+    view.open_document(document_path)
+    qtbot.waitUntil(lambda: view.page_count == 1)
+
+    service.emit_text_progress(view._document_id, metadata.revision, 0, 10, 2)
+    state = view.search_state
+    assert state.failed_pages == 2
+    assert state.total_pages == 10
+    assert state.indexing_completed is False
+
+    other_document = create_pdf(tmp_path / "progress-stale.pdf", 1)
+    other_revision = create_metadata(other_document, 1).revision
+    service.emit_text_progress(view._document_id, other_revision, 10, 10, 10)
+
+    stale_state = view.search_state
+    assert stale_state.failed_pages == 2
+    assert stale_state.indexed_pages == 0
+
+    service.emit_text_completed(view._document_id, metadata.revision, 8, 2)
+    completed_state = view.search_state
+    assert completed_state.indexing_completed is True
+    assert completed_state.failed_pages == 2
     assert _wrapper.isVisible()
 
 
