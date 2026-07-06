@@ -6,7 +6,7 @@ import pytest
 from pypdf import PdfWriter
 from PySide6.QtCore import QMimeData, QPoint, QPointF, QSettings, Qt, QUrl
 from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent
-from PySide6.QtWidgets import QMessageBox
+from PySide6.QtWidgets import QApplication, QMessageBox
 from pytestqt.qtbot import QtBot
 
 from pdf_workbench.services.page_coordinates import PageMetadata
@@ -183,6 +183,52 @@ def test_main_window_starts_on_empty_state_and_updates_toolbar(
     assert window._toolbar_widget.zoom_field.currentText() == "100%"
     assert window._documents[0].session.zoom_factor == 1.0
     assert window._documents[0].view.zoom_factor == pytest.approx(1.5)
+
+
+def test_main_window_search_toolbar_starts_hidden(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    window = MainWindow(settings)
+    qtbot.addWidget(window)
+
+    assert window._search_toolbar is not None
+    assert window._search_toolbar.isHidden()
+    assert window.find_action.isEnabled() is False
+
+
+def test_main_window_copy_action_tracks_focus_and_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    window = MainWindow(settings)
+    qtbot.addWidget(window)
+
+    document_path = tmp_path / "copy.pdf"
+    document_path.touch()
+    window.open_document(document_path)
+    window._prompt_search()
+
+    line_edit = window._search_bar.search_input
+    line_edit.setText("selected")
+    line_edit.setSelection(0, len(line_edit.text()))
+    monkeypatch.setattr(QApplication, "focusWidget", staticmethod(lambda: line_edit))
+    window._update_actions()
+
+    assert window.copy_action.isEnabled()
+
+    document = window._documents[0]
+    document.view._selection = None
+    document.view._search_query = ""
+    window._on_focus_changed(line_edit, document.view)
+
+    assert QApplication.focusWidget() is not None
 
 
 @pytest.mark.parametrize(

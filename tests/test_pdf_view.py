@@ -618,8 +618,8 @@ def test_text_selection_and_copy_use_character_boxes(
         boxes,
     )
 
-    view._begin_selection(0, QPointF(12.0, 12.0))
-    view._update_selection(0, QPointF(43.0, 12.0))
+    view._begin_selection(0, QPointF(25.0, 280.0))
+    view._update_selection(0, QPointF(60.0, 280.0))
 
     assert view.selected_text == "abc"
     assert view.copy_selected_text() is True

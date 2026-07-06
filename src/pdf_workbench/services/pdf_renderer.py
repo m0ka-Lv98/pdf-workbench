@@ -62,14 +62,14 @@ class PageTextIndex:
 @dataclass(frozen=True, slots=True)
 class NormalizedPageText:
     text: str
-    source_character_indexes: tuple[int, ...]
+    source_character_offsets: tuple[int, ...]
 
 
 @dataclass(frozen=True, slots=True)
 class SearchMatch:
     page_index: int
-    start: int
-    end: int
+    start_pdfium_index: int
+    end_pdfium_index: int
     text: str
     boxes: tuple[PdfRect, ...]
 
@@ -336,7 +336,7 @@ class PdfRenderWorker(QObject):
     text_page_indexed = Signal(object, object, object)
     text_index_progress = Signal(object, object, int, int, int)
     text_index_completed = Signal(object, object, int, int)
-    text_index_failed = Signal(object, int, int, str)
+    text_index_failed = Signal(object, object, int, str)
     shutdown_completed = Signal()
 
     def __init__(
@@ -466,6 +466,7 @@ class PdfRenderWorker(QObject):
         if generation < context.generation:
             return
         self._drop_pending_render_for_document(document_id)
+        self._drop_pending_text_for_document(document_id)
         self._close_document_backend(document_id)
 
     @Slot(str, int, object)
@@ -531,39 +532,70 @@ class PdfRenderWorker(QObject):
             if next_text_request is None:
                 self._processing = False
                 return
-            document_id, generation, page_index, _revision = next_text_request
+            document_id, _generation, page_index, requested_revision = next_text_request
             context = self._documents.get(document_id)
-            if context is None:
+            if context is None or context.revision != requested_revision or self._shutting_down:
                 self._processing = False
                 self._schedule_processing()
                 return
             try:
-                text_index = context.backend.extract_text_page(page_index, context.revision)
+                text_index = context.backend.extract_text_page(page_index, requested_revision)
             except Exception as exc:
                 self._failed_text_pages.setdefault(
-                    (document_id, context.revision),
+                    (document_id, requested_revision),
                     set(),
                 ).add(page_index)
-                self.text_index_failed.emit(document_id, generation, page_index, str(exc))
+                current_context = self._documents.get(document_id)
+                if (
+                    current_context is None
+                    or current_context.revision != requested_revision
+                    or self._shutting_down
+                ):
+                    self._processing = False
+                    self._schedule_processing()
+                    return
+                self.text_index_failed.emit(
+                    document_id,
+                    requested_revision,
+                    page_index,
+                    str(exc),
+                )
             else:
                 self._processed_text_pages.setdefault(
-                    (document_id, context.revision),
+                    (document_id, requested_revision),
                     set(),
                 ).add(page_index)
-                self.text_page_indexed.emit(document_id, context.revision, text_index)
-            processed = len(self._processed_text_pages.get((document_id, context.revision), set()))
-            failed = len(self._failed_text_pages.get((document_id, context.revision), set()))
+                current_context = self._documents.get(document_id)
+                if (
+                    current_context is not None
+                    and current_context.revision == requested_revision
+                    and not self._shutting_down
+                ):
+                    self.text_page_indexed.emit(document_id, requested_revision, text_index)
+            current_context = self._documents.get(document_id)
+            if (
+                current_context is None
+                or current_context.revision != requested_revision
+                or self._shutting_down
+            ):
+                self._processing = False
+                self._schedule_processing()
+                return
+            processed = len(
+                self._processed_text_pages.get((document_id, requested_revision), set())
+            )
+            failed = len(self._failed_text_pages.get((document_id, requested_revision), set()))
             self.text_index_progress.emit(
                 document_id,
-                context.revision,
+                requested_revision,
                 processed,
-                context.backend.page_count(),
+                current_context.backend.page_count(),
                 failed,
             )
-            if processed + failed >= context.backend.page_count():
+            if processed + failed >= current_context.backend.page_count():
                 self.text_index_completed.emit(
                     document_id,
-                    context.revision,
+                    requested_revision,
                     processed,
                     failed,
                 )
@@ -710,7 +742,7 @@ class PdfRenderService(QObject):
     text_page_indexed = Signal(object, object, object)
     text_index_progress = Signal(object, object, int, int, int)
     text_index_completed = Signal(object, object, int, int)
-    text_index_failed = Signal(object, int, int, str)
+    text_index_failed = Signal(object, object, int, str)
     _open_requested = Signal(str, Path, int, object)
     _render_requested = Signal(object)
     _close_requested = Signal(str, int)
