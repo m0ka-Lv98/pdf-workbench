@@ -58,6 +58,14 @@ jobs:
           test -f "dist/PDF Workbench.app/Contents/Info.plist"
           test -x "dist/PDF Workbench.app/Contents/MacOS/PDF Workbench"
           find "dist/PDF Workbench.app/Contents" -maxdepth 2 -type d | grep -Eq '/(Frameworks|MacOS|Resources)$'
+      - name: Verify bundled theme resources
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          find "dist/PDF Workbench.app" -name "bootstrap_*.qss" -print
+          find "dist/PDF Workbench.app" -name "bootstrap_light.qss" -print -quit | grep -q .
+          find "dist/PDF Workbench.app" -name "bootstrap_dark.qss" -print -quit | grep -q .
       - name: Verify app architecture
         shell: bash
         run: |
@@ -95,22 +103,49 @@ jobs:
           set -euo pipefail
 
           executable="dist/PDF Workbench.app/Contents/MacOS/PDF Workbench"
-          log_file="gui-smoke-test.log"
+          stdout_log="gui-stdout.log"
+          stderr_log="gui-stderr.log"
+          copied_app_log="gui-app.log"
+          app_log_path=$(python - <<'PY'
+          from platformdirs import user_log_dir
+          from pathlib import Path
 
-          "$executable" >"$log_file" 2>&1 &
+          print(Path(user_log_dir("PDF Workbench", "m0ka-Lv98")) / "pdf-workbench.log")
+          PY
+          )
+
+          rm -f "$stdout_log" "$stderr_log" "$copied_app_log" "$app_log_path"
+
+          "$executable" >"$stdout_log" 2>"$stderr_log" &
           app_pid=$!
+          app_exit_code=0
+          survived=true
 
-          started=false
-          for attempt in 1 2 3 4 5; do
-            if kill -0 "$app_pid" 2>/dev/null; then
-              started=true
+          for second in 1 2 3 4 5 6 7 8 9 10; do
+            if ! kill -0 "$app_pid" 2>/dev/null; then
+              survived=false
+              wait "$app_pid" || app_exit_code=$?
               break
             fi
             sleep 1
           done
 
-          if [ "$started" != "true" ]; then
-            cat "$log_file"
+          echo "App log path: $app_log_path"
+          echo "App exit code: $app_exit_code"
+          echo "=== STDOUT ==="
+          test -f "$stdout_log" && cat "$stdout_log" || true
+          echo "=== STDERR ==="
+          test -f "$stderr_log" && cat "$stderr_log" || true
+          echo "=== APP LOG ==="
+          test -f "$app_log_path" && cat "$app_log_path" || true
+          if test -f "$app_log_path"; then
+            cp "$app_log_path" "$copied_app_log"
+          else
+            : > "$copied_app_log"
+          fi
+
+          if [ "$survived" != "true" ]; then
+            echo "GUI process exited before 10 seconds."
             exit 1
           fi
 
@@ -140,3 +175,14 @@ jobs:
             artifacts/${{ matrix.archive_name }}
             artifacts/${{ matrix.archive_name }}.sha256
           if-no-files-found: error
+      - name: Upload smoke test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}-smoke-logs
+          path: |
+            cli-smoke-test.log
+            gui-stdout.log
+            gui-stderr.log
+            gui-app.log
+          if-no-files-found: warn
