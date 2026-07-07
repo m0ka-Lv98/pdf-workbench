@@ -17,13 +17,14 @@ def _project_version() -> str:
 project_root = Path(SPECPATH).parent
 project_version = _project_version()
 pypdfium_datas, pypdfium_binaries, pypdfium_hiddenimports = collect_all("pypdfium2")
+theme_datas, _, theme_hiddenimports = collect_all("pdf_workbench.ui.styles")
 
 analysis = Analysis(
     [str(project_root / "src" / "pdf_workbench" / "__main__.py")],
     pathex=[str(project_root / "src")],
     binaries=pypdfium_binaries,
-    datas=pypdfium_datas,
-    hiddenimports=pypdfium_hiddenimports,
+    datas=[*pypdfium_datas, *theme_datas],
+    hiddenimports=[*pypdfium_hiddenimports, *theme_hiddenimports],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
