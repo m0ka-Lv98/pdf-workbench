@@ -175,6 +175,17 @@ jobs:
             artifacts/${{ matrix.archive_name }}
             artifacts/${{ matrix.archive_name }}.sha256
           if-no-files-found: error
+      - name: Prepare smoke test logs
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for file in cli-smoke-test.log gui-stdout.log gui-stderr.log gui-app.log; do
+            if [ ! -f "$file" ]; then
+              printf 'not generated\n' > "$file"
+            fi
+          done
       - name: Upload smoke test logs
         if: always()
         uses: actions/upload-artifact@v4

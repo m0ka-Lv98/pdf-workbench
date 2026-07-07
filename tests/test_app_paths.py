@@ -42,8 +42,7 @@ def test_configure_logging_falls_back_to_stream_when_file_handler_fails(
 
     assert log_path == ensure_app_directories().log_dir / "pdf-workbench.log"
     assert any(
-        isinstance(handler, logging.StreamHandler)
-        for handler in logging.getLogger().handlers
+        isinstance(handler, logging.StreamHandler) for handler in logging.getLogger().handlers
     )
 
 
