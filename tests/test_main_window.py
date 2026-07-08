@@ -10,7 +10,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMessageBox
 from pytestqt.qtbot import QtBot
 
-from pdf_test_utils import create_blank_pdf, create_image_only_pdf, create_qt_text_pdf
+from pdf_test_utils import copy_pdf_fixture, create_blank_pdf, create_image_only_pdf
 from pdf_workbench.services.page_coordinates import PageMetadata
 from pdf_workbench.services.pdf_renderer import (
     DocumentMetadata,
@@ -405,9 +405,9 @@ def test_main_window_real_search_updates_after_index_completion(
     qtbot: QtBot,
     tmp_path: Path,
 ) -> None:
-    document_path = create_qt_text_pdf(
+    document_path = copy_pdf_fixture(
+        "real-search-english.pdf",
         tmp_path / "real-search-english.pdf",
-        ["Alpha Search Alpha"],
     )
     window = create_real_main_window(qtbot, tmp_path, delay_seconds=0.35)
 
@@ -445,9 +445,9 @@ def test_main_window_real_search_supports_japanese_text(
     qtbot: QtBot,
     tmp_path: Path,
 ) -> None:
-    document_path = create_qt_text_pdf(
+    document_path = copy_pdf_fixture(
+        "real-search-japanese.pdf",
         tmp_path / "real-search-japanese.pdf",
-        ["検索東京検索"],
     )
     window = create_real_main_window(qtbot, tmp_path)
 
