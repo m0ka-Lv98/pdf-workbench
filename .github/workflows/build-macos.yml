@@ -36,6 +36,14 @@ jobs:
         with:
           python-version: "3.13"
           cache: pip
+      - name: Set build metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          short_sha="${GITHUB_SHA::7}"
+          echo "SHORT_SHA=$short_sha" >> "$GITHUB_ENV"
+          echo "ARCHIVE_NAME=PDF-Workbench-macOS-${{ matrix.architecture }}-$short_sha.zip" >> "$GITHUB_ENV"
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e ".[dev]"
       - run: ruff check .
@@ -103,9 +111,11 @@ jobs:
           set -euo pipefail
 
           executable="dist/PDF Workbench.app/Contents/MacOS/PDF Workbench"
+          input_pdf="$PWD/tests/fixtures/real-search-english.pdf"
           stdout_log="gui-stdout.log"
           stderr_log="gui-stderr.log"
           copied_app_log="gui-app.log"
+          screenshot_path="gui-search.png"
           app_log_path=$(python - <<'PY'
           from platformdirs import user_log_dir
           from pathlib import Path
@@ -114,9 +124,16 @@ jobs:
           PY
           )
 
-          rm -f "$stdout_log" "$stderr_log" "$copied_app_log" "$app_log_path"
+          rm -f "$stdout_log" "$stderr_log" "$copied_app_log" "$screenshot_path" "$app_log_path"
 
-          "$executable" >"$stdout_log" 2>"$stderr_log" &
+          PDF_WORKBENCH_BUILD_SHA="$SHORT_SHA" \
+          "$executable" \
+            "$input_pdf" \
+            --open-search \
+            --search-query Alpha \
+            --screenshot-path "$screenshot_path" \
+            --quit-after-ms 12000 \
+            >"$stdout_log" 2>"$stderr_log" &
           app_pid=$!
           app_exit_code=0
           survived=true
@@ -138,6 +155,8 @@ jobs:
           test -f "$stderr_log" && cat "$stderr_log" || true
           echo "=== APP LOG ==="
           test -f "$app_log_path" && cat "$app_log_path" || true
+          echo "=== SCREENSHOT ==="
+          test -f "$screenshot_path" && ls -l "$screenshot_path" || true
           if test -f "$app_log_path"; then
             cp "$app_log_path" "$copied_app_log"
           else
@@ -149,8 +168,21 @@ jobs:
             exit 1
           fi
 
-          kill -TERM "$app_pid"
-          wait "$app_pid" || true
+          for second in 1 2 3 4 5; do
+            if ! kill -0 "$app_pid" 2>/dev/null; then
+              wait "$app_pid" || app_exit_code=$?
+              break
+            fi
+            sleep 1
+          done
+
+          if kill -0 "$app_pid" 2>/dev/null; then
+            kill -TERM "$app_pid"
+            wait "$app_pid" || app_exit_code=$?
+          fi
+
+          test -f "$screenshot_path"
+          test "$app_exit_code" -eq 0
       - name: Verify codesign
         shell: bash
         run: |
@@ -166,14 +198,14 @@ jobs:
           mkdir -p artifacts
           ditto -c -k --sequesterRsrc --keepParent \
             "dist/PDF Workbench.app" \
-            "artifacts/${{ matrix.archive_name }}"
-          shasum -a 256 "artifacts/${{ matrix.archive_name }}" > "artifacts/${{ matrix.archive_name }}.sha256"
+            "artifacts/$ARCHIVE_NAME"
+          shasum -a 256 "artifacts/$ARCHIVE_NAME" > "artifacts/$ARCHIVE_NAME.sha256"
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
+          name: ${{ matrix.artifact_name }}-${{ env.SHORT_SHA }}
           path: |
-            artifacts/${{ matrix.archive_name }}
-            artifacts/${{ matrix.archive_name }}.sha256
+            artifacts/${{ env.ARCHIVE_NAME }}
+            artifacts/${{ env.ARCHIVE_NAME }}.sha256
           if-no-files-found: error
       - name: Prepare smoke test logs
         if: always()
@@ -181,7 +213,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          for file in cli-smoke-test.log gui-stdout.log gui-stderr.log gui-app.log; do
+          for file in cli-smoke-test.log gui-stdout.log gui-stderr.log gui-app.log gui-search.png; do
             if [ ! -f "$file" ]; then
               printf 'not generated\n' > "$file"
             fi
@@ -190,10 +222,11 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}-smoke-logs
+          name: ${{ matrix.artifact_name }}-${{ env.SHORT_SHA }}-smoke-logs
           path: |
             cli-smoke-test.log
             gui-stdout.log
             gui-stderr.log
             gui-app.log
+            gui-search.png
           if-no-files-found: warn
