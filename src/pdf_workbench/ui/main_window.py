@@ -43,10 +43,17 @@ class MainWindow(QMainWindow):
     _MAX_RECENT_FILES = 10
     _BASE_RENDER_SCALE = 1.5
 
-    def __init__(self, settings: QSettings | None = None) -> None:
+    def __init__(
+        self,
+        settings: QSettings | None = None,
+        *,
+        render_service: PdfRenderService | None = None,
+    ) -> None:
         super().__init__()
         self._settings = settings if settings is not None else configure_qsettings()
-        self._render_service = PdfRenderService(self)
+        self._render_service = (
+            render_service if render_service is not None else PdfRenderService(self)
+        )
         self._documents: list[DocumentTab] = []
         self._recent_files: list[Path] = self._load_recent_files()
         self._toolbar_widget = DocumentToolbar(self)
@@ -217,7 +224,7 @@ class MainWindow(QMainWindow):
             return
 
         view.state_changed.connect(self._update_status)
-        view.search_state_changed.connect(self._update_status)
+        view.search_state_changed.connect(lambda: self._on_view_search_state_changed(view))
         view.selection_changed.connect(self._update_actions)
         view.error_occurred.connect(lambda message: self.statusBar().showMessage(message, 5000))
         document = DocumentTab(session=session, view=view)
@@ -343,9 +350,7 @@ class MainWindow(QMainWindow):
         document = self._current_document()
         if document is None:
             return
-        count = document.view.search(query)
-        if count:
-            document.view.next_match()
+        document.view.search(query)
         self._sync_search_bar(document)
 
     def _close_search(self) -> None:
@@ -476,6 +481,12 @@ class MainWindow(QMainWindow):
     def _on_focus_changed(self, _old: QWidget | None, _new: QWidget | None) -> None:
         self._update_actions()
 
+    def _on_view_search_state_changed(self, view: PdfView) -> None:
+        document = self._current_document()
+        if document is not None and document.view is view:
+            self._sync_search_bar(document)
+        self._update_status()
+
     def _remember_recent_file(self, path: Path) -> None:
         normalized = path.resolve()
         self._recent_files = [item for item in self._recent_files if item != normalized]
@@ -570,11 +581,29 @@ class MainWindow(QMainWindow):
 
         if not isinstance(state, PdfSearchState):
             raise TypeError("state must be PdfSearchState")
-        if state.indexing_completed:
+        if not state.indexing_completed:
+            text = f"索引作成中 {state.indexed_pages} / {state.total_pages}"
             if state.failed_pages:
-                return f"索引完了\uff08{state.failed_pages}ページ失敗\uff09"
-            return "索引完了"
-        text = f"索引作成中 {state.indexed_pages} / {state.total_pages}"
+                text += f"\uff08{state.failed_pages}ページ失敗\uff09"
+            return text
+        if state.text_pages_with_content == 0 and state.total_pages > 0:
+            if state.image_only_pages == state.total_pages:
+                text = "OCRが必要な画像PDF"
+            else:
+                text = "テキストレイヤーがありません"
+            if state.failed_pages:
+                text += f"\uff08{state.failed_pages}ページ失敗\uff09"
+            return text
+        if state.total_count == 0 and state.query:
+            text = "検索結果 0 件"
+            if state.failed_pages:
+                text += f"\uff08{state.failed_pages}ページ失敗\uff09"
+            return text
+        if state.failed_pages:
+            return f"索引完了\uff08{state.failed_pages}ページ失敗\uff09"
+        if state.query:
+            return f"検索結果 {state.total_count} 件"
+        text = "索引完了"
         if state.failed_pages:
             text += f"\uff08{state.failed_pages}ページ失敗\uff09"
         return text

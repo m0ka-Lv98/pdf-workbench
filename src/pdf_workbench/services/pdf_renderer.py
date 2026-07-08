@@ -9,6 +9,7 @@ from typing import Any, Protocol
 
 import pypdfium2 as pdfium  # type: ignore[import-untyped]
 from PIL.ImageQt import ImageQt
+from pypdf import PdfReader
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QImage
 
@@ -49,6 +50,7 @@ class TextCharacterBox:
     pdfium_index: int
     text: str
     box: PdfRect | None
+    line_index: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +59,7 @@ class PageTextIndex:
     page_index: int
     characters: tuple[TextCharacterBox, ...]
     text: str
+    has_image_content: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,9 +186,28 @@ class PdfRenderServiceProtocol(Protocol):
     ) -> None: ...
 
 
+class _PdfiumTextPageProtocol(Protocol):
+    def count_chars(self) -> int: ...
+
+    def count_rects(self, index: int = 0, count: int = -1) -> int: ...
+
+    def get_rect(self, index: int) -> tuple[float, float, float, float]: ...
+
+    def get_text_range(self, index: int = 0, count: int = -1, errors: str = "ignore") -> str: ...
+
+    def get_charbox(
+        self,
+        index: int,
+        loose: bool = False,
+    ) -> tuple[float, float, float, float]: ...
+
+    def close(self) -> None: ...
+
+
 class PdfiumDocumentBackend:
     def __init__(self, path: Path) -> None:
         self._document = pdfium.PdfDocument(str(path))
+        self._reader = PdfReader(str(path))
 
     def page_count(self) -> int:
         return len(self._document)
@@ -231,21 +253,22 @@ class PdfiumDocumentBackend:
     ) -> PageTextIndex:
         page = self._document[page_index]
         try:
-            text_page = page.get_textpage()
+            typed_text_page: _PdfiumTextPageProtocol = page.get_textpage()
             try:
-                count = text_page.count_chars()
+                count = typed_text_page.count_chars()
+                line_rects = self._text_line_rects(typed_text_page, count)
                 characters: list[TextCharacterBox] = []
                 text_parts: list[str] = []
                 for index in range(count):
                     try:
-                        piece = text_page.get_text_range(index, 1)
+                        piece = typed_text_page.get_text_range(index, 1)
                     except Exception:
                         piece = ""
                     piece = piece.replace("\x00", "")
                     text_parts.append(piece)
                     box: PdfRect | None
                     try:
-                        char_box = text_page.get_charbox(index)
+                        char_box = typed_text_page.get_charbox(index)
                     except Exception:
                         box = None
                     else:
@@ -265,6 +288,7 @@ class PdfiumDocumentBackend:
                             pdfium_index=index,
                             text=piece,
                             box=box,
+                            line_index=self._line_index_for_box(box, line_rects),
                         )
                     )
                 text = "".join(text_parts)
@@ -273,14 +297,82 @@ class PdfiumDocumentBackend:
                     page_index=page_index,
                     characters=tuple(characters),
                     text=text,
+                    has_image_content=self._page_has_images(page_index),
                 )
             finally:
-                text_page.close()
+                typed_text_page.close()
         finally:
             page.close()
 
     def close(self) -> None:
         self._document.close()
+
+    @staticmethod
+    def _text_line_rects(
+        text_page: _PdfiumTextPageProtocol,
+        count: int,
+    ) -> tuple[PdfRect, ...]:
+        if count <= 0:
+            return ()
+        try:
+            rect_count = text_page.count_rects(0, count)
+        except Exception:
+            return ()
+        rects: list[PdfRect] = []
+        for index in range(rect_count):
+            try:
+                rect = text_page.get_rect(index)
+            except Exception:
+                continue
+            try:
+                rects.append(
+                    PdfRect.normalized(
+                        (
+                            float(rect[0]),
+                            float(rect[1]),
+                            float(rect[2]),
+                            float(rect[3]),
+                        )
+                    )
+                )
+            except Exception:
+                continue
+        return tuple(rects)
+
+    @staticmethod
+    def _line_index_for_box(box: PdfRect | None, line_rects: tuple[PdfRect, ...]) -> int | None:
+        if box is None or not line_rects:
+            return None
+        center = box.center
+        best_index: int | None = None
+        best_overlap = 0.0
+        for index, line_rect in enumerate(line_rects):
+            intersection = box.intersection(line_rect)
+            if intersection is not None:
+                overlap_area = intersection.width * intersection.height
+                if overlap_area > best_overlap:
+                    best_overlap = overlap_area
+                    best_index = index
+                    continue
+            if (
+                line_rect.left <= center.x <= line_rect.right
+                and line_rect.bottom <= center.y <= line_rect.top
+            ):
+                return index
+        return best_index
+
+    def _page_has_images(self, page_index: int) -> bool:
+        try:
+            page = self._reader.pages[page_index]
+        except Exception:
+            return False
+        images = getattr(page, "images", None)
+        if images is not None:
+            try:
+                return any(True for _ in images)
+            except Exception:
+                return False
+        return False
 
 
 class RenderImageCache:

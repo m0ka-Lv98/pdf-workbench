@@ -289,6 +289,15 @@ def page_point_for_box(view: PdfView, page_index: int, box: PdfRect) -> QPoint:
     return point.toPoint()
 
 
+def union_rect(*boxes: PdfRect) -> PdfRect:
+    return PdfRect(
+        left=min(box.left for box in boxes),
+        bottom=min(box.bottom for box in boxes),
+        right=max(box.right for box in boxes),
+        top=max(box.top for box in boxes),
+    )
+
+
 def send_page_mouse_event(
     page: QWidget,
     event_type: QEvent.Type,
@@ -653,9 +662,8 @@ def test_text_search_highlights_matches_and_navigates_between_results(
     )
 
     assert view.search("hello") == 2
-    assert view.next_match() is True
     assert view._current_match_index == 0
-    assert view._canvas.pages[0]._current_match_boxes
+    assert len(view._canvas.pages[0]._current_match_boxes) == 1
     assert view.next_match() is True
     assert view._current_match_index == 1
     assert view.previous_match() is True
@@ -663,7 +671,7 @@ def test_text_search_highlights_matches_and_navigates_between_results(
     assert _wrapper.isVisible()
 
 
-def test_text_selection_and_copy_use_character_boxes(
+def test_text_selection_and_copy_merge_adjacent_boxes_into_single_overlay_run(
     qtbot: QtBot,
     tmp_path: Path,
 ) -> None:
@@ -702,9 +710,80 @@ def test_text_selection_and_copy_use_character_boxes(
     assert view.selected_text == "abc"
     assert view.copy_selected_text() is True
     assert QApplication.clipboard().text() == "abc"
-    assert view._canvas.pages[0]._selection_boxes
+    assert len(view._canvas.pages[0]._selection_boxes) == 1
+    assert view._canvas.pages[0]._selection_boxes[0].box == union_rect(*boxes)
     assert QWidget.mouseGrabber() is None
     assert _wrapper.isVisible()
+
+
+def test_text_selection_splits_overlay_runs_across_lines(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    document_path = create_pdf(tmp_path / "selection-lines.pdf", 1)
+    service = FakeRenderService(create_metadata(document_path, 1))
+    view = PdfView(render_service=service, debounce_interval_ms=0)
+    _wrapper = show_view(qtbot, view)
+
+    view.open_document(document_path)
+    qtbot.waitUntil(lambda: view.page_count == 1)
+
+    boxes = [
+        PdfRect(10.0, 50.0, 20.0, 70.0),
+        PdfRect(22.0, 50.0, 32.0, 70.0),
+        PdfRect(10.0, 20.0, 20.0, 40.0),
+        PdfRect(22.0, 20.0, 32.0, 40.0),
+    ]
+    service.emit_text_index(
+        view._document_id,
+        create_metadata(document_path, 1).revision,
+        0,
+        "ab\ncd",
+        boxes,
+    )
+    page = view._canvas.pages[0]
+    start_point = page_point_for_box(view, 0, boxes[0])
+    end_point = page_point_for_box(view, 0, boxes[3])
+    send_page_mouse_event(page, QEvent.Type.MouseButtonPress, start_point)
+    send_page_mouse_event(page, QEvent.Type.MouseMove, end_point)
+    send_page_mouse_event(
+        page,
+        QEvent.Type.MouseButtonRelease,
+        end_point,
+        buttons=Qt.MouseButton.NoButton,
+    )
+
+    assert len(page._selection_boxes) == 2
+
+
+def test_text_selection_does_not_merge_distant_columns(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    document_path = create_pdf(tmp_path / "selection-columns.pdf", 1)
+    service = FakeRenderService(create_metadata(document_path, 1))
+    view = PdfView(render_service=service, debounce_interval_ms=0)
+    _wrapper = show_view(qtbot, view)
+
+    view.open_document(document_path)
+    qtbot.waitUntil(lambda: view.page_count == 1)
+
+    boxes = [
+        PdfRect(10.0, 50.0, 20.0, 70.0),
+        PdfRect(22.0, 50.0, 32.0, 70.0),
+        PdfRect(120.0, 50.0, 130.0, 70.0),
+        PdfRect(132.0, 50.0, 142.0, 70.0),
+    ]
+    service.emit_text_index(
+        view._document_id,
+        create_metadata(document_path, 1).revision,
+        0,
+        "abcd",
+        boxes,
+    )
+
+    assert view.search("abcd") == 1
+    assert len(view._canvas.pages[0]._match_boxes) == 2
 
 
 def test_live_mouse_selection_ignores_page_margin_press(
@@ -794,8 +873,8 @@ def test_live_mouse_selection_crosses_pages_with_global_positions(
     )
 
     assert view.selected_text == "abc\ndef"
-    assert view._canvas.pages[0]._selection_boxes
-    assert view._canvas.pages[1]._selection_boxes
+    assert len(view._canvas.pages[0]._selection_boxes) == 1
+    assert len(view._canvas.pages[1]._selection_boxes) == 1
     assert QWidget.mouseGrabber() is None
     assert _wrapper.isVisible()
 
@@ -875,5 +954,85 @@ def test_real_text_pdf_indexes_search_terms_and_survives_rotation(
 
     assert view.search("PDF") == 1
     assert view.next_match() is True
-    assert view._canvas.pages[0]._current_match_boxes
+    assert len(view._canvas.pages[0]._current_match_boxes) == 1
     assert _wrapper.isVisible()
+
+
+@pytest.mark.parametrize("rotation", [0, 90, 180, 270])
+def test_selection_overlay_runs_preserve_pdf_coordinates_across_rotation(
+    qtbot: QtBot,
+    tmp_path: Path,
+    rotation: int,
+) -> None:
+    document_path = create_pdf(tmp_path / f"selection-rotation-{rotation}.pdf", 1)
+    service = FakeRenderService(create_metadata(document_path, 1))
+    view = PdfView(render_service=service, debounce_interval_ms=0)
+    _wrapper = show_view(qtbot, view)
+
+    view.open_document(document_path)
+    qtbot.waitUntil(lambda: view.page_count == 1)
+    boxes = [
+        PdfRect(10.0, 10.0, 20.0, 30.0),
+        PdfRect(22.0, 10.0, 32.0, 30.0),
+        PdfRect(34.0, 10.0, 44.0, 30.0),
+    ]
+    service.emit_text_index(
+        view._document_id,
+        create_metadata(document_path, 1).revision,
+        0,
+        "abc",
+        boxes,
+    )
+    view.set_rotation(rotation)
+    page = view._canvas.pages[0]
+    start_point = page_point_for_box(view, 0, boxes[0])
+    end_point = page_point_for_box(view, 0, boxes[2])
+    send_page_mouse_event(page, QEvent.Type.MouseButtonPress, start_point)
+    send_page_mouse_event(page, QEvent.Type.MouseMove, end_point)
+    send_page_mouse_event(
+        page,
+        QEvent.Type.MouseButtonRelease,
+        end_point,
+        buttons=Qt.MouseButton.NoButton,
+    )
+
+    assert page._selection_boxes[0].box == union_rect(*boxes)
+
+
+def test_selection_overlay_runs_preserve_pdf_coordinates_after_zoom_change(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    document_path = create_pdf(tmp_path / "selection-zoom.pdf", 1)
+    service = FakeRenderService(create_metadata(document_path, 1))
+    view = PdfView(render_service=service, debounce_interval_ms=0)
+    _wrapper = show_view(qtbot, view)
+
+    view.open_document(document_path)
+    qtbot.waitUntil(lambda: view.page_count == 1)
+    boxes = [
+        PdfRect(10.0, 10.0, 20.0, 30.0),
+        PdfRect(22.0, 10.0, 32.0, 30.0),
+        PdfRect(34.0, 10.0, 44.0, 30.0),
+    ]
+    service.emit_text_index(
+        view._document_id,
+        create_metadata(document_path, 1).revision,
+        0,
+        "abc",
+        boxes,
+    )
+    view.set_zoom(2.5)
+    page = view._canvas.pages[0]
+    start_point = page_point_for_box(view, 0, boxes[0])
+    end_point = page_point_for_box(view, 0, boxes[2])
+    send_page_mouse_event(page, QEvent.Type.MouseButtonPress, start_point)
+    send_page_mouse_event(page, QEvent.Type.MouseMove, end_point)
+    send_page_mouse_event(
+        page,
+        QEvent.Type.MouseButtonRelease,
+        end_point,
+        buttons=Qt.MouseButton.NoButton,
+    )
+
+    assert page._selection_boxes[0].box == union_rect(*boxes)

@@ -42,6 +42,7 @@ from pdf_workbench.services.pdf_renderer import (
     PdfRenderServiceProtocol,
     RenderRequest,
     SearchMatch,
+    TextCharacterBox,
 )
 
 
@@ -56,13 +57,12 @@ _MAX_USER_ZOOM = 5.0
 _BASE_RENDER_SCALE = 1.5
 _MIN_LOGICAL_ZOOM = _BASE_RENDER_SCALE * _MIN_USER_ZOOM
 _MAX_LOGICAL_ZOOM = _BASE_RENDER_SCALE * _MAX_USER_ZOOM
-_PAGE_CORNER_RADIUS = 6.0
 _MATCH_COLOR = QColor(255, 214, 51, 120)
-_MATCH_OUTLINE = QColor(184, 134, 11, 180)
-_CURRENT_MATCH_COLOR = QColor(76, 175, 80, 140)
-_CURRENT_MATCH_OUTLINE = QColor(27, 94, 32, 220)
-_SELECTION_COLOR = QColor(33, 150, 243, 100)
-_SELECTION_OUTLINE = QColor(13, 71, 161, 200)
+_CURRENT_MATCH_COLOR = QColor(255, 167, 38, 160)
+_SELECTION_COLOR = QColor(33, 150, 243, 96)
+_SELECTION_OUTLINE = QColor(13, 71, 161, 90)
+_LINE_RUN_VERTICAL_OVERLAP_RATIO = 0.55
+_LINE_RUN_GAP_MULTIPLIER = 1.5
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,11 +214,11 @@ class PagePlaceholder(QFrame):
         shadow = rect.translated(2, 3)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(0, 0, 0, 28))
-        painter.drawRoundedRect(shadow, _PAGE_CORNER_RADIUS, _PAGE_CORNER_RADIUS)
+        painter.drawRoundedRect(shadow, 6.0, 6.0)
 
         surface = rect
         painter.setBrush(self.palette().base())
-        painter.drawRoundedRect(surface, _PAGE_CORNER_RADIUS, _PAGE_CORNER_RADIUS)
+        painter.drawRoundedRect(surface, 6.0, 6.0)
 
         if self._pixmap is not None:
             target = self.page_content_rect()
@@ -239,7 +239,7 @@ class PagePlaceholder(QFrame):
 
         painter.setPen(self.palette().color(QPalette.ColorRole.Mid))
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawRoundedRect(surface, _PAGE_CORNER_RADIUS, _PAGE_CORNER_RADIUS)
+        painter.drawRoundedRect(surface, 6.0, 6.0)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -262,9 +262,9 @@ class PagePlaceholder(QFrame):
     def _draw_overlays(self, painter: QPainter) -> None:
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         for box in self._match_boxes:
-            self._draw_box(painter, box.box, _MATCH_COLOR, _MATCH_OUTLINE)
+            self._draw_box(painter, box.box, _MATCH_COLOR)
         for box in self._current_match_boxes:
-            self._draw_box(painter, box.box, _CURRENT_MATCH_COLOR, _CURRENT_MATCH_OUTLINE)
+            self._draw_box(painter, box.box, _CURRENT_MATCH_COLOR)
         for box in self._selection_boxes:
             self._draw_box(painter, box.box, _SELECTION_COLOR, _SELECTION_OUTLINE)
 
@@ -273,13 +273,13 @@ class PagePlaceholder(QFrame):
         painter: QPainter,
         box: PdfRect,
         fill: QColor,
-        outline: QColor,
+        outline: QColor | None = None,
     ) -> None:
         mapper = self._coordinate_mapper()
         rect = mapper.pdf_to_view_rect(box)
-        painter.setPen(outline)
+        painter.setPen(outline if outline is not None else Qt.PenStyle.NoPen)
         painter.setBrush(fill)
-        painter.drawRoundedRect(rect, 3.0, 3.0)
+        painter.drawRect(rect)
 
     def _status_text(self) -> str:
         labels = {
@@ -357,6 +357,9 @@ class PdfSearchState:
     total_pages: int
     failed_pages: int
     indexing_completed: bool
+    text_pages_with_content: int = 0
+    image_only_pages: int = 0
+    empty_text_pages: int = 0
 
 
 class PdfView(QWidget):
@@ -396,6 +399,9 @@ class PdfView(QWidget):
         self._failed_page_count = 0
         self._index_total_page_count = 0
         self._indexing_completed = False
+        self._text_page_indexes: set[int] = set()
+        self._empty_text_page_indexes: set[int] = set()
+        self._image_only_page_indexes: set[int] = set()
 
         self._content = QWidget(self)
         self._content.setObjectName("pdfContent")
@@ -690,10 +696,18 @@ class PdfView(QWidget):
         self._text_indexes[page_text.page_index] = page_text
         self._normalized_page_texts[page_text.page_index] = self._normalize_page_text(page_text)
         self._indexed_page_count = len(self._text_indexes)
+        self._update_page_text_flags(page_text)
+        should_focus = False
         if self._search_query:
-            self._recompute_search_matches()
+            should_focus = self._recompute_search_matches(
+                activate_first_match=self._current_match_index < 0,
+                preserve_current=True,
+            )
         self.search_state_changed.emit()
-        self._refresh_page_overlays(page_text.page_index)
+        if should_focus and self._current_match_index >= 0:
+            self._goto_match(self._current_match_index)
+        else:
+            self._refresh_page_overlays()
 
     def _on_text_index_progress(
         self,
@@ -747,14 +761,22 @@ class PdfView(QWidget):
         if self._metadata is None or revision != self._metadata.revision:
             return
         self._failed_page_count += 1
+        self.error_occurred.emit(f"テキスト索引の作成に失敗しました: {page_index + 1}ページ")
         self.search_state_changed.emit()
         if 0 <= page_index < len(self._canvas.pages):
             self._canvas.pages[page_index].update()
 
     def search(self, query: str) -> int:
+        previous_query = self._search_query
         self._search_query = query.strip()
-        self._recompute_search_matches()
-        self._refresh_page_overlays()
+        should_focus = self._recompute_search_matches(
+            activate_first_match=bool(self._search_query),
+            preserve_current=self._search_query == previous_query,
+        )
+        if should_focus and self._current_match_index >= 0:
+            self._goto_match(self._current_match_index)
+        else:
+            self._refresh_page_overlays()
         self.search_state_changed.emit()
         return len(self._search_matches)
 
@@ -790,6 +812,9 @@ class PdfView(QWidget):
             total_pages=self._index_total_page_count,
             failed_pages=self._failed_page_count,
             indexing_completed=self._indexing_completed,
+            text_pages_with_content=len(self._text_page_indexes),
+            image_only_pages=len(self._image_only_page_indexes),
+            empty_text_pages=len(self._empty_text_page_indexes),
         )
 
     @property
@@ -858,12 +883,25 @@ class PdfView(QWidget):
             box_in_page_content.size(),
         )
 
-    def _recompute_search_matches(self) -> None:
+    def _recompute_search_matches(
+        self,
+        *,
+        activate_first_match: bool,
+        preserve_current: bool,
+    ) -> bool:
         query = self._search_query.strip()
+        current_match_key: tuple[int, int, int] | None = None
+        if preserve_current and 0 <= self._current_match_index < len(self._search_matches):
+            current_match = self._search_matches[self._current_match_index]
+            current_match_key = (
+                current_match.page_index,
+                current_match.start_pdfium_index,
+                current_match.end_pdfium_index,
+            )
         self._search_matches.clear()
         self._current_match_index = -1
         if not query or not self._text_indexes:
-            return
+            return False
         lowered = query.casefold()
         for page_index in sorted(self._text_indexes):
             normalized = self._normalized_page_texts.get(page_index)
@@ -884,9 +922,7 @@ class PdfView(QWidget):
                 if not source_characters:
                     start = found + max(1, len(lowered))
                     continue
-                boxes = tuple(
-                    character.box for character in source_characters if character.box is not None
-                )
+                boxes = tuple(self._merge_characters_into_runs(source_characters))
                 self._search_matches.append(
                     SearchMatch(
                         page_index=page_index,
@@ -906,6 +942,19 @@ class PdfView(QWidget):
                 match.end_pdfium_index,
             )
         )
+        if current_match_key is not None:
+            for index, match in enumerate(self._search_matches):
+                if (
+                    match.page_index,
+                    match.start_pdfium_index,
+                    match.end_pdfium_index,
+                ) == current_match_key:
+                    self._current_match_index = index
+                    return False
+        if activate_first_match and self._search_matches:
+            self._current_match_index = 0
+            return True
+        return False
 
     def _normalize_page_text(self, text_index: PageTextIndex) -> NormalizedPageText:
         normalized_parts: list[str] = []
@@ -1095,22 +1144,20 @@ class PdfView(QWidget):
         start: TextPosition,
         end: TextPosition,
     ) -> list[PdfRect]:
-        boxes: list[PdfRect] = []
+        characters: list[TextCharacterBox] = []
         for character in text_index.characters:
-            if character.box is None:
-                continue
             if page_index == start.page_index and page_index == end.page_index:
                 if start.pdfium_index <= character.pdfium_index <= end.pdfium_index:
-                    boxes.append(character.box)
+                    characters.append(character)
             elif page_index == start.page_index:
                 if character.pdfium_index >= start.pdfium_index:
-                    boxes.append(character.box)
+                    characters.append(character)
             elif page_index == end.page_index:
                 if character.pdfium_index <= end.pdfium_index:
-                    boxes.append(character.box)
+                    characters.append(character)
             elif start.page_index < page_index < end.page_index:
-                boxes.append(character.box)
-        return boxes
+                characters.append(character)
+        return self._merge_characters_into_runs(characters)
 
     @staticmethod
     def _distance_to_rect(rect: QRectF, point: QPointF) -> float:
@@ -1267,11 +1314,86 @@ class PdfView(QWidget):
         self._failed_page_count = 0
         self._index_total_page_count = 0
         self._indexing_completed = False
+        self._text_page_indexes.clear()
+        self._empty_text_page_indexes.clear()
+        self._image_only_page_indexes.clear()
         if clear_query:
             self._search_query = ""
         self._refresh_page_overlays()
         self.search_state_changed.emit()
         self.selection_changed.emit()
+
+    def _update_page_text_flags(self, page_text: PageTextIndex) -> None:
+        page_index = page_text.page_index
+        self._text_page_indexes.discard(page_index)
+        self._empty_text_page_indexes.discard(page_index)
+        self._image_only_page_indexes.discard(page_index)
+        if page_text.text.strip():
+            self._text_page_indexes.add(page_index)
+            return
+        self._empty_text_page_indexes.add(page_index)
+        if page_text.has_image_content:
+            self._image_only_page_indexes.add(page_index)
+
+    @staticmethod
+    def _merge_characters_into_runs(characters: list[TextCharacterBox]) -> list[PdfRect]:
+        boxes = [character for character in characters if character.box is not None]
+        if not boxes:
+            return []
+        runs: list[PdfRect] = []
+        current_run = boxes[0].box
+        if current_run is None:
+            return []
+        previous_character = boxes[0]
+        for character in boxes[1:]:
+            box = character.box
+            if box is None:
+                continue
+            if PdfView._should_merge_boxes(previous_character, character):
+                current_run = PdfRect(
+                    left=min(current_run.left, box.left),
+                    bottom=min(current_run.bottom, box.bottom),
+                    right=max(current_run.right, box.right),
+                    top=max(current_run.top, box.top),
+                )
+            else:
+                runs.append(current_run)
+                current_run = box
+            previous_character = character
+        runs.append(current_run)
+        return runs
+
+    @staticmethod
+    def _should_merge_boxes(
+        previous_character: TextCharacterBox,
+        current_character: TextCharacterBox,
+    ) -> bool:
+        previous_box = previous_character.box
+        current_box = current_character.box
+        if previous_box is None or current_box is None:
+            return False
+        vertical_overlap = min(previous_box.top, current_box.top) - max(
+            previous_box.bottom,
+            current_box.bottom,
+        )
+        minimum_height = min(previous_box.height, current_box.height)
+        same_line = vertical_overlap >= minimum_height * _LINE_RUN_VERTICAL_OVERLAP_RATIO
+        if not same_line:
+            same_line = abs(previous_box.center.y - current_box.center.y) <= minimum_height * (
+                1.0 - _LINE_RUN_VERTICAL_OVERLAP_RATIO
+            )
+        if not same_line:
+            return False
+        gap = current_box.left - previous_box.right
+        gap_limit = (
+            max(
+                previous_box.height,
+                current_box.height,
+                min(previous_box.width, current_box.width),
+            )
+            * _LINE_RUN_GAP_MULTIPLIER
+        )
+        return gap <= gap_limit
 
     @staticmethod
     def _release_mouse_grab() -> None:
