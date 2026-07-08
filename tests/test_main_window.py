@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 from PySide6.QtCore import QMimeData, QPoint, QPointF, QSettings, Qt, QUrl
-from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent
+from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent, QKeySequence
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMessageBox
 from pytestqt.qtbot import QtBot
@@ -338,12 +338,10 @@ def test_main_window_search_shortcut_opens_search_ui(
     document.view.setFocus(Qt.FocusReason.OtherFocusReason)
     qtbot.waitUntil(document.view.hasFocus)
 
-    modifier = (
-        Qt.KeyboardModifier.MetaModifier
-        if sys.platform == "darwin"
-        else Qt.KeyboardModifier.ControlModifier
+    expected_sequence = (
+        QKeySequence("Meta+F") if sys.platform == "darwin" else QKeySequence("Ctrl+F")
     )
-    QTest.keyClick(document.view, Qt.Key.Key_F, modifier)
+    QTest.keySequence(window, expected_sequence)
 
     qtbot.waitUntil(lambda: window._search_ui_is_ready())
     assert_search_ui_ready(window)

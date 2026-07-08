@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtCore import QMimeData, QSettings, QSize, Qt
-from PySide6.QtGui import QAction, QCloseEvent, QDragEnterEvent, QDropEvent, QKeySequence
+from PySide6.QtCore import QEvent, QMimeData, QObject, QSettings, QSize, Qt
+from PySide6.QtGui import QAction, QCloseEvent, QDragEnterEvent, QDropEvent, QKeyEvent, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -105,6 +106,8 @@ class MainWindow(QMainWindow):
         focus_changed = getattr(app, "focusChanged", None)
         if focus_changed is not None:
             focus_changed.connect(self._on_focus_changed)
+        if app is not None:
+            app.installEventFilter(self)
 
         self._create_actions()
         self._create_menu()
@@ -146,13 +149,11 @@ class MainWindow(QMainWindow):
         self.zoom_out_action.triggered.connect(lambda: self._change_zoom(1 / 1.2))
 
         self.find_action = QAction("検索", self)
-        self.find_action.setShortcuts(
-            [
-                QKeySequence(QKeySequence.StandardKey.Find),
-                QKeySequence("Ctrl+F"),
-                QKeySequence("Meta+F"),
-            ]
-        )
+        find_shortcuts = list(QKeySequence.keyBindings(QKeySequence.StandardKey.Find))
+        if not find_shortcuts:
+            fallback = "Meta+F" if sys.platform == "darwin" else "Ctrl+F"
+            find_shortcuts = [QKeySequence(fallback)]
+        self.find_action.setShortcuts(find_shortcuts)
         self.find_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
         self.find_action.triggered.connect(self.open_search_bar)
 
@@ -535,6 +536,36 @@ class MainWindow(QMainWindow):
 
     def _on_focus_changed(self, _old: QWidget | None, _new: QWidget | None) -> None:
         self._update_actions()
+
+    @staticmethod
+    def _is_find_shortcut_event(event: QKeyEvent) -> bool:
+        if event.key() != Qt.Key.Key_F:
+            return False
+        expected_modifier = (
+            Qt.KeyboardModifier.MetaModifier
+            if sys.platform == "darwin"
+            else Qt.KeyboardModifier.ControlModifier
+        )
+        return bool(event.modifiers() & expected_modifier)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if (
+            isinstance(watched, QWidget)
+            and isinstance(event, QKeyEvent)
+            and event.type() in (QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress)
+            and self._is_find_shortcut_event(event)
+        ):
+            focus_widget = QApplication.focusWidget()
+            if (
+                focus_widget is not None
+                and focus_widget is not self._search_bar.search_input
+                and isinstance(focus_widget, QLineEdit)
+            ):
+                return super().eventFilter(watched, event)
+            if self._current_document() is not None and self.isAncestorOf(watched):
+                self.find_action.trigger()
+                return True
+        return super().eventFilter(watched, event)
 
     def _on_view_search_state_changed(self, view: PdfView) -> None:
         document = self._current_document()
