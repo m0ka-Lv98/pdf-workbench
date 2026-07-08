@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from PySide6.QtCore import QEvent, QObject, QSignalBlocker, Qt, QTimer, Signal
 from PySide6.QtGui import QKeyEvent
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QLineEdit, QToolButton, QWidget
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QLineEdit, QSizePolicy, QToolButton, QWidget
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +41,11 @@ class SearchBar(QWidget):
         self.search_input.setPlaceholderText("検索")
         self.search_input.setAccessibleName("Search input")
         self.search_input.setToolTip("検索語句を入力します")
+        self.search_input.setMinimumWidth(320)
+        self.search_input.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
         self.search_input.textChanged.connect(self._on_text_changed)
 
         self.previous_button = QToolButton(self)
@@ -81,6 +86,7 @@ class SearchBar(QWidget):
         layout.addWidget(self.close_button)
 
         self.search_input.installEventFilter(self)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
     def set_state(self, state: SearchBarState) -> None:
         blocker = QSignalBlocker(self.search_input)
@@ -91,6 +97,7 @@ class SearchBar(QWidget):
 
     def focus_search(self) -> None:
         self.show()
+        self.activateWindow()
         self.search_input.setFocus(Qt.FocusReason.ShortcutFocusReason)
 
     def cancel_pending_search(self) -> None:

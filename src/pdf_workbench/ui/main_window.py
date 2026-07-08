@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QSizePolicy,
     QStackedWidget,
     QStatusBar,
     QTabWidget,
@@ -56,8 +58,10 @@ class MainWindow(QMainWindow):
         )
         self._documents: list[DocumentTab] = []
         self._recent_files: list[Path] = self._load_recent_files()
+        self._build_sha = os.environ.get("PDF_WORKBENCH_BUILD_SHA", "").strip()
         self._toolbar_widget = DocumentToolbar(self)
         self._search_bar = SearchBar(self)
+        self._main_toolbar: QToolBar | None = None
         self._search_toolbar: QToolBar | None = None
         self._empty_state = EmptyState(self)
 
@@ -87,6 +91,7 @@ class MainWindow(QMainWindow):
         self._empty_state.open_requested.connect(self._choose_document)
         self._empty_state.recent_file_requested.connect(self.open_document)
         self._toolbar_widget.open_requested.connect(self._choose_document)
+        self._toolbar_widget.search_requested.connect(self.open_search_bar)
         self._toolbar_widget.previous_requested.connect(self._previous_page)
         self._toolbar_widget.next_requested.connect(self._next_page)
         self._toolbar_widget.rotate_requested.connect(self._rotate_page)
@@ -141,8 +146,15 @@ class MainWindow(QMainWindow):
         self.zoom_out_action.triggered.connect(lambda: self._change_zoom(1 / 1.2))
 
         self.find_action = QAction("検索", self)
-        self.find_action.setShortcut(QKeySequence.StandardKey.Find)
-        self.find_action.triggered.connect(self._prompt_search)
+        self.find_action.setShortcuts(
+            [
+                QKeySequence(QKeySequence.StandardKey.Find),
+                QKeySequence("Ctrl+F"),
+                QKeySequence("Meta+F"),
+            ]
+        )
+        self.find_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+        self.find_action.triggered.connect(self.open_search_bar)
 
         self.find_next_action = QAction("次の検索結果", self)
         self.find_next_action.setShortcut(QKeySequence("F3"))
@@ -155,6 +167,21 @@ class MainWindow(QMainWindow):
         self.copy_action = QAction("コピー", self)
         self.copy_action.setShortcut(QKeySequence.StandardKey.Copy)
         self.copy_action.triggered.connect(self._copy_selection)
+
+        for action in (
+            self.open_action,
+            self.close_action,
+            self.exit_action,
+            self.previous_action,
+            self.next_action,
+            self.zoom_in_action,
+            self.zoom_out_action,
+            self.find_action,
+            self.find_next_action,
+            self.find_previous_action,
+            self.copy_action,
+        ):
+            self.addAction(action)
 
     def _create_menu(self) -> None:
         file_menu = self.menuBar().addMenu("ファイル")
@@ -184,17 +211,26 @@ class MainWindow(QMainWindow):
         toolbar.setMovable(False)
         toolbar.setFloatable(False)
         toolbar.setIconSize(QSize(18, 18))
+        toolbar.setAllowedAreas(Qt.ToolBarArea.TopToolBarArea)
         self.addToolBar(toolbar)
         toolbar.addWidget(self._toolbar_widget)
+        self._main_toolbar = toolbar
 
     def _create_search_bar(self) -> None:
         self._search_toolbar = QToolBar("検索", self)
         self._search_toolbar.setObjectName("searchToolbar")
         self._search_toolbar.setMovable(False)
         self._search_toolbar.setFloatable(False)
+        self._search_toolbar.setAllowedAreas(Qt.ToolBarArea.TopToolBarArea)
+        self._search_toolbar.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        self.addToolBarBreak(Qt.ToolBarArea.TopToolBarArea)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self._search_toolbar)
         self._search_toolbar.hide()
-        self.addToolBar(self._search_toolbar)
         self._search_toolbar.addWidget(self._search_bar)
+        self._search_toolbar.toggleViewAction().setVisible(False)
 
     def _choose_document(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(self, "PDFを開く", "", "PDF files (*.pdf)")
@@ -310,16 +346,32 @@ class MainWindow(QMainWindow):
         self._sync_toolbar(document)
         self._update_status()
 
-    def _prompt_search(self) -> None:
+    def open_search_bar(self) -> bool:
         document = self._current_document()
         if document is None:
-            return
+            return False
+        self.activateWindow()
+        self.raise_()
         if self._search_toolbar is not None:
+            available_width = max(480, self.width() - 24)
+            self._search_toolbar.setMinimumWidth(available_width)
+            self._search_toolbar.resize(available_width, self._search_toolbar.sizeHint().height())
             self._search_toolbar.show()
+            self._search_toolbar.raise_()
         self._search_bar.show()
+        self._search_bar.setMinimumWidth(max(420, self.width() - 48))
         self._search_bar.cancel_pending_search()
         self._search_bar.set_state(self._search_state_for(document))
         self._search_bar.focus_search()
+        if self._search_toolbar is not None:
+            self._search_toolbar.adjustSize()
+        self._search_bar.adjustSize()
+        self._search_bar.search_input.adjustSize()
+        QApplication.processEvents()
+        return self._search_ui_is_ready()
+
+    def _prompt_search(self) -> None:
+        self.open_search_bar()
 
     def _next_match(self) -> None:
         document = self._current_document()
@@ -439,11 +491,14 @@ class MainWindow(QMainWindow):
         return f"{document.session.source_path.name}{suffix}"
 
     def _update_window_title(self) -> None:
+        suffix = ""
+        if self._build_sha:
+            suffix = f" [{self._build_sha}]"
         document = self._current_document()
         if document is None:
-            self.setWindowTitle("PDF Workbench")
+            self.setWindowTitle(f"PDF Workbench{suffix}")
             return
-        self.setWindowTitle(f"{self._tab_title(document)} - PDF Workbench")
+        self.setWindowTitle(f"{self._tab_title(document)} - PDF Workbench{suffix}")
 
     def _update_actions(self) -> None:
         has_document = self._current_document() is not None
@@ -574,6 +629,32 @@ class MainWindow(QMainWindow):
 
     def _is_search_open(self) -> bool:
         return self._search_toolbar is not None and self._search_toolbar.isVisible()
+
+    def _search_ui_is_ready(self) -> bool:
+        if self._search_toolbar is None:
+            return False
+        if not self._search_toolbar.isVisible():
+            return False
+        if not self._search_bar.isVisible():
+            return False
+        if not self._search_bar.search_input.isVisible():
+            return False
+        if (
+            QApplication.platformName() != "offscreen"
+            and not self._search_bar.search_input.hasFocus()
+        ):
+            return False
+        if (
+            self._search_toolbar.geometry().width() <= 0
+            or self._search_toolbar.geometry().height() <= 0
+        ):
+            return False
+        if self._search_bar.geometry().width() <= 0 or self._search_bar.geometry().height() <= 0:
+            return False
+        return not (
+            self._search_bar.search_input.geometry().width() <= 0
+            or self._search_bar.search_input.geometry().height() <= 0
+        )
 
     @staticmethod
     def _search_progress_text(state: object) -> str:

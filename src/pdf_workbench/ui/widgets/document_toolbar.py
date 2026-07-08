@@ -26,6 +26,7 @@ class ToolbarState:
 
 class DocumentToolbar(QWidget):
     open_requested = Signal()
+    search_requested = Signal()
     previous_requested = Signal()
     next_requested = Signal()
     rotate_requested = Signal()
@@ -46,6 +47,12 @@ class DocumentToolbar(QWidget):
             role="primary",
             object_name="openPdfButton",
             tooltip="PDFを開く",
+        )
+        self.search_button = self._button(
+            "検索",
+            QStyle.StandardPixmap.SP_FileDialogContentsView,
+            object_name="openSearchButton",
+            tooltip="検索 (⌘F / Ctrl+F)",
         )
         self.previous_button = self._button(
             "前へ",
@@ -114,7 +121,7 @@ class DocumentToolbar(QWidget):
         line_edit.editingFinished.connect(self._commit_zoom_from_editor)
         line_edit.returnPressed.connect(self._commit_zoom_from_editor)
 
-        self._group(root, self.open_button)
+        self._group(root, self.open_button, self.search_button)
         self._group(root, self.previous_button, self.page_field, self._page_label, self.next_button)
         self._group(
             root,
@@ -125,6 +132,7 @@ class DocumentToolbar(QWidget):
         )
 
         self.open_button.clicked.connect(self.open_requested.emit)
+        self.search_button.clicked.connect(self.search_requested.emit)
         self.previous_button.clicked.connect(self.previous_requested.emit)
         self.next_button.clicked.connect(self.next_requested.emit)
         self.rotate_button.clicked.connect(self.rotate_requested.emit)
@@ -133,6 +141,7 @@ class DocumentToolbar(QWidget):
 
         for button in (
             self.open_button,
+            self.search_button,
             self.previous_button,
             self.next_button,
             self.rotate_button,
@@ -146,6 +155,7 @@ class DocumentToolbar(QWidget):
 
     def setState(self, state: ToolbarState) -> None:
         self.open_button.setEnabled(True)
+        self.search_button.setEnabled(state.has_document)
         self.previous_button.setEnabled(state.has_document and state.page_index > 0)
         self.next_button.setEnabled(state.has_document and state.page_index + 1 < state.page_count)
         self.rotate_button.setEnabled(state.has_document)
