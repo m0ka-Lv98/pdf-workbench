@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 from PIL import Image, ImageDraw
@@ -7,6 +8,12 @@ from pypdf import PdfWriter
 from PySide6.QtCore import QMarginsF, QSizeF
 from PySide6.QtGui import QFont, QPageLayout, QPageSize, QPainter, QPdfWriter
 from PySide6.QtWidgets import QApplication
+
+
+def copy_pdf_fixture(name: str, destination: Path) -> Path:
+    fixture_path = Path(__file__).with_name("fixtures") / name
+    shutil.copyfile(fixture_path, destination)
+    return destination
 
 
 def create_blank_pdf(path: Path, page_count: int) -> Path:
