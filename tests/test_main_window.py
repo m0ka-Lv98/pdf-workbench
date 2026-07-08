@@ -9,8 +9,8 @@ from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMessageBox
 from pytestqt.qtbot import QtBot
-from tests.pdf_test_utils import create_blank_pdf, create_image_only_pdf, create_qt_text_pdf
 
+from pdf_test_utils import create_blank_pdf, create_image_only_pdf, create_qt_text_pdf
 from pdf_workbench.services.page_coordinates import PageMetadata
 from pdf_workbench.services.pdf_renderer import (
     DocumentMetadata,
