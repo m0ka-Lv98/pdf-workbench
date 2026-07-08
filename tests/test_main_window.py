@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import time
 from pathlib import Path
 
@@ -37,6 +38,28 @@ def patch_pdf_open(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def create_settings(tmp_path: Path) -> QSettings:
     return QSettings(str(tmp_path / "app.ini"), QSettings.Format.IniFormat)
+
+
+def show_window(qtbot: QtBot, window: MainWindow) -> None:
+    window.show()
+    qtbot.waitUntil(window.isVisible)
+
+
+def assert_search_ui_ready(window: MainWindow) -> None:
+    assert window._search_toolbar is not None
+    assert window._search_toolbar.isVisible()
+    assert window._search_bar.isVisible()
+    assert window._search_bar.search_input.isVisible()
+    if QApplication.platformName() != "offscreen":
+        assert window._search_bar.search_input.hasFocus()
+    assert window._search_toolbar.geometry().width() > 0
+    assert window._search_toolbar.geometry().height() > 0
+    assert window._search_bar.geometry().width() > 0
+    assert window._search_bar.geometry().height() > 0
+    assert window._search_bar.search_input.geometry().width() > 0
+    assert window._search_bar.search_input.geometry().height() > 0
+    if window._main_toolbar is not None:
+        assert window._search_toolbar.geometry().top() >= window._main_toolbar.geometry().bottom()
 
 
 class DelayedTextBackend(PdfiumDocumentBackend):
@@ -79,6 +102,12 @@ def test_main_window_opens_and_closes_multiple_documents(
     settings = create_settings(tmp_path)
     window = MainWindow(settings)
     qtbot.addWidget(window)
+    show_window(qtbot, window)
+    show_window(qtbot, window)
+    show_window(qtbot, window)
+    show_window(qtbot, window)
+    show_window(qtbot, window)
+    show_window(qtbot, window)
 
     first = tmp_path / "first.pdf"
     second = tmp_path / "second.pdf"
@@ -110,6 +139,10 @@ def test_main_window_requires_confirmation_for_modified_document(
     settings = create_settings(tmp_path)
     window = MainWindow(settings)
     qtbot.addWidget(window)
+    show_window(qtbot, window)
+    show_window(qtbot, window)
+    show_window(qtbot, window)
+    show_window(qtbot, window)
 
     document_path = tmp_path / "modified.pdf"
     document_path.touch()
@@ -142,6 +175,10 @@ def test_main_window_persists_recent_files_and_geometry(
     settings = create_settings(tmp_path)
     window = MainWindow(settings)
     qtbot.addWidget(window)
+    show_window(qtbot, window)
+    show_window(qtbot, window)
+    show_window(qtbot, window)
+    show_window(qtbot, window)
 
     document_path = tmp_path / "recent.pdf"
     document_path.touch()
@@ -166,6 +203,8 @@ def test_main_window_avoids_duplicate_tabs_for_same_document(
     settings = create_settings(tmp_path)
     window = MainWindow(settings)
     qtbot.addWidget(window)
+    show_window(qtbot, window)
+    show_window(qtbot, window)
 
     document_path = tmp_path / "duplicate.pdf"
     document_path.touch()
@@ -236,6 +275,101 @@ def test_main_window_search_toolbar_starts_hidden(
     assert window._search_toolbar is not None
     assert window._search_toolbar.isHidden()
     assert window.find_action.isEnabled() is False
+    assert window._toolbar_widget.search_button.isEnabled() is False
+
+
+def test_main_window_toolbar_search_button_opens_search_ui(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    window = MainWindow(settings)
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = tmp_path / "toolbar-search.pdf"
+    document_path.touch()
+    window.open_document(document_path)
+
+    assert window._toolbar_widget.search_button.isEnabled() is True
+    QTest.mouseClick(window._toolbar_widget.search_button, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(lambda: window._search_ui_is_ready())
+    assert_search_ui_ready(window)
+
+
+def test_main_window_find_action_opens_search_ui(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    window = MainWindow(settings)
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = tmp_path / "menu-search.pdf"
+    document_path.touch()
+    window.open_document(document_path)
+
+    assert window.find_action.isEnabled() is True
+    window.find_action.trigger()
+    qtbot.waitUntil(lambda: window._search_ui_is_ready())
+    assert_search_ui_ready(window)
+
+
+def test_main_window_search_shortcut_opens_search_ui(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    window = MainWindow(settings)
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = tmp_path / "shortcut-search.pdf"
+    document_path.touch()
+    window.open_document(document_path)
+    document = window._documents[0]
+    document.view.setFocus(Qt.FocusReason.OtherFocusReason)
+    qtbot.waitUntil(document.view.hasFocus)
+
+    modifier = (
+        Qt.KeyboardModifier.MetaModifier
+        if sys.platform == "darwin"
+        else Qt.KeyboardModifier.ControlModifier
+    )
+    QTest.keyClick(document.view, Qt.Key.Key_F, modifier)
+
+    qtbot.waitUntil(lambda: window._search_ui_is_ready())
+    assert_search_ui_ready(window)
+
+
+def test_main_window_open_search_bar_refocuses_existing_input(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    window = MainWindow(settings)
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = tmp_path / "refocus-search.pdf"
+    document_path.touch()
+    window.open_document(document_path)
+
+    assert window.open_search_bar() is True
+    window._toolbar_widget.page_field.setFocus(Qt.FocusReason.OtherFocusReason)
+    qtbot.waitUntil(window._toolbar_widget.page_field.hasFocus)
+
+    assert window.open_search_bar() is True
+    assert_search_ui_ready(window)
 
 
 def test_main_window_copy_action_tracks_focus_and_selection(
@@ -247,11 +381,12 @@ def test_main_window_copy_action_tracks_focus_and_selection(
     settings = create_settings(tmp_path)
     window = MainWindow(settings)
     qtbot.addWidget(window)
+    show_window(qtbot, window)
 
     document_path = tmp_path / "copy.pdf"
     document_path.touch()
     window.open_document(document_path)
-    window._prompt_search()
+    assert window.open_search_bar() is True
 
     line_edit = window._search_bar.search_input
     line_edit.setText("selected")
@@ -278,11 +413,12 @@ def test_main_window_copy_action_prefers_line_edit_selection(
     settings = create_settings(tmp_path)
     window = MainWindow(settings)
     qtbot.addWidget(window)
+    show_window(qtbot, window)
 
     document_path = tmp_path / "copy-priority.pdf"
     document_path.touch()
     window.open_document(document_path)
-    window._prompt_search()
+    assert window.open_search_bar() is True
 
     line_edit = window._search_bar.search_input
     line_edit.setText("line-edit")
@@ -309,11 +445,12 @@ def test_main_window_search_bar_enter_and_shift_enter_fire_once(
     settings = create_settings(tmp_path)
     window = MainWindow(settings)
     qtbot.addWidget(window)
+    show_window(qtbot, window)
 
     document_path = tmp_path / "search-events.pdf"
     document_path.touch()
     window.open_document(document_path)
-    window._prompt_search()
+    assert window.open_search_bar() is True
 
     next_calls = 0
     previous_calls = 0
@@ -412,7 +549,7 @@ def test_main_window_real_search_updates_after_index_completion(
     window = create_real_main_window(qtbot, tmp_path, delay_seconds=0.35)
 
     window.open_document(document_path)
-    window._prompt_search()
+    assert window.open_search_bar() is True
     search_input = window._search_bar.search_input
     search_input.clear()
     search_input.setText("Alpha")
@@ -452,7 +589,7 @@ def test_main_window_real_search_supports_japanese_text(
     window = create_real_main_window(qtbot, tmp_path)
 
     window.open_document(document_path)
-    window._prompt_search()
+    assert window.open_search_bar() is True
     search_input = window._search_bar.search_input
     search_input.clear()
     search_input.setText("検索")
@@ -480,7 +617,7 @@ def test_main_window_real_search_reports_blank_pdf_without_text_layer(
     window = create_real_main_window(qtbot, tmp_path)
 
     window.open_document(document_path)
-    window._prompt_search()
+    assert window.open_search_bar() is True
     window._search_bar.search_input.setText("Alpha")
     window._search_bar._emit_debounced_search()
 
@@ -502,7 +639,7 @@ def test_main_window_real_search_reports_image_pdf_needs_ocr(
     window = create_real_main_window(qtbot, tmp_path)
 
     window.open_document(document_path)
-    window._prompt_search()
+    assert window.open_search_bar() is True
     window._search_bar.search_input.setText("scan")
     window._search_bar._emit_debounced_search()
 
@@ -525,11 +662,12 @@ def test_main_window_copy_action_falls_back_to_pdf_view_when_line_edit_has_no_se
     settings = create_settings(tmp_path)
     window = MainWindow(settings)
     qtbot.addWidget(window)
+    show_window(qtbot, window)
 
     document_path = tmp_path / "copy-fallback.pdf"
     document_path.touch()
     window.open_document(document_path)
-    window._prompt_search()
+    assert window.open_search_bar() is True
 
     line_edit = window._search_bar.search_input
     line_edit.setText("line-edit")

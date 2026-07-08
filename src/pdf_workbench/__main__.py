@@ -4,6 +4,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 
 from pdf_workbench import __version__
@@ -17,6 +18,29 @@ from pdf_workbench.ui.theme import ThemeController
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Local-first PDF desktop workbench")
     parser.add_argument("pdf", nargs="?", type=Path, help="PDF file to open")
+    parser.add_argument(
+        "--open-search",
+        action="store_true",
+        help="Open the search bar after launch",
+    )
+    parser.add_argument(
+        "--search-query",
+        type=str,
+        default=None,
+        help="Prefill the search bar with a query after launch",
+    )
+    parser.add_argument(
+        "--screenshot-path",
+        type=Path,
+        default=None,
+        help="Capture a window screenshot to the given path after launch",
+    )
+    parser.add_argument(
+        "--quit-after-ms",
+        type=int,
+        default=None,
+        help="Quit the application after the given number of milliseconds",
+    )
     parser.add_argument("--version", action="version", version=__version__)
     return parser
 
@@ -38,6 +62,22 @@ def main() -> int:
 
     if args.pdf is not None:
         window.open_document(args.pdf)
+
+    def run_startup_actions() -> None:
+        if (
+            (args.open_search or args.search_query is not None)
+            and window.open_search_bar()
+            and args.search_query is not None
+        ):
+            window._search_bar.search_input.setText(args.search_query)
+            window._search_bar._emit_debounced_search()
+        if args.screenshot_path is not None:
+            args.screenshot_path.parent.mkdir(parents=True, exist_ok=True)
+            window.grab().save(str(args.screenshot_path))
+
+    QTimer.singleShot(300, run_startup_actions)
+    if args.quit_after_ms is not None:
+        QTimer.singleShot(args.quit_after_ms, app.quit)
 
     return app.exec()
 
