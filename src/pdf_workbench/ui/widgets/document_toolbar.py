@@ -4,14 +4,14 @@ import math
 from dataclasses import dataclass
 
 from PySide6.QtCore import QEvent, QObject, QRect, QSignalBlocker, Qt, Signal
-from PySide6.QtGui import QIcon, QPainter, QPaintEvent
+from PySide6.QtGui import QIcon, QPainter, QPaintEvent, QResizeEvent
 from PySide6.QtWidgets import (
     QComboBox,
-    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QPushButton,
+    QSizePolicy,
     QSpinBox,
     QStyle,
     QStyleOptionComboBox,
@@ -79,17 +79,18 @@ class DocumentToolbar(QWidget):
         super().__init__(parent)
         self.setObjectName("documentToolbar")
         self.setAccessibleName("Document toolbar")
+        self._compact_mode = False
 
-        root = QHBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(10)
+        self._root = QHBoxLayout(self)
+        self._root.setContentsMargins(0, 0, 0, 0)
+        self._root.setSpacing(10)
 
         self.open_button = QPushButton("開く", self)
         self.open_button.setObjectName("openPdfButton")
         self.open_button.setAccessibleName("Open PDF")
         self.open_button.setToolTip("PDFを開く")
         self.open_button.clicked.connect(self.open_requested.emit)
-        root.addWidget(self.open_button)
+        self._root.addWidget(self.open_button)
 
         self.search_button = self._icon_button(
             "Search document",
@@ -97,9 +98,9 @@ class DocumentToolbar(QWidget):
             object_name="openSearchButton",
         )
         self.search_button.clicked.connect(self.search_requested.emit)
-        root.addWidget(self.search_button)
+        self._root.addWidget(self.search_button, 0, Qt.AlignmentFlag.AlignVCenter)
 
-        root.addWidget(self._separator())
+        self._root.addWidget(self._separator(), 0, Qt.AlignmentFlag.AlignVCenter)
 
         self.previous_button = self._icon_button(
             "Previous page",
@@ -107,7 +108,7 @@ class DocumentToolbar(QWidget):
             object_name="previousPageButton",
         )
         self.previous_button.clicked.connect(self.previous_requested.emit)
-        root.addWidget(self.previous_button)
+        self._root.addWidget(self.previous_button, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self.page_field = QSpinBox(self)
         self.page_field.setObjectName("pageNumberInput")
@@ -125,13 +126,13 @@ class DocumentToolbar(QWidget):
             page_editor.setObjectName("pageNumberEditor")
             page_editor.setAlignment(Qt.AlignmentFlag.AlignCenter)
             page_editor.setFrame(False)
-        root.addWidget(self.page_field)
+        self._root.addWidget(self.page_field, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self._page_label = QLabel("/ 0", self)
         self._page_label.setObjectName("pageTotalLabel")
         self._page_label.setAccessibleName("Page total")
         self._page_label.setProperty("muted", True)
-        root.addWidget(self._page_label)
+        self._root.addWidget(self._page_label, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self.next_button = self._icon_button(
             "Next page",
@@ -139,9 +140,9 @@ class DocumentToolbar(QWidget):
             object_name="nextPageButton",
         )
         self.next_button.clicked.connect(self.next_requested.emit)
-        root.addWidget(self.next_button)
+        self._root.addWidget(self.next_button, 0, Qt.AlignmentFlag.AlignVCenter)
 
-        root.addWidget(self._separator())
+        self._root.addWidget(self._separator(), 0, Qt.AlignmentFlag.AlignVCenter)
 
         self.zoom_out_button = self._icon_button(
             "Zoom out",
@@ -149,7 +150,7 @@ class DocumentToolbar(QWidget):
             object_name="zoomOutButton",
         )
         self.zoom_out_button.clicked.connect(lambda: self._nudge_zoom(-1 / 6))
-        root.addWidget(self.zoom_out_button)
+        self._root.addWidget(self.zoom_out_button, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self.zoom_field = ChevronComboBox(self)
         self.zoom_field.setObjectName("zoomControl")
@@ -169,7 +170,7 @@ class DocumentToolbar(QWidget):
         line_edit.setFrame(False)
         line_edit.editingFinished.connect(self._commit_zoom_from_editor)
         line_edit.returnPressed.connect(self._commit_zoom_from_editor)
-        root.addWidget(self.zoom_field)
+        self._root.addWidget(self.zoom_field, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self.zoom_in_button = self._icon_button(
             "Zoom in",
@@ -177,9 +178,9 @@ class DocumentToolbar(QWidget):
             object_name="zoomInButton",
         )
         self.zoom_in_button.clicked.connect(lambda: self._nudge_zoom(0.2))
-        root.addWidget(self.zoom_in_button)
+        self._root.addWidget(self.zoom_in_button, 0, Qt.AlignmentFlag.AlignVCenter)
 
-        root.addWidget(self._separator())
+        self._root.addWidget(self._separator(), 0, Qt.AlignmentFlag.AlignVCenter)
 
         self.rotate_button = self._icon_button(
             "Rotate clockwise",
@@ -187,13 +188,14 @@ class DocumentToolbar(QWidget):
             object_name="rotateClockwiseButton",
         )
         self.rotate_button.clicked.connect(self.rotate_requested.emit)
-        root.addWidget(self.rotate_button)
+        self._root.addWidget(self.rotate_button, 0, Qt.AlignmentFlag.AlignVCenter)
 
-        root.addStretch(1)
+        self._root.addStretch(1)
 
         self.setFixedHeight(54)
         self.refresh_theme_assets()
         self.setState(ToolbarState(False, 0, 0, 1.0))
+        self._apply_layout_metrics()
 
     def setState(self, state: ToolbarState) -> None:
         self.open_button.setEnabled(True)
@@ -246,12 +248,47 @@ class DocumentToolbar(QWidget):
         button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
         return button
 
-    def _separator(self) -> QFrame:
-        separator = QFrame(self)
+    def _separator(self) -> QWidget:
+        separator = QWidget(self)
         separator.setObjectName("toolbarSeparator")
-        separator.setFrameShape(QFrame.Shape.VLine)
-        separator.setFrameShadow(QFrame.Shadow.Plain)
+        separator.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        separator.setFixedWidth(1)
+        separator.setFixedHeight(20)
         return separator
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        compact = self.width() <= 800
+        if compact != self._compact_mode:
+            self._compact_mode = compact
+            self._apply_layout_metrics()
+
+    def _apply_layout_metrics(self) -> None:
+        if self._compact_mode:
+            self._root.setSpacing(6)
+            self.open_button.setFixedWidth(108)
+            self.page_field.setFixedWidth(56)
+            self.zoom_field.setFixedWidth(92)
+            icon_extent = 32
+            separator_extent = 18
+        else:
+            self._root.setSpacing(10)
+            self.open_button.setFixedWidth(118)
+            self.page_field.setFixedWidth(58)
+            self.zoom_field.setFixedWidth(94)
+            icon_extent = 34
+            separator_extent = 20
+        for button in (
+            self.search_button,
+            self.previous_button,
+            self.next_button,
+            self.zoom_out_button,
+            self.zoom_in_button,
+            self.rotate_button,
+        ):
+            button.setFixedSize(icon_extent, icon_extent)
+        for separator in self.findChildren(QWidget, "toolbarSeparator"):
+            separator.setFixedHeight(separator_extent)
 
     def _emit_page_requested(self, value: int) -> None:
         if self.page_field.isEnabled():

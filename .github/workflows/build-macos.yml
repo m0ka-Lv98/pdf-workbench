@@ -123,6 +123,111 @@ jobs:
           assert payload["page_input_geometry"][2] > 0
           assert payload["zoom_control_geometry"][2] > 0
           PY
+      - name: Capture UI review screenshots
+        shell: bash
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          set -euo pipefail
+          review_dir="ui-review"
+          mkdir -p "$review_dir"
+
+          capture_ui() {
+            local stem="$1"
+            shift
+            python -m pdf_workbench "$@" \
+              --screenshot-path "$review_dir/$stem.png" \
+              --ui-state-path "$review_dir/$stem.json" \
+              --quit-after-ms 1800
+          }
+
+          capture_ui "light-empty-1100x800" \
+            --window-size 1100x800 \
+            --color-scheme light
+
+          capture_ui "light-document-1100x800" \
+            tests/fixtures/real-search-english.pdf \
+            --window-size 1100x800 \
+            --color-scheme light
+
+          capture_ui "light-search-1100x800" \
+            tests/fixtures/real-search-english.pdf \
+            --window-size 1100x800 \
+            --color-scheme light \
+            --open-search \
+            --search-query Alpha
+
+          capture_ui "dark-document-1100x800" \
+            tests/fixtures/real-search-english.pdf \
+            --window-size 1100x800 \
+            --color-scheme dark
+
+          capture_ui "dark-search-1100x800" \
+            tests/fixtures/real-search-english.pdf \
+            --window-size 1100x800 \
+            --color-scheme dark \
+            --open-search \
+            --search-query Alpha
+
+          capture_ui "light-document-800x600" \
+            tests/fixtures/real-search-english.pdf \
+            --window-size 800x600 \
+            --color-scheme light
+      - name: Verify UI review screenshots
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          from PySide6.QtGui import QImage
+
+          review_dir = Path("ui-review")
+          expected_sizes = {
+              "light-empty-1100x800": [1100, 800],
+              "light-document-1100x800": [1100, 800],
+              "light-search-1100x800": [1100, 800],
+              "dark-document-1100x800": [1100, 800],
+              "dark-search-1100x800": [1100, 800],
+              "light-document-800x600": [800, 600],
+          }
+
+          payloads: dict[str, dict[str, object]] = {}
+          for stem, expected_size in expected_sizes.items():
+              image = QImage(str(review_dir / f"{stem}.png"))
+              assert not image.isNull(), stem
+              assert [image.width(), image.height()] == expected_size, stem
+              payload = json.loads((review_dir / f"{stem}.json").read_text(encoding="utf-8"))
+              payloads[stem] = payload
+              assert payload["requested_window_size"] == expected_size, stem
+              assert payload["actual_window_size"] == expected_size, stem
+
+          compact = payloads["light-document-800x600"]
+          assert compact["window_minimum_size_hint"][0] <= 800
+          assert 56 <= compact["page_input_geometry"][2] <= 64
+          assert 90 <= compact["zoom_control_geometry"][2] <= 104
+          assert compact["main_toolbar_geometry"][2] > 0
+          assert compact["visible_controls"]["rotate"] is True
+
+          for stem in ("light-search-1100x800", "dark-search-1100x800"):
+              payload = payloads[stem]
+              search_surface = payload["search_surface_window_geometry"]
+              first_page = payload["first_page_window_geometry"]
+              assert search_surface[2] > 0 and search_surface[3] > 0
+              assert first_page[2] > 0 and first_page[3] > 0
+              assert first_page[1] >= search_surface[1] + search_surface[3] + 8
+
+          light_search = payloads["light-search-1100x800"]
+          assert light_search["search_query"] == "Alpha"
+          assert light_search["search_counter"] == "1 / 2"
+          assert light_search["status_left_geometry"][2] > 0
+          assert light_search["status_icon_geometry"][2] > 0
+          assert (
+              light_search["status_message_geometry"][0]
+              > light_search["status_icon_geometry"][0] + light_search["status_icon_geometry"][2]
+          )
+          PY
       - name: Package app bundle
         shell: bash
         run: |
@@ -142,4 +247,21 @@ jobs:
             gui-search-light.json
             gui-stdout.log
             gui-stderr.log
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pdf-workbench-ui-review-${{ env.SHORT_SHA }}
+          path: |
+            ui-review/light-empty-1100x800.png
+            ui-review/light-empty-1100x800.json
+            ui-review/light-document-1100x800.png
+            ui-review/light-document-1100x800.json
+            ui-review/light-search-1100x800.png
+            ui-review/light-search-1100x800.json
+            ui-review/dark-document-1100x800.png
+            ui-review/dark-document-1100x800.json
+            ui-review/dark-search-1100x800.png
+            ui-review/dark-search-1100x800.json
+            ui-review/light-document-800x600.png
+            ui-review/light-document-800x600.json
           if-no-files-found: error

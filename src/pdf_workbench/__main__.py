@@ -6,8 +6,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QTimer
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QPoint, QTimer
+from PySide6.QtWidgets import QApplication, QWidget
 
 from pdf_workbench import __version__
 from pdf_workbench.core.app_paths import APP_AUTHOR, APP_NAME
@@ -104,6 +104,7 @@ def main() -> int:
     def capture_outputs() -> None:
         if args.window_size is not None:
             _apply_window_size(window, args.window_size)
+        _flush_layout(window)
         if args.screenshot_path is not None:
             args.screenshot_path.parent.mkdir(parents=True, exist_ok=True)
             window.grab().save(str(args.screenshot_path))
@@ -130,17 +131,29 @@ def _build_ui_state(window: MainWindow, *, requested_window_size: str | None) ->
     active_theme = None if app is None else app.property("colorScheme")
     current_document = window._current_document()
     pdf_canvas_target = None if current_document is None else current_document.view
+    first_page = None
+    if current_document is not None and current_document.view._canvas.pages:
+        first_page = current_document.view._canvas.pages[0]
     return {
         "requested_window_size": _parse_window_size(requested_window_size),
         "actual_window_size": [window.width(), window.height()],
+        "window_minimum_size_hint": [
+            window.minimumSizeHint().width(),
+            window.minimumSizeHint().height(),
+        ],
         "main_toolbar_geometry": _geometry(window._main_toolbar),
         "tab_bar_geometry": _geometry(window._tabs.tabBar()),
         "search_row_geometry": _geometry(window._search_toolbar),
         "search_surface_geometry": _geometry(window._search_surface),
         "status_bar_geometry": _geometry(window.statusBar()),
+        "status_left_geometry": _geometry(window._status_left),
+        "status_icon_geometry": _geometry(window._status_icon),
+        "status_message_geometry": _geometry(window._status_message),
         "page_input_geometry": _geometry(window._toolbar_widget.page_field),
         "zoom_control_geometry": _geometry(window._toolbar_widget.zoom_field),
         "pdf_canvas_geometry": _geometry(pdf_canvas_target),
+        "search_surface_window_geometry": _window_geometry(window, window._search_surface),
+        "first_page_window_geometry": _window_geometry(window, first_page),
         "active_theme": active_theme,
         "search_query": window._search_bar.search_input.text(),
         "search_counter": window._search_bar.counter_label.text(),
@@ -168,6 +181,14 @@ def _geometry(widget: object) -> list[int]:
     return [rect.x(), rect.y(), rect.width(), rect.height()]
 
 
+def _window_geometry(window: MainWindow, widget: QWidget | None) -> list[int]:
+    if widget is None:
+        return [0, 0, 0, 0]
+    top_left = widget.mapTo(window, QPoint(0, 0))
+    geometry = widget.geometry()
+    return [top_left.x(), top_left.y(), geometry.width(), geometry.height()]
+
+
 def _parse_window_size(size: str | None) -> list[int] | None:
     if size is None:
         return None
@@ -182,9 +203,26 @@ def _apply_window_size(window: MainWindow, size: str) -> None:
     if parsed is None:
         raise ValueError("--window-size must use WIDTHxHEIGHT format")
     width, height = parsed
-    window.setMinimumSize(width, height)
-    window.setMaximumSize(width, height)
-    window.resize(width, height)
+    window.setFixedSize(width, height)
+    _flush_layout(window)
+
+
+def _flush_layout(window: MainWindow) -> None:
+    app = QApplication.instance()
+    if app is None:
+        return
+    for _ in range(3):
+        app.processEvents()
+    layout = window.layout()
+    if layout is not None:
+        layout.activate()
+    central_layout = window.centralWidget().layout() if window.centralWidget() is not None else None
+    if central_layout is not None:
+        central_layout.activate()
+    window.updateGeometry()
+    window.repaint()
+    for _ in range(3):
+        app.processEvents()
 
 
 if __name__ == "__main__":

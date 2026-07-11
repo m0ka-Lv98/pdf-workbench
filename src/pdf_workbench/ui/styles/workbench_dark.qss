@@ -61,11 +61,13 @@ QWidget#searchSurface {
   border-radius: 8px;
 }
 
-QFrame#toolbarSeparator {
+QWidget#toolbarSeparator {
   background: #3a3f47;
   min-width: 1px;
   max-width: 1px;
-  margin: 15px 12px;
+  min-height: 18px;
+  max-height: 22px;
+  margin: 0 8px;
 }
 
 QWidget#documentToolbar QPushButton,
@@ -150,23 +152,23 @@ QWidget#searchBar QLineEdit {
   border-radius: 7px;
   background: #292c32;
   color: #f2f4f7;
-  padding: 0 12px;
+  padding: 0 4px;
   font-size: 13px;
 }
 
 QWidget#documentToolbar QSpinBox#pageNumberInput {
   min-width: 56px;
   max-width: 56px;
+  padding: 0 2px;
 }
 
 QWidget#documentToolbar QComboBox#zoomControl {
-  min-width: 90px;
-  max-width: 96px;
-  padding-right: 28px;
+  padding-left: 6px;
+  padding-right: 22px;
 }
 
 QWidget#documentToolbar QComboBox::drop-down {
-  width: 24px;
+  width: 22px;
   border: none;
   background: transparent;
 }
@@ -187,9 +189,27 @@ QWidget#documentToolbar QComboBox QAbstractItemView {
   outline: none;
 }
 
+QWidget#documentToolbar QSpinBox QLineEdit#pageNumberEditor,
+QWidget#documentToolbar QComboBox QLineEdit#zoomControlEditor {
+  background: transparent;
+  border: none;
+  padding: 0;
+  margin: 0;
+}
+
+QWidget#documentToolbar QSpinBox QLineEdit#pageNumberEditor {
+  qproperty-alignment: AlignCenter;
+}
+
+QWidget#documentToolbar QComboBox QLineEdit#zoomControlEditor {
+  qproperty-alignment: AlignCenter;
+}
+
 QWidget#searchBar QLineEdit#searchInput {
   min-width: 320px;
   border-radius: 7px;
+  border-color: transparent;
+  background: #292c32;
 }
 
 QWidget#documentToolbar QComboBox:hover,
@@ -197,6 +217,10 @@ QWidget#documentToolbar QSpinBox:hover,
 QWidget#searchBar QLineEdit:hover,
 QWidget#emptyState QPushButton[variant="recent"]:hover {
   border-color: #535966;
+}
+
+QWidget#searchBar QLineEdit#searchInput:hover {
+  border-color: transparent;
 }
 
 QWidget#documentToolbar QPushButton:focus,
@@ -207,6 +231,10 @@ QWidget#searchBar QLineEdit:focus,
 QWidget#searchBar QToolButton:focus,
 QWidget#emptyState QPushButton:focus {
   border: 1px solid #60a5fa;
+}
+
+QWidget#searchBar QLineEdit#searchInput:focus {
+  border-color: transparent;
 }
 
 QWidget#documentToolbar QLabel,
@@ -240,11 +268,18 @@ QStatusBar#mainStatusBar {
   background: #22252a;
   border-top: 1px solid #3a3f47;
   min-height: 28px;
-  padding: 0 18px;
 }
 
 QStatusBar#mainStatusBar::item {
   border: none;
+}
+
+QWidget#statusLeftContainer {
+  background: transparent;
+}
+
+QWidget#statusRightContainer {
+  background: transparent;
 }
 
 QTabWidget#documentTabs {
@@ -253,15 +288,15 @@ QTabWidget#documentTabs {
 
 QTabWidget#documentTabs::pane {
   border: none;
-  background: transparent;
+  background: #1f2227;
   top: 0;
 }
 
-QTabWidget#documentTabs QTabBar {
+QTabBar#documentTabBar {
   background: #1f2227;
 }
 
-QTabWidget#documentTabs QTabBar::tab {
+QTabBar#documentTabBar::tab {
   min-height: 38px;
   background: transparent;
   color: #a4aab4;
@@ -271,14 +306,14 @@ QTabWidget#documentTabs QTabBar::tab {
   border-bottom: 2px solid transparent;
 }
 
-QTabWidget#documentTabs QTabBar::tab:selected {
-  background: #22252a;
+QTabBar#documentTabBar::tab:selected {
+  background: #292c32;
   color: #f2f4f7;
   border-bottom-color: #60a5fa;
   font-weight: 600;
 }
 
-QTabWidget#documentTabs QTabBar::tab:hover:!selected {
+QTabBar#documentTabBar::tab:hover:!selected {
   color: #f2f4f7;
   background: rgba(242, 244, 247, 0.04);
 }

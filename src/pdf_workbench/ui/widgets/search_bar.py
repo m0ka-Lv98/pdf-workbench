@@ -37,6 +37,7 @@ class SearchBar(QWidget):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
+        layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
         self.search_input = QLineEdit(self)
         self.search_input.setObjectName("searchInput")
@@ -103,6 +104,7 @@ class SearchBar(QWidget):
 
         self.search_input.installEventFilter(self)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setMinimumHeight(36)
         self.refresh_theme_assets()
 
     def set_state(self, state: SearchBarState) -> None:

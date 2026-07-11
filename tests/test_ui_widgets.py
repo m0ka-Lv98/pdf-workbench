@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QWidget
+from PySide6.QtWidgets import QFrame, QWidget
 from pytestqt.qtbot import QtBot
 
 from pdf_workbench.ui.widgets.document_toolbar import DocumentToolbar, ToolbarState, button_has_icon
@@ -42,6 +42,11 @@ def test_document_toolbar_updates_state_and_emits_signals(qtbot: QtBot) -> None:
     assert button_has_icon(toolbar.previous_button)
     assert button_has_icon(toolbar.next_button)
     assert button_has_icon(toolbar.rotate_button)
+    assert 56 <= toolbar.page_field.width() <= 64
+    assert 90 <= toolbar.zoom_field.width() <= 104
+    separators = toolbar.findChildren(QWidget, "toolbarSeparator")
+    assert separators
+    assert all(18 <= separator.height() <= 22 for separator in separators)
 
     page_requests: list[int] = []
     zoom_requests: list[float] = []
@@ -130,6 +135,10 @@ def test_document_toolbar_does_not_use_toolbar_group_frames(qtbot: QtBot) -> Non
     qtbot.addWidget(toolbar)
 
     assert toolbar.findChild(QWidget, "toolbarGroup") is None
+    assert not toolbar.findChildren(type(toolbar), "toolbarGroup")
+    separators = toolbar.findChildren(QWidget, "toolbarSeparator")
+    assert separators
+    assert all(not isinstance(separator, QFrame) for separator in separators)
 
 
 def test_document_toolbar_responsive_layout_keeps_primary_controls_visible(qtbot: QtBot) -> None:
@@ -154,6 +163,8 @@ def test_document_toolbar_responsive_layout_keeps_primary_controls_visible(qtbot
         assert widget.isVisible()
         assert widget.geometry().width() > 0
         assert widget.geometry().height() > 0
+        assert widget.geometry().right() <= toolbar.rect().right()
+    assert toolbar.minimumSizeHint().width() <= 800
 
 
 def test_document_toolbar_page_state_switches_minimum(qtbot: QtBot) -> None:

@@ -74,10 +74,12 @@ class MainWindow(QMainWindow):
         self._toolbar_widget = DocumentToolbar(self)
         self._search_bar = SearchBar(self)
         self._main_toolbar: QWidget | None = None
+        self._main_toolbar_layout: QHBoxLayout | None = None
         self._search_toolbar: QWidget | None = None
         self._search_surface: QWidget | None = None
         self._workspace_overlay_host: QWidget | None = None
         self._empty_state = EmptyState(self)
+        self._search_row_height = 54
 
         self.setObjectName("mainWindow")
         self.setWindowTitle("PDF Workbench")
@@ -92,6 +94,7 @@ class MainWindow(QMainWindow):
         tab_bar.setObjectName("documentTabBar")
         tab_bar.setElideMode(Qt.TextElideMode.ElideMiddle)
         tab_bar.setUsesScrollButtons(True)
+        tab_bar.setDrawBase(False)
         tab_bar.setFixedHeight(40)
         self._tabs.currentChanged.connect(self._on_current_tab_changed)
         self._tabs.tabCloseRequested.connect(self.close_document_at)
@@ -110,15 +113,29 @@ class MainWindow(QMainWindow):
         status_bar.setObjectName("mainStatusBar")
         status_bar.setSizeGripEnabled(False)
         self.setStatusBar(status_bar)
-        self._status_icon = QLabel("", self)
+        self._status_left = QWidget(self)
+        self._status_left.setObjectName("statusLeftContainer")
+        status_left_layout = QHBoxLayout(self._status_left)
+        status_left_layout.setContentsMargins(16, 0, 0, 0)
+        status_left_layout.setSpacing(6)
+        self._status_icon = QLabel("", self._status_left)
         self._status_icon.setObjectName("statusStateIcon")
-        self._status_message = QLabel("準備完了", self)
+        self._status_message = QLabel("準備完了", self._status_left)
         self._status_message.setObjectName("statusMessageLabel")
-        status_bar.addWidget(self._status_icon)
-        status_bar.addWidget(self._status_message, 1)
-        self._status_summary = QLabel("", self)
+        status_left_layout.addWidget(self._status_icon)
+        status_left_layout.addWidget(self._status_message)
+        status_left_layout.addStretch(1)
+        status_bar.addWidget(self._status_left, 1)
+        self._status_right = QWidget(self)
+        self._status_right.setObjectName("statusRightContainer")
+        status_right_layout = QHBoxLayout(self._status_right)
+        status_right_layout.setContentsMargins(0, 0, 16, 0)
+        status_right_layout.setSpacing(0)
+        self._status_summary = QLabel("", self._status_right)
         self._status_summary.setObjectName("statusSummaryLabel")
-        status_bar.addPermanentWidget(self._status_summary)
+        status_right_layout.addStretch(1)
+        status_right_layout.addWidget(self._status_summary)
+        status_bar.addPermanentWidget(self._status_right)
         status_bar.messageChanged.connect(self._on_status_message_changed)
 
         self._empty_state.open_requested.connect(self._choose_document)
@@ -151,6 +168,7 @@ class MainWindow(QMainWindow):
         self.refresh_theme_assets()
         self._update_actions()
         self._update_status()
+        self._apply_search_inset()
 
     def _create_actions(self) -> None:
         self.open_action = QAction("開く", self)
@@ -243,10 +261,10 @@ class MainWindow(QMainWindow):
         toolbar = QWidget(self._central_container)
         toolbar.setObjectName("mainToolbar")
         toolbar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        layout = QHBoxLayout(toolbar)
-        layout.setContentsMargins(20, 0, 20, 0)
-        layout.setSpacing(0)
-        layout.addWidget(self._toolbar_widget)
+        self._main_toolbar_layout = QHBoxLayout(toolbar)
+        self._main_toolbar_layout.setContentsMargins(20, 0, 20, 0)
+        self._main_toolbar_layout.setSpacing(0)
+        self._main_toolbar_layout.addWidget(self._toolbar_widget)
         self._central_layout.addWidget(toolbar)
         self._main_toolbar = toolbar
 
@@ -316,6 +334,7 @@ class MainWindow(QMainWindow):
         self._update_actions()
         self._update_status()
         self._update_overlay_geometry()
+        self._apply_search_inset()
 
     def close_document_at(self, index: int) -> bool:
         if not 0 <= index < len(self._documents):
@@ -349,6 +368,7 @@ class MainWindow(QMainWindow):
         self._update_actions()
         self._update_status()
         self._update_overlay_geometry()
+        self._apply_search_inset()
         return True
 
     def close_current_document(self) -> bool:
@@ -411,6 +431,7 @@ class MainWindow(QMainWindow):
         self._search_bar.focus_search()
         QApplication.processEvents()
         self._update_overlay_geometry()
+        self._apply_search_inset()
         return self._search_ui_is_ready()
 
     def _prompt_search(self) -> None:
@@ -453,6 +474,7 @@ class MainWindow(QMainWindow):
         self._search_bar.cancel_pending_search()
         if self._search_toolbar is not None:
             self._search_toolbar.hide()
+        self._apply_search_inset()
         if document is None:
             return
         document.view.search("")
@@ -566,6 +588,7 @@ class MainWindow(QMainWindow):
             self._search_bar.cancel_pending_search()
             self._search_toolbar.hide()
         self._update_overlay_geometry()
+        self._apply_search_inset()
 
     def _on_current_tab_changed(self, _index: int) -> None:
         document = self._current_document()
@@ -576,6 +599,7 @@ class MainWindow(QMainWindow):
         self._update_actions()
         self._update_status()
         self._update_overlay_geometry()
+        self._apply_search_inset()
 
     def _on_focus_changed(self, _old: QWidget | None, _new: QWidget | None) -> None:
         self._update_actions()
@@ -733,9 +757,7 @@ class MainWindow(QMainWindow):
         self._toolbar_widget.refresh_theme_assets()
         self._search_bar.refresh_theme_assets()
         self._empty_state.refresh_theme_assets()
-        self._status_icon.setPixmap(
-            IconProvider.icon(IconName.STATUS_SUCCESS, tone=IconTone.ACCENT, size=16).pixmap(16, 16)
-        )
+        self._set_status_icon(error=False)
 
     @staticmethod
     def _search_progress_text(state: object) -> str:
@@ -788,7 +810,11 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
+        if self._main_toolbar_layout is not None:
+            horizontal_margin = 12 if self.width() <= 800 else 20
+            self._main_toolbar_layout.setContentsMargins(horizontal_margin, 0, horizontal_margin, 0)
         self._update_overlay_geometry()
+        self._apply_search_inset()
 
     def _update_overlay_geometry(self) -> None:
         if self._search_toolbar is None or self._workspace_overlay_host is None:
@@ -798,13 +824,21 @@ class MainWindow(QMainWindow):
             return
         host = self._workspace_overlay_host
         top_margin = self._tabs.tabBar().height() + 16
-        row_height = 54
-        self._search_toolbar.setGeometry(0, top_margin, host.width(), row_height)
+        self._search_toolbar.setGeometry(0, top_margin, host.width(), self._search_row_height)
         if self._search_surface is not None:
             max_surface_width = min(660, max(420, host.width() - 72))
             self._search_surface.setMaximumWidth(max_surface_width)
             self._search_surface.setFixedHeight(44)
         self._search_toolbar.raise_()
+
+    def _apply_search_inset(self) -> None:
+        document = self._current_document()
+        if document is None:
+            return
+        inset = 24
+        if self._is_search_open():
+            inset += self._search_row_height + 8
+        document.view.set_search_overlay_inset(inset)
 
     def _on_status_message_changed(self, message: str) -> None:
         self._status_message.setText(message or "準備完了")
@@ -813,7 +847,15 @@ class MainWindow(QMainWindow):
         self._status_icon.setProperty("error", error)
         self._status_icon.style().unpolish(self._status_icon)
         self._status_icon.style().polish(self._status_icon)
+        self._set_status_icon(error=error)
         if error:
             self.statusBar().showMessage(message, 5000)
             return
         self.statusBar().showMessage(message or "準備完了")
+
+    def _set_status_icon(self, *, error: bool) -> None:
+        if error:
+            icon = IconProvider.icon(IconName.STATUS_ERROR, tone=IconTone.DEFAULT, size=16)
+        else:
+            icon = IconProvider.icon(IconName.STATUS_SUCCESS, tone=IconTone.SUCCESS, size=16)
+        self._status_icon.setPixmap(icon.pixmap(16, 16))

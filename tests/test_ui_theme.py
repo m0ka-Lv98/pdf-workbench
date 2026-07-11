@@ -47,12 +47,14 @@ def test_load_stylesheet_returns_workbench_theme_styles() -> None:
 
     assert "QWidget#searchSurface" in light
     assert "QWidget#mainToolbar" in light
-    assert "QFrame#toolbarSeparator" in light
+    assert "QWidget#toolbarSeparator" in light
     assert "QWidget#documentToolbar QPushButton#openPdfButton" in light
     assert "QScrollArea#pdfScrollArea" in light
     assert "QMenuBar" in light
-    assert "QTabWidget#documentTabs QTabBar::tab:selected" in light
+    assert "QTabBar#documentTabBar::tab:selected" in light
     assert "QWidget#documentToolbar QComboBox::down-arrow" in light
+    assert "QWidget#statusLeftContainer" in light
+    assert "QWidget#statusRightContainer" in light
     assert "bootstrap_" not in light
     assert "bootstrap_" not in dark
     assert "#2563eb" in light.lower()

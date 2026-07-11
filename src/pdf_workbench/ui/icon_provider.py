@@ -26,12 +26,14 @@ class IconName(StrEnum):
     DOCUMENT = "document"
     HISTORY = "history"
     STATUS_SUCCESS = "status-success"
+    STATUS_ERROR = "status-error"
 
 
 class IconTone(StrEnum):
     DEFAULT = "default"
     MUTED = "muted"
     ACCENT = "accent"
+    SUCCESS = "success"
     INVERSE = "inverse"
 
 
@@ -40,6 +42,7 @@ class _Palette:
     default: str
     muted: str
     accent: str
+    success: str
     inverse: str
     disabled: str
 
@@ -48,6 +51,8 @@ class _Palette:
             return self.muted
         if tone is IconTone.ACCENT:
             return self.accent
+        if tone is IconTone.SUCCESS:
+            return self.success
         if tone is IconTone.INVERSE:
             return self.inverse
         return self.default
@@ -58,6 +63,7 @@ _PALETTES = {
         default="#1F2328",
         muted="#667085",
         accent="#2563EB",
+        success="#22A447",
         inverse="#FFFFFF",
         disabled="#98A2B3",
     ),
@@ -65,6 +71,7 @@ _PALETTES = {
         default="#F2F4F7",
         muted="#A4A7AE",
         accent="#60A5FA",
+        success="#4ADE80",
         inverse="#FFFFFF",
         disabled="#6B7280",
     ),

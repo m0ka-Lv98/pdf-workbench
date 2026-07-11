@@ -315,6 +315,14 @@ class ContinuousPageCanvas(QWidget):
         self._layout.setSpacing(24)
         self._pages: list[PagePlaceholder] = []
 
+    def set_top_inset(self, inset: int) -> None:
+        margins = self._layout.contentsMargins()
+        self._layout.setContentsMargins(margins.left(), inset, margins.right(), margins.bottom())
+        self._layout.activate()
+        self.adjustSize()
+        self.updateGeometry()
+        self.viewport_changed.emit()
+
     @property
     def pages(self) -> list[PagePlaceholder]:
         return self._pages
@@ -402,6 +410,7 @@ class PdfView(QWidget):
         self._text_page_indexes: set[int] = set()
         self._empty_text_page_indexes: set[int] = set()
         self._image_only_page_indexes: set[int] = set()
+        self._search_top_inset = 24
 
         self._content = QWidget(self)
         self._content.setObjectName("pdfContent")
@@ -557,6 +566,15 @@ class PdfView(QWidget):
         self._content.adjustSize()
         self._schedule_visible_page_update()
         self.state_changed.emit()
+
+    def set_search_overlay_inset(self, inset: int) -> None:
+        target = max(24, inset)
+        if target == self._search_top_inset:
+            return
+        self._search_top_inset = target
+        self._canvas.set_top_inset(target)
+        self._content.adjustSize()
+        self._schedule_visible_page_update()
 
     def shutdown(self) -> None:
         if self._closed:
