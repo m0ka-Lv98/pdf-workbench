@@ -3,10 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from PySide6.QtCore import QEvent, QObject, QSignalBlocker, Qt, QTimer, Signal
-from PySide6.QtGui import QKeyEvent
+from PySide6.QtGui import QAction, QKeyEvent
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QLineEdit, QSizePolicy, QToolButton, QWidget
 
-from pdf_workbench.ui.icon_provider import IconName, IconProvider
+from pdf_workbench.ui.icon_provider import IconName, IconProvider, IconTone
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,8 +35,8 @@ class SearchBar(QWidget):
         self._search_timer.timeout.connect(self._emit_debounced_search)
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(8, 6, 8, 6)
-        layout.setSpacing(6)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
 
         self.search_input = QLineEdit(self)
         self.search_input.setObjectName("searchInput")
@@ -49,6 +49,17 @@ class SearchBar(QWidget):
             QSizePolicy.Policy.Fixed,
         )
         self.search_input.textChanged.connect(self._on_text_changed)
+        self._search_icon_action = QAction(self)
+        self._clear_icon_action = QAction(self)
+        self._clear_icon_action.triggered.connect(self._clear_query)
+        self.search_input.addAction(
+            self._search_icon_action,
+            QLineEdit.ActionPosition.LeadingPosition,
+        )
+        self.search_input.addAction(
+            self._clear_icon_action,
+            QLineEdit.ActionPosition.TrailingPosition,
+        )
 
         self.previous_button = QToolButton(self)
         self.previous_button.setObjectName("previousSearchResultButton")
@@ -83,10 +94,10 @@ class SearchBar(QWidget):
         self.close_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
         self.close_button.clicked.connect(self.close_requested.emit)
 
-        layout.addWidget(self.search_input)
+        layout.addWidget(self.search_input, 1)
         layout.addWidget(self.previous_button)
-        layout.addWidget(self.next_button)
         layout.addWidget(self.counter_label)
+        layout.addWidget(self.next_button)
         layout.addWidget(self.progress_label)
         layout.addWidget(self.close_button)
 
@@ -100,6 +111,7 @@ class SearchBar(QWidget):
         del blocker
         self.counter_label.setText(f"{state.current_index} / {state.total_count}")
         self.progress_label.setText(state.progress_text)
+        self.progress_label.setVisible(bool(state.progress_text))
 
     def focus_search(self) -> None:
         self.show()
@@ -107,6 +119,12 @@ class SearchBar(QWidget):
         self.search_input.setFocus(Qt.FocusReason.ShortcutFocusReason)
 
     def refresh_theme_assets(self) -> None:
+        self._search_icon_action.setIcon(
+            IconProvider.icon(IconName.SEARCH, tone=IconTone.MUTED, size=16)
+        )
+        self._clear_icon_action.setIcon(
+            IconProvider.icon(IconName.CLOSE, tone=IconTone.MUTED, size=14)
+        )
         self.previous_button.setIcon(IconProvider.icon(IconName.CHEVRON_LEFT, size=16))
         self.next_button.setIcon(IconProvider.icon(IconName.CHEVRON_RIGHT, size=16))
         self.close_button.setIcon(IconProvider.icon(IconName.CLOSE, size=16))
@@ -123,6 +141,11 @@ class SearchBar(QWidget):
 
     def _emit_debounced_search(self) -> None:
         self.submit_current_query()
+
+    def _clear_query(self) -> None:
+        self.cancel_pending_search()
+        self.search_input.clear()
+        self.search_requested.emit("")
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         if watched is self.search_input and event.type() == QEvent.Type.KeyPress:

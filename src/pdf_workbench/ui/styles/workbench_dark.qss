@@ -1,5 +1,5 @@
 QMainWindow#mainWindow {
-  background: #1e1f22;
+  background: #1b1d21;
   color: #f2f4f7;
 }
 
@@ -16,13 +16,13 @@ QWidget#pdfContent {
 }
 
 QMenuBar {
-  background: #1e1f22;
-  border-bottom: 1px solid #3a3c42;
+  background: #1b1d21;
+  border-bottom: 1px solid #3a3f47;
 }
 
 QMenuBar::item {
   padding: 6px 8px;
-  margin: 2px 2px;
+  margin: 2px;
   border-radius: 4px;
 }
 
@@ -32,8 +32,8 @@ QMenu::item:selected {
 }
 
 QMenu {
-  background: #27282c;
-  border: 1px solid #3a3c42;
+  background: #22252a;
+  border: 1px solid #3a3f47;
   padding: 6px;
 }
 
@@ -42,12 +42,9 @@ QMenu::item {
   border-radius: 4px;
 }
 
-QToolBar#mainToolbar {
-  background: #1e1f22;
-  border: none;
-  border-bottom: 1px solid #3a3c42;
-  padding: 0 10px;
-  spacing: 0;
+QWidget#mainToolbar {
+  background: #22252a;
+  border-bottom: 1px solid #3a3f47;
 }
 
 QWidget#documentToolbar {
@@ -55,46 +52,58 @@ QWidget#documentToolbar {
 }
 
 QWidget#searchToolbar {
-  background: #1e1f22;
-  border-bottom: 1px solid #3a3c42;
+  background: transparent;
 }
 
 QWidget#searchSurface {
-  background: #27282c;
-  border: 1px solid #3a3c42;
-  border-radius: 10px;
+  background: rgba(34, 37, 42, 0.94);
+  border: 1px solid #3a3f47;
+  border-radius: 8px;
 }
 
 QFrame#toolbarSeparator {
-  background: #3a3c42;
+  background: #3a3f47;
   min-width: 1px;
   max-width: 1px;
-  margin: 10px 10px;
+  margin: 15px 12px;
 }
 
 QWidget#documentToolbar QPushButton,
 QWidget#documentToolbar QToolButton,
 QWidget#searchBar QToolButton,
 QWidget#emptyState QPushButton {
-  min-height: 30px;
+  min-height: 34px;
   border: 1px solid transparent;
   border-radius: 7px;
   background: transparent;
   color: #f2f4f7;
   padding: 0 10px;
+  font-size: 13px;
 }
 
 QWidget#documentToolbar QPushButton#openPdfButton {
-  min-height: 34px;
-  padding: 0 14px;
+  min-height: 36px;
+  min-width: 118px;
+  max-width: 128px;
+  padding: 0 16px;
   background: #2563eb;
   color: #ffffff;
+  font-weight: 600;
+}
+
+QWidget#documentToolbar QToolButton#zoomOutButton,
+QWidget#documentToolbar QToolButton#zoomInButton {
+  min-width: 34px;
+  max-width: 34px;
+  border: 1px solid #3a3f47;
+  border-radius: 17px;
+  background: #292c32;
 }
 
 QWidget#documentToolbar QToolButton,
 QWidget#searchBar QToolButton {
-  min-width: 30px;
-  max-width: 30px;
+  min-width: 32px;
+  max-width: 32px;
   padding: 0;
 }
 
@@ -105,7 +114,8 @@ QWidget#emptyState QPushButton:hover {
   background: #30343b;
 }
 
-QWidget#documentToolbar QPushButton#openPdfButton:hover {
+QWidget#documentToolbar QPushButton#openPdfButton:hover,
+QWidget#emptyState QPushButton[variant="primary"]:hover {
   background: #1d4ed8;
 }
 
@@ -113,10 +123,11 @@ QWidget#documentToolbar QPushButton:pressed,
 QWidget#documentToolbar QToolButton:pressed,
 QWidget#searchBar QToolButton:pressed,
 QWidget#emptyState QPushButton:pressed {
-  background: #3a3f48;
+  background: #393e46;
 }
 
-QWidget#documentToolbar QPushButton#openPdfButton:pressed {
+QWidget#documentToolbar QPushButton#openPdfButton:pressed,
+QWidget#emptyState QPushButton[variant="primary"]:pressed {
   background: #1e40af;
 }
 
@@ -127,43 +138,65 @@ QWidget#documentToolbar QSpinBox:disabled,
 QWidget#searchBar QLineEdit:disabled,
 QWidget#searchBar QToolButton:disabled,
 QWidget#emptyState QPushButton:disabled {
-  color: #6b7280;
+  color: #7a828f;
   background: transparent;
-}
-
-QWidget#documentToolbar QToolButton:checked,
-QWidget#searchBar QToolButton:checked {
-  background: #253247;
 }
 
 QWidget#documentToolbar QComboBox,
 QWidget#documentToolbar QSpinBox,
 QWidget#searchBar QLineEdit {
-  min-height: 30px;
-  border: 1px solid #3a3c42;
+  min-height: 34px;
+  border: 1px solid #3a3f47;
   border-radius: 7px;
-  background: #27282c;
+  background: #292c32;
   color: #f2f4f7;
-  padding: 0 10px;
+  padding: 0 12px;
+  font-size: 13px;
 }
 
 QWidget#documentToolbar QSpinBox#pageNumberInput {
-  min-width: 58px;
-  max-width: 58px;
+  min-width: 56px;
+  max-width: 56px;
 }
 
 QWidget#documentToolbar QComboBox#zoomControl {
-  min-width: 84px;
+  min-width: 90px;
+  max-width: 96px;
+  padding-right: 28px;
+}
+
+QWidget#documentToolbar QComboBox::drop-down {
+  width: 24px;
+  border: none;
+  background: transparent;
+}
+
+QWidget#documentToolbar QComboBox::down-arrow {
+  image: none;
+  width: 0;
+  height: 0;
+}
+
+QWidget#documentToolbar QComboBox QAbstractItemView {
+  background: #292c32;
+  color: #f2f4f7;
+  border: 1px solid #3a3f47;
+  selection-background-color: #30343b;
+  selection-color: #f2f4f7;
+  padding: 4px;
+  outline: none;
 }
 
 QWidget#searchBar QLineEdit#searchInput {
-  min-width: 260px;
+  min-width: 320px;
+  border-radius: 7px;
 }
 
 QWidget#documentToolbar QComboBox:hover,
 QWidget#documentToolbar QSpinBox:hover,
-QWidget#searchBar QLineEdit:hover {
-  border-color: #667085;
+QWidget#searchBar QLineEdit:hover,
+QWidget#emptyState QPushButton[variant="recent"]:hover {
+  border-color: #535966;
 }
 
 QWidget#documentToolbar QPushButton:focus,
@@ -186,10 +219,11 @@ QStatusBar#mainStatusBar QLabel {
 QLabel#pageTotalLabel,
 QLabel#searchProgressLabel,
 QLabel#statusSummaryLabel,
+QLabel#statusMessageLabel,
 QLabel#emptyStateSubtitle,
 QLabel#emptyStateRecentHint,
 QLabel#emptyStateRecentMessage {
-  color: #a4a7ae;
+  color: #a4aab4;
 }
 
 QLabel#searchResultCounter {
@@ -197,31 +231,48 @@ QLabel#searchResultCounter {
   font-weight: 600;
 }
 
+QLabel#statusStateIcon[error="true"],
+QLabel#searchProgressLabel[error="true"] {
+  color: #ffb4ab;
+}
+
 QStatusBar#mainStatusBar {
-  border-top: 1px solid #3a3c42;
-  min-height: 24px;
+  background: #22252a;
+  border-top: 1px solid #3a3f47;
+  min-height: 28px;
+  padding: 0 18px;
 }
 
 QStatusBar#mainStatusBar::item {
   border: none;
 }
 
+QTabWidget#documentTabs {
+  background: #1f2227;
+}
+
 QTabWidget#documentTabs::pane {
   border: none;
   background: transparent;
+  top: 0;
+}
+
+QTabWidget#documentTabs QTabBar {
+  background: #1f2227;
 }
 
 QTabWidget#documentTabs QTabBar::tab {
-  min-height: 34px;
+  min-height: 38px;
   background: transparent;
-  color: #a4a7ae;
-  padding: 0 12px;
-  margin: 0 2px;
+  color: #a4aab4;
+  padding: 0 14px;
+  margin: 0;
   border: none;
   border-bottom: 2px solid transparent;
 }
 
 QTabWidget#documentTabs QTabBar::tab:selected {
+  background: #22252a;
   color: #f2f4f7;
   border-bottom-color: #60a5fa;
   font-weight: 600;
@@ -243,50 +294,39 @@ QWidget#emptyState QLabel#emptyStateTitle {
 }
 
 QWidget#emptyState QLabel#emptyStateIcon {
-  color: #a4a7ae;
+  color: #a4aab4;
 }
 
 QWidget#emptyState QPushButton[variant="primary"] {
   background: #2563eb;
   color: #ffffff;
   padding: 0 18px;
-}
-
-QWidget#emptyState QPushButton[variant="primary"]:hover {
-  background: #1d4ed8;
+  font-weight: 600;
 }
 
 QWidget#emptyState QPushButton[variant="recent"] {
   text-align: left;
   padding: 0 12px;
-  border: 1px solid #3a3c42;
-  background: #27282c;
+  border: 1px solid #3a3f47;
+  background: #292c32;
 }
 
-QWidget#emptyState QPushButton[variant="recent"]:hover {
-  background: #30343b;
-  border-color: #667085;
-}
-
-QScrollArea#pdfScrollArea {
-  border: none;
-  background: #141518;
-}
-
+QScrollArea#pdfScrollArea,
 QWidget#pdfCanvas {
-  background: #141518;
+  border: none;
+  background: #15171b;
 }
 
 QFrame#pageCard {
-  background: #27282c;
-  border: 1px solid #3a3c42;
+  background: #ffffff;
+  border: 1px solid #3a3f47;
   border-radius: 2px;
 }
 
 QFrame#pageCard[renderState="not_requested"],
 QFrame#pageCard[renderState="queued"],
 QFrame#pageCard[renderState="rendering"] {
-  color: #a4a7ae;
+  color: #a4aab4;
 }
 
 QFrame#pageCard[renderState="error"] {

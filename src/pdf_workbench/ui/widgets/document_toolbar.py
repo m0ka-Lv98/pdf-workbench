@@ -3,8 +3,8 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from PySide6.QtCore import QSignalBlocker, Qt, Signal
-from PySide6.QtGui import QIcon
+from PySide6.QtCore import QEvent, QObject, QRect, QSignalBlocker, Qt, Signal
+from PySide6.QtGui import QIcon, QPainter, QPaintEvent
 from PySide6.QtWidgets import (
     QComboBox,
     QFrame,
@@ -13,6 +13,8 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPushButton,
     QSpinBox,
+    QStyle,
+    QStyleOptionComboBox,
     QToolButton,
     QWidget,
 )
@@ -26,6 +28,42 @@ class ToolbarState:
     page_index: int
     page_count: int
     zoom_factor: float
+
+
+class ChevronComboBox(QComboBox):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._chevron_icon = IconProvider.icon(IconName.CHEVRON_DOWN, tone=IconTone.MUTED, size=14)
+        self.installEventFilter(self)
+
+    def refresh_theme_assets(self) -> None:
+        self._chevron_icon = IconProvider.icon(IconName.CHEVRON_DOWN, tone=IconTone.MUTED, size=14)
+        self.update()
+
+    def paintEvent(self, event: QPaintEvent) -> None:
+        super().paintEvent(event)
+        painter = QPainter(self)
+        option = QStyleOptionComboBox()
+        self.initStyleOption(option)
+        arrow_rect = self.style().subControlRect(
+            QStyle.ComplexControl.CC_ComboBox,
+            option,
+            QStyle.SubControl.SC_ComboBoxArrow,
+            self,
+        )
+        target = QRect(
+            arrow_rect.center().x() - 7,
+            arrow_rect.center().y() - 7,
+            14,
+            14,
+        )
+        self._chevron_icon.paint(painter, target)
+        painter.end()
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if watched is self and event.type() == QEvent.Type.EnabledChange:
+            self.update()
+        return super().eventFilter(watched, event)
 
 
 class DocumentToolbar(QWidget):
@@ -44,7 +82,7 @@ class DocumentToolbar(QWidget):
 
         root = QHBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
+        root.setSpacing(10)
 
         self.open_button = QPushButton("開く", self)
         self.open_button.setObjectName("openPdfButton")
@@ -79,7 +117,8 @@ class DocumentToolbar(QWidget):
         self.page_field.setMaximum(0)
         self.page_field.setSpecialValueText("—")
         self.page_field.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
-        self.page_field.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self.page_field.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.page_field.setFixedWidth(58)
         self.page_field.valueChanged.connect(self._emit_page_requested)
         page_editor = self.page_field.findChild(QLineEdit)
         if page_editor is not None:
@@ -112,11 +151,12 @@ class DocumentToolbar(QWidget):
         self.zoom_out_button.clicked.connect(lambda: self._nudge_zoom(-1 / 6))
         root.addWidget(self.zoom_out_button)
 
-        self.zoom_field = QComboBox(self)
+        self.zoom_field = ChevronComboBox(self)
         self.zoom_field.setObjectName("zoomControl")
         self.zoom_field.setAccessibleName("Zoom control")
         self.zoom_field.setToolTip("ズーム倍率")
         self.zoom_field.setEditable(True)
+        self.zoom_field.setFixedWidth(94)
         self.zoom_field.addItems(["50%", "75%", "100%", "125%", "150%", "200%", "300%", "400%"])
         self.zoom_field.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self.zoom_field.setCurrentText("100%")
@@ -139,6 +179,8 @@ class DocumentToolbar(QWidget):
         self.zoom_in_button.clicked.connect(lambda: self._nudge_zoom(0.2))
         root.addWidget(self.zoom_in_button)
 
+        root.addWidget(self._separator())
+
         self.rotate_button = self._icon_button(
             "Rotate clockwise",
             "時計回りに回転",
@@ -149,7 +191,7 @@ class DocumentToolbar(QWidget):
 
         root.addStretch(1)
 
-        self.setFixedHeight(50)
+        self.setFixedHeight(54)
         self.refresh_theme_assets()
         self.setState(ToolbarState(False, 0, 0, 1.0))
 
@@ -187,6 +229,7 @@ class DocumentToolbar(QWidget):
         self.zoom_out_button.setIcon(IconProvider.icon(IconName.ZOOM_OUT, size=18))
         self.zoom_in_button.setIcon(IconProvider.icon(IconName.ZOOM_IN, size=18))
         self.rotate_button.setIcon(IconProvider.icon(IconName.ROTATE_CLOCKWISE, size=18))
+        self.zoom_field.refresh_theme_assets()
 
     def _icon_button(
         self,

@@ -7,8 +7,16 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QMimeData, QObject, QSettings, QSize, Qt
-from PySide6.QtGui import QAction, QCloseEvent, QDragEnterEvent, QDropEvent, QKeyEvent, QKeySequence
+from PySide6.QtCore import QEvent, QMimeData, QObject, QSettings, Qt
+from PySide6.QtGui import (
+    QAction,
+    QCloseEvent,
+    QDragEnterEvent,
+    QDropEvent,
+    QKeyEvent,
+    QKeySequence,
+    QResizeEvent,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -21,7 +29,6 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QStatusBar,
     QTabWidget,
-    QToolBar,
     QVBoxLayout,
     QWidget,
 )
@@ -29,6 +36,7 @@ from PySide6.QtWidgets import (
 from pdf_workbench.core.settings import configure_qsettings
 from pdf_workbench.domain.document_session import DocumentSession
 from pdf_workbench.services.pdf_renderer import PdfRenderService
+from pdf_workbench.ui.icon_provider import IconName, IconProvider, IconTone
 from pdf_workbench.ui.pdf_view import PdfView
 from pdf_workbench.ui.widgets.document_toolbar import DocumentToolbar, ToolbarState
 from pdf_workbench.ui.widgets.empty_state import EmptyState
@@ -65,9 +73,10 @@ class MainWindow(QMainWindow):
         self._build_sha = os.environ.get("PDF_WORKBENCH_BUILD_SHA", "").strip()
         self._toolbar_widget = DocumentToolbar(self)
         self._search_bar = SearchBar(self)
-        self._main_toolbar: QToolBar | None = None
+        self._main_toolbar: QWidget | None = None
         self._search_toolbar: QWidget | None = None
         self._search_surface: QWidget | None = None
+        self._workspace_overlay_host: QWidget | None = None
         self._empty_state = EmptyState(self)
 
         self.setObjectName("mainWindow")
@@ -80,14 +89,17 @@ class MainWindow(QMainWindow):
         self._tabs.setDocumentMode(True)
         self._tabs.setTabsClosable(True)
         tab_bar = self._tabs.tabBar()
+        tab_bar.setObjectName("documentTabBar")
         tab_bar.setElideMode(Qt.TextElideMode.ElideMiddle)
         tab_bar.setUsesScrollButtons(True)
+        tab_bar.setFixedHeight(40)
         self._tabs.currentChanged.connect(self._on_current_tab_changed)
         self._tabs.tabCloseRequested.connect(self.close_document_at)
         self._stack = QStackedWidget(self)
         self._stack.setObjectName("mainStack")
         self._stack.addWidget(self._empty_state)
         self._stack.addWidget(self._tabs)
+        self._stack.currentChanged.connect(lambda _index: self._update_overlay_geometry())
         self._central_container = QWidget(self)
         self._central_container.setObjectName("centralContainer")
         self._central_layout = QVBoxLayout(self._central_container)
@@ -96,10 +108,18 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self._central_container)
         status_bar = QStatusBar(self)
         status_bar.setObjectName("mainStatusBar")
+        status_bar.setSizeGripEnabled(False)
         self.setStatusBar(status_bar)
+        self._status_icon = QLabel("", self)
+        self._status_icon.setObjectName("statusStateIcon")
+        self._status_message = QLabel("準備完了", self)
+        self._status_message.setObjectName("statusMessageLabel")
+        status_bar.addWidget(self._status_icon)
+        status_bar.addWidget(self._status_message, 1)
         self._status_summary = QLabel("", self)
         self._status_summary.setObjectName("statusSummaryLabel")
         status_bar.addPermanentWidget(self._status_summary)
+        status_bar.messageChanged.connect(self._on_status_message_changed)
 
         self._empty_state.open_requested.connect(self._choose_document)
         self._empty_state.recent_file_requested.connect(self.open_document)
@@ -220,36 +240,36 @@ class MainWindow(QMainWindow):
         edit_menu.addAction(self.copy_action)
 
     def _create_toolbar(self) -> None:
-        toolbar = QToolBar("メイン", self)
+        toolbar = QWidget(self._central_container)
         toolbar.setObjectName("mainToolbar")
-        toolbar.setMovable(False)
-        toolbar.setFloatable(False)
-        toolbar.setIconSize(QSize(18, 18))
-        toolbar.setAllowedAreas(Qt.ToolBarArea.TopToolBarArea)
-        self.addToolBar(toolbar)
-        toolbar.addWidget(self._toolbar_widget)
+        toolbar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        layout = QHBoxLayout(toolbar)
+        layout.setContentsMargins(20, 0, 20, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self._toolbar_widget)
+        self._central_layout.addWidget(toolbar)
         self._main_toolbar = toolbar
 
     def _create_search_bar(self) -> None:
-        self._search_toolbar = QWidget(self._central_container)
+        self._workspace_overlay_host = self._stack
+        self._search_toolbar = QWidget(self._workspace_overlay_host)
         self._search_toolbar.setObjectName("searchToolbar")
         self._search_toolbar.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Fixed,
         )
         layout = QHBoxLayout(self._search_toolbar)
-        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setContentsMargins(24, 16, 24, 0)
         layout.setSpacing(0)
         layout.addStretch(1)
         self._search_surface = QWidget(self._search_toolbar)
         self._search_surface.setObjectName("searchSurface")
-        self._search_surface.setMaximumWidth(620)
+        self._search_surface.setMaximumWidth(660)
         surface_layout = QHBoxLayout(self._search_surface)
-        surface_layout.setContentsMargins(6, 6, 6, 6)
+        surface_layout.setContentsMargins(8, 6, 8, 6)
         surface_layout.setSpacing(0)
         surface_layout.addWidget(self._search_bar)
         layout.addWidget(self._search_surface)
-        self._central_layout.addWidget(self._search_toolbar)
         self._central_layout.addWidget(self._stack, 1)
         self._search_toolbar.hide()
         self._search_toolbar.updateGeometry()
@@ -265,10 +285,7 @@ class MainWindow(QMainWindow):
         if existing_index is not None:
             self._tabs.setCurrentIndex(existing_index)
             self._remember_recent_file(normalized_path)
-            self.statusBar().showMessage(
-                f"{normalized_path.name} はすでに開いています",
-                5000,
-            )
+            self._set_status_message(f"{normalized_path.name} はすでに開いています")
             return
 
         try:
@@ -284,16 +301,21 @@ class MainWindow(QMainWindow):
         view.state_changed.connect(self._update_status)
         view.search_state_changed.connect(lambda: self._on_view_search_state_changed(view))
         view.selection_changed.connect(self._update_actions)
-        view.error_occurred.connect(lambda message: self.statusBar().showMessage(message, 5000))
+        view.error_occurred.connect(lambda message: self._set_status_message(message, error=True))
         document = DocumentTab(session=session, view=view)
         self._documents.append(document)
-        tab_index = self._tabs.addTab(view, self._tab_title(document))
+        tab_index = self._tabs.addTab(
+            view,
+            IconProvider.icon(IconName.DOCUMENT, tone=IconTone.MUTED, size=16),
+            self._tab_title(document),
+        )
         self._tabs.setCurrentIndex(tab_index)
         self._stack.setCurrentWidget(self._tabs)
         self._remember_recent_file(session.source_path)
         self._update_window_title()
         self._update_actions()
         self._update_status()
+        self._update_overlay_geometry()
 
     def close_document_at(self, index: int) -> bool:
         if not 0 <= index < len(self._documents):
@@ -320,10 +342,13 @@ class MainWindow(QMainWindow):
             widget.deleteLater()
         if not self._documents:
             self._stack.setCurrentWidget(self._empty_state)
+            if self._search_toolbar is not None:
+                self._search_toolbar.hide()
 
         self._update_window_title()
         self._update_actions()
         self._update_status()
+        self._update_overlay_geometry()
         return True
 
     def close_current_document(self) -> bool:
@@ -375,42 +400,17 @@ class MainWindow(QMainWindow):
         self.activateWindow()
         self.raise_()
         if self._search_toolbar is not None:
-            search_bar_height = max(
-                self._search_bar.sizeHint().height(),
-                self._search_bar.minimumSizeHint().height(),
-            )
-            self._search_toolbar.setMinimumHeight(search_bar_height + 12)
-            self._search_toolbar.setMinimumWidth(self._central_container.width())
-            self._search_toolbar.resize(
-                self._central_container.width(),
-                self._search_toolbar.sizeHint().height(),
-            )
             self._search_toolbar.show()
             self._search_toolbar.raise_()
         if self._search_surface is not None:
-            self._search_surface.setMinimumWidth(min(420, max(320, self.width() - 180)))
-            self._search_surface.setMaximumWidth(max(420, min(640, self.width() - 32)))
+            self._search_surface.setMinimumWidth(min(420, max(320, self.width() - 240)))
+            self._search_surface.setMaximumWidth(max(540, min(660, self.width() - 64)))
         self._search_bar.show()
-        self._search_bar.setMinimumHeight(
-            max(
-                self._search_bar.sizeHint().height(),
-                self._search_bar.minimumSizeHint().height(),
-            )
-        )
         self._search_bar.cancel_pending_search()
         self._search_bar.set_state(self._search_state_for(document))
         self._search_bar.focus_search()
-        if self._search_toolbar is not None:
-            toolbar_layout = self._search_toolbar.layout()
-            if toolbar_layout is not None:
-                toolbar_layout.activate()
-            self._search_toolbar.updateGeometry()
-            self._central_layout.activate()
-        if self._search_surface is not None:
-            self._search_surface.adjustSize()
-        self._search_bar.adjustSize()
-        self._search_bar.search_input.adjustSize()
         QApplication.processEvents()
+        self._update_overlay_geometry()
         return self._search_ui_is_ready()
 
     def _prompt_search(self) -> None:
@@ -421,14 +421,14 @@ class MainWindow(QMainWindow):
         if document is None:
             return
         if not document.view.next_match():
-            self.statusBar().showMessage("検索結果がありません", 5000)
+            self._set_status_message("検索結果がありません")
 
     def _previous_match(self) -> None:
         document = self._current_document()
         if document is None:
             return
         if not document.view.previous_match():
-            self.statusBar().showMessage("検索結果がありません", 5000)
+            self._set_status_message("検索結果がありません")
 
     def _copy_selection(self) -> None:
         focus_widget = QApplication.focusWidget()
@@ -439,7 +439,7 @@ class MainWindow(QMainWindow):
         if document is None:
             return
         if not document.view.copy_selected_text():
-            self.statusBar().showMessage("コピーするテキストが選択されていません", 5000)
+            self._set_status_message("コピーするテキストが選択されていません")
 
     def _search_text_changed(self, query: str) -> None:
         document = self._current_document()
@@ -479,14 +479,14 @@ class MainWindow(QMainWindow):
     def _update_status(self) -> None:
         document = self._current_document()
         if document is None:
-            self.statusBar().showMessage("準備完了")
+            self._set_status_message("")
             self._status_summary.setText("")
             self._toolbar_widget.setState(ToolbarState(False, 0, 0, 1.0))
             return
         page_count = document.view.page_count
         current_page = 0 if page_count == 0 else document.view.page_index + 1
         self._status_summary.setText(
-            f"{current_page} / {page_count} pages  ·  {document.session.zoom_factor:.0%}"
+            f"{current_page} / {page_count} ページ  •  {document.session.zoom_factor:.0%}"
         )
         self._sync_toolbar(document)
 
@@ -497,7 +497,7 @@ class MainWindow(QMainWindow):
                 return
         shutdown_succeeded = self._render_service.shutdown()
         if not shutdown_succeeded:
-            self.statusBar().showMessage("PDFレンダラーの終了を待ち切れませんでした", 5000)
+            self._set_status_message("PDFレンダラーの終了を待ち切れませんでした", error=True)
             event.ignore()
             return
         self._save_window_state()
@@ -565,6 +565,7 @@ class MainWindow(QMainWindow):
         if not has_document and self._search_toolbar is not None:
             self._search_bar.cancel_pending_search()
             self._search_toolbar.hide()
+        self._update_overlay_geometry()
 
     def _on_current_tab_changed(self, _index: int) -> None:
         document = self._current_document()
@@ -574,6 +575,7 @@ class MainWindow(QMainWindow):
         self._update_window_title()
         self._update_actions()
         self._update_status()
+        self._update_overlay_geometry()
 
     def _on_focus_changed(self, _old: QWidget | None, _new: QWidget | None) -> None:
         self._update_actions()
@@ -723,12 +725,17 @@ class MainWindow(QMainWindow):
             or self._search_bar.search_input.geometry().height() <= 0
         ):
             return False
-        return self._search_toolbar.geometry().height() >= self._search_bar.geometry().height()
+        if self._search_surface is None:
+            return False
+        return self._search_surface.geometry().height() >= self._search_bar.geometry().height()
 
     def refresh_theme_assets(self) -> None:
         self._toolbar_widget.refresh_theme_assets()
         self._search_bar.refresh_theme_assets()
         self._empty_state.refresh_theme_assets()
+        self._status_icon.setPixmap(
+            IconProvider.icon(IconName.STATUS_SUCCESS, tone=IconTone.ACCENT, size=16).pixmap(16, 16)
+        )
 
     @staticmethod
     def _search_progress_text(state: object) -> str:
@@ -750,21 +757,16 @@ class MainWindow(QMainWindow):
                 text += f"\uff08{state.failed_pages}ページ失敗\uff09"
             return text
         if state.total_count == 0 and state.query:
-            text = "検索結果 0 件"
+            text = "0件"
             if state.failed_pages:
                 text += f"\uff08{state.failed_pages}ページ失敗\uff09"
             return text
         if state.failed_pages:
             return f"索引完了\uff08{state.failed_pages}ページ失敗\uff09"
-        if state.query:
-            return f"検索結果 {state.total_count} 件"
-        text = "索引完了"
-        if state.failed_pages:
-            text += f"\uff08{state.failed_pages}ページ失敗\uff09"
-        return text
+        return ""
 
     def _report_error(self, title: str, message: str) -> None:
-        self.statusBar().showMessage(message, 5000)
+        self._set_status_message(message, error=True)
         QMessageBox.critical(self, title, message)
 
     @staticmethod
@@ -783,3 +785,35 @@ class MainWindow(QMainWindow):
             if path.suffix.lower() == ".pdf":
                 paths.append(path)
         return paths
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._update_overlay_geometry()
+
+    def _update_overlay_geometry(self) -> None:
+        if self._search_toolbar is None or self._workspace_overlay_host is None:
+            return
+        if self._stack.currentWidget() is not self._tabs:
+            self._search_toolbar.hide()
+            return
+        host = self._workspace_overlay_host
+        top_margin = self._tabs.tabBar().height() + 16
+        row_height = 54
+        self._search_toolbar.setGeometry(0, top_margin, host.width(), row_height)
+        if self._search_surface is not None:
+            max_surface_width = min(660, max(420, host.width() - 72))
+            self._search_surface.setMaximumWidth(max_surface_width)
+            self._search_surface.setFixedHeight(44)
+        self._search_toolbar.raise_()
+
+    def _on_status_message_changed(self, message: str) -> None:
+        self._status_message.setText(message or "準備完了")
+
+    def _set_status_message(self, message: str, *, error: bool = False) -> None:
+        self._status_icon.setProperty("error", error)
+        self._status_icon.style().unpolish(self._status_icon)
+        self._status_icon.style().polish(self._status_icon)
+        if error:
+            self.statusBar().showMessage(message, 5000)
+            return
+        self.statusBar().showMessage(message or "準備完了")

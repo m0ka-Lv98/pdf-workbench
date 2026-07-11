@@ -18,12 +18,14 @@ class IconName(StrEnum):
     SEARCH = "search"
     CHEVRON_LEFT = "chevron-left"
     CHEVRON_RIGHT = "chevron-right"
+    CHEVRON_DOWN = "chevron-down"
     ZOOM_OUT = "zoom-out"
     ZOOM_IN = "zoom-in"
     ROTATE_CLOCKWISE = "rotate-clockwise"
     CLOSE = "close"
     DOCUMENT = "document"
     HISTORY = "history"
+    STATUS_SUCCESS = "status-success"
 
 
 class IconTone(StrEnum):

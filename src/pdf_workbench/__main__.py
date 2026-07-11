@@ -82,16 +82,15 @@ def main() -> int:
         apply_application_theme(app, ColorScheme(args.color_scheme))
         window.refresh_theme_assets()
     if args.window_size is not None:
-        width_text, separator, height_text = args.window_size.partition("x")
-        if separator != "x":
-            raise ValueError("--window-size must use WIDTHxHEIGHT format")
-        window.resize(int(width_text), int(height_text))
+        _apply_window_size(window, args.window_size)
     window.show()
 
     if args.pdf is not None:
         window.open_document(args.pdf)
 
     def run_startup_actions() -> None:
+        if args.window_size is not None:
+            _apply_window_size(window, args.window_size)
         if (
             (args.open_search or args.search_query is not None)
             and window.open_search_bar()
@@ -103,13 +102,19 @@ def main() -> int:
             QTimer.singleShot(350, capture_outputs)
 
     def capture_outputs() -> None:
+        if args.window_size is not None:
+            _apply_window_size(window, args.window_size)
         if args.screenshot_path is not None:
             args.screenshot_path.parent.mkdir(parents=True, exist_ok=True)
             window.grab().save(str(args.screenshot_path))
         if args.ui_state_path is not None:
             args.ui_state_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = _build_ui_state(
+                window,
+                requested_window_size=args.window_size,
+            )
             args.ui_state_path.write_text(
-                json.dumps(_build_ui_state(window), ensure_ascii=True, indent=2) + "\n",
+                json.dumps(payload, ensure_ascii=True, indent=2) + "\n",
                 encoding="utf-8",
             )
 
@@ -120,18 +125,25 @@ def main() -> int:
     return app.exec()
 
 
-def _build_ui_state(window: MainWindow) -> dict[str, Any]:
+def _build_ui_state(window: MainWindow, *, requested_window_size: str | None) -> dict[str, Any]:
     app = QApplication.instance()
     active_theme = None if app is None else app.property("colorScheme")
+    current_document = window._current_document()
+    pdf_canvas_target = None if current_document is None else current_document.view
     return {
-        "window_size": [window.width(), window.height()],
-        "toolbar_geometry": _geometry(window._main_toolbar),
+        "requested_window_size": _parse_window_size(requested_window_size),
+        "actual_window_size": [window.width(), window.height()],
+        "main_toolbar_geometry": _geometry(window._main_toolbar),
         "tab_bar_geometry": _geometry(window._tabs.tabBar()),
+        "search_row_geometry": _geometry(window._search_toolbar),
         "search_surface_geometry": _geometry(window._search_surface),
-        "page_field_geometry": _geometry(window._toolbar_widget.page_field),
-        "zoom_field_geometry": _geometry(window._toolbar_widget.zoom_field),
+        "status_bar_geometry": _geometry(window.statusBar()),
+        "page_input_geometry": _geometry(window._toolbar_widget.page_field),
+        "zoom_control_geometry": _geometry(window._toolbar_widget.zoom_field),
+        "pdf_canvas_geometry": _geometry(pdf_canvas_target),
         "active_theme": active_theme,
-        "search_counter_text": window._search_bar.counter_label.text(),
+        "search_query": window._search_bar.search_input.text(),
+        "search_counter": window._search_bar.counter_label.text(),
         "search_progress_text": window._search_bar.progress_label.text(),
         "visible_controls": {
             "open": window._toolbar_widget.open_button.isVisible(),
@@ -154,6 +166,25 @@ def _geometry(widget: object) -> list[int]:
         return [0, 0, 0, 0]
     rect = geometry()
     return [rect.x(), rect.y(), rect.width(), rect.height()]
+
+
+def _parse_window_size(size: str | None) -> list[int] | None:
+    if size is None:
+        return None
+    width_text, separator, height_text = size.partition("x")
+    if separator != "x":
+        return None
+    return [int(width_text), int(height_text)]
+
+
+def _apply_window_size(window: MainWindow, size: str) -> None:
+    parsed = _parse_window_size(size)
+    if parsed is None:
+        raise ValueError("--window-size must use WIDTHxHEIGHT format")
+    width, height = parsed
+    window.setMinimumSize(width, height)
+    window.setMaximumSize(width, height)
+    window.resize(width, height)
 
 
 if __name__ == "__main__":
