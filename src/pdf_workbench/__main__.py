@@ -6,8 +6,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtTest import QTest
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication, QWidget
 
 from pdf_workbench import __version__
@@ -80,7 +79,9 @@ class StartupSearchSmokeController:
         self._ui_state_path = ui_state_path
         self._phase = "wait-document"
         self._completed = False
-        self._query_entered = False
+        self._final_payload: dict[str, Any] | None = None
+        self._exit_code = 1
+        self._close_started = False
 
         self._poll_timer = QTimer(window)
         self._poll_timer.setInterval(50)
@@ -90,6 +91,15 @@ class StartupSearchSmokeController:
         self._timeout_timer.setSingleShot(True)
         self._timeout_timer.setInterval(timeout_ms)
         self._timeout_timer.timeout.connect(self._on_timeout)
+
+        self._close_timer = QTimer(window)
+        self._close_timer.setInterval(50)
+        self._close_timer.timeout.connect(self._poll_window_close)
+
+        self._close_timeout_timer = QTimer(window)
+        self._close_timeout_timer.setSingleShot(True)
+        self._close_timeout_timer.setInterval(3000)
+        self._close_timeout_timer.timeout.connect(self._on_close_timeout)
 
     def start(self) -> None:
         self._poll_timer.start()
@@ -105,10 +115,7 @@ class StartupSearchSmokeController:
         if self._phase == "wait-document":
             self._window.activateWindow()
             self._window.raise_()
-            QTest.mouseClick(
-                self._window._toolbar_widget.search_button,
-                Qt.MouseButton.LeftButton,
-            )
+            self._window._toolbar_widget.search_button.click()
             self._phase = "wait-search-ui"
             return
 
@@ -118,29 +125,13 @@ class StartupSearchSmokeController:
             self._app.processEvents()
             if not self._search_widgets_ready():
                 return
-            if not self._window._search_bar.search_input.hasFocus():
-                QTest.mouseClick(
-                    self._window._search_bar.search_input,
-                    Qt.MouseButton.LeftButton,
-                )
-                self._app.processEvents()
-                return
-            if not self._query_entered:
-                self._window._search_bar.search_input.clear()
-                QTest.keyClicks(self._window._search_bar.search_input, self._query)
-                self._query_entered = True
-                self._app.processEvents()
-                return
+            self._window._search_bar.search_input.setText(self._query)
+            self._window._search_bar.submit_current_query()
+            self._app.processEvents()
             self._phase = "wait-results"
             return
 
         if self._phase == "wait-results":
-            if not self._window._search_bar.search_input.hasFocus():
-                QTest.mouseClick(
-                    self._window._search_bar.search_input,
-                    Qt.MouseButton.LeftButton,
-                )
-            self._app.processEvents()
             state = document.view.search_state
             if not self._diagnostic_conditions_met(state):
                 return
@@ -153,11 +144,14 @@ class StartupSearchSmokeController:
         if document is None:
             return False
         search_input = self._window._search_bar.search_input
+        search_toolbar = self._window._search_toolbar
+        if search_toolbar is None:
+            return False
         if not self._search_widgets_ready():
             return False
         if search_input.text() != self._query:
             return False
-        if not search_input.hasFocus():
+        if not search_input.isEnabled():
             return False
         view_state = document.view.search_state
         if view_state.query != self._query:
@@ -165,6 +159,13 @@ class StartupSearchSmokeController:
         if view_state.total_count != self._expected_count:
             return False
         if view_state.current_index != 1:
+            return False
+        if search_toolbar.geometry().height() < self._window._search_bar.geometry().height():
+            return False
+        if (
+            self._window._search_bar.geometry().height()
+            < self._window._search_bar.search_input.geometry().height()
+        ):
             return False
         return self._window._search_bar.counter_label.text() == f"1 / {self._expected_count}"
 
@@ -176,6 +177,8 @@ class StartupSearchSmokeController:
         if not self._window._search_bar.isVisible():
             return False
         if not self._window._search_bar.search_input.isVisible():
+            return False
+        if not self._window._search_bar.search_input.isEnabled():
             return False
         if self._window._search_toolbar.geometry().width() <= 0:
             return False
@@ -203,16 +206,11 @@ class StartupSearchSmokeController:
             return
 
         payload = self._build_state_payload()
-        if self._ui_state_path is not None:
-            self._write_ui_state(payload)
         if self._screenshot_path is not None and not self._capture_screenshot():
             self._fail("Failed to capture startup search screenshot.")
             return
 
-        self._completed = True
-        self._poll_timer.stop()
-        self._timeout_timer.stop()
-        self._app.exit(0)
+        self._begin_shutdown(payload, exit_code=0)
 
     def _build_state_payload(self) -> dict[str, Any]:
         document = self._window._current_document()
@@ -222,13 +220,17 @@ class StartupSearchSmokeController:
             and self._window._search_toolbar.isVisible(),
             "search_bar_visible": self._window._search_bar.isVisible(),
             "search_input_visible": self._window._search_bar.search_input.isVisible(),
+            "search_input_enabled": self._window._search_bar.search_input.isEnabled(),
             "search_input_focused": self._window._search_bar.search_input.hasFocus(),
             "search_toolbar_geometry": self._geometry_payload(self._window._search_toolbar),
             "search_bar_geometry": self._geometry_payload(self._window._search_bar),
             "search_input_geometry": self._geometry_payload(self._window._search_bar.search_input),
+            "input_text": self._window._search_bar.search_input.text(),
             "query": "" if state is None else state.query,
             "current_index": 0 if state is None else state.current_index,
             "total_count": 0 if state is None else state.total_count,
+            "counter_text": self._window._search_bar.counter_label.text(),
+            "clean_shutdown": False,
         }
 
     @staticmethod
@@ -255,19 +257,55 @@ class StartupSearchSmokeController:
 
     def _on_timeout(self) -> None:
         payload = self._build_state_payload()
-        if self._ui_state_path is not None:
-            self._write_ui_state(payload)
         self._fail(
             "Timed out waiting for packaged search UI readiness: "
-            + json.dumps(payload, ensure_ascii=True)
+            + json.dumps(payload, ensure_ascii=True),
+            payload=payload,
         )
 
-    def _fail(self, message: str) -> None:
+    def _fail(self, message: str, *, payload: dict[str, Any] | None = None) -> None:
+        if self._completed:
+            return
+        self._final_payload = payload if payload is not None else self._build_state_payload()
+        print(message, file=sys.stderr)
+        self._begin_shutdown(self._final_payload, exit_code=1)
+
+    def _begin_shutdown(self, payload: dict[str, Any], *, exit_code: int) -> None:
+        if self._completed:
+            return
         self._completed = True
+        self._final_payload = payload
+        self._exit_code = exit_code
         self._poll_timer.stop()
         self._timeout_timer.stop()
-        print(message, file=sys.stderr)
-        self._app.exit(1)
+        self._close_timeout_timer.start()
+        self._close_started = True
+        self._window.close()
+        if not self._window.isVisible():
+            self._complete_shutdown(clean_shutdown=True)
+            return
+        self._close_timer.start()
+
+    def _poll_window_close(self) -> None:
+        if not self._close_started:
+            return
+        if self._window.isVisible():
+            return
+        self._complete_shutdown(clean_shutdown=True)
+
+    def _on_close_timeout(self) -> None:
+        self._complete_shutdown(clean_shutdown=not self._window.isVisible())
+
+    def _complete_shutdown(self, *, clean_shutdown: bool) -> None:
+        self._close_timer.stop()
+        self._close_timeout_timer.stop()
+        payload = (
+            self._final_payload if self._final_payload is not None else self._build_state_payload()
+        )
+        payload["clean_shutdown"] = clean_shutdown
+        if self._ui_state_path is not None:
+            self._write_ui_state(payload)
+        self._app.exit(0 if clean_shutdown and self._exit_code == 0 else self._exit_code)
 
 
 def main() -> int:
@@ -311,7 +349,7 @@ def main() -> int:
             def apply_query() -> None:
                 if window.open_search_bar():
                     window._search_bar.search_input.setText(args.search_query or "")
-                    window._search_bar._emit_debounced_search()
+                    window._search_bar.submit_current_query()
 
             QTimer.singleShot(300, apply_query)
         if args.screenshot_path is not None:

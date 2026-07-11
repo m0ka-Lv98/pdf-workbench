@@ -103,11 +103,15 @@ class SearchBar(QWidget):
     def cancel_pending_search(self) -> None:
         self._search_timer.stop()
 
+    def submit_current_query(self) -> None:
+        self._search_timer.stop()
+        self.search_requested.emit(self.search_input.text())
+
     def _on_text_changed(self, _text: str) -> None:
         self._search_timer.start()
 
     def _emit_debounced_search(self) -> None:
-        self.search_requested.emit(self.search_input.text())
+        self.submit_current_query()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         if watched is self.search_input and event.type() == QEvent.Type.KeyPress:

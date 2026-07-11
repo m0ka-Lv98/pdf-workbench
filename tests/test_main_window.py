@@ -58,8 +58,17 @@ def assert_search_ui_ready(window: MainWindow) -> None:
     assert window._search_bar.geometry().height() > 0
     assert window._search_bar.search_input.geometry().width() > 0
     assert window._search_bar.search_input.geometry().height() > 0
+    assert window._search_toolbar.geometry().height() >= window._search_bar.geometry().height()
+    assert (
+        window._search_bar.geometry().height()
+        >= window._search_bar.search_input.geometry().height()
+    )
     if window._main_toolbar is not None:
-        assert window._search_toolbar.geometry().top() >= window._main_toolbar.geometry().bottom()
+        search_top = window._search_toolbar.mapTo(
+            window,
+            window._search_toolbar.rect().topLeft(),
+        ).y()
+        assert search_top >= window._main_toolbar.geometry().bottom()
 
 
 class DelayedTextBackend(PdfiumDocumentBackend):

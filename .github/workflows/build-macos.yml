@@ -205,10 +205,13 @@ jobs:
           assert payload["search_toolbar_visible"] is True
           assert payload["search_bar_visible"] is True
           assert payload["search_input_visible"] is True
-          assert payload["search_input_focused"] is True
+          assert payload["search_input_enabled"] is True
+          assert payload["input_text"] == "Alpha"
           assert payload["query"] == "Alpha"
           assert payload["current_index"] == 1
           assert payload["total_count"] == 2
+          assert payload["counter_text"] == "1 / 2"
+          assert payload["clean_shutdown"] is True
 
           for key in (
               "search_toolbar_geometry",
@@ -219,7 +222,17 @@ jobs:
               assert isinstance(geometry, list) and len(geometry) == 4
               assert geometry[2] > 0
               assert geometry[3] > 0
+
+          toolbar_height = payload["search_toolbar_geometry"][3]
+          search_bar_height = payload["search_bar_geometry"][3]
+          search_input_height = payload["search_input_geometry"][3]
+          assert toolbar_height >= search_bar_height
+          assert search_bar_height >= search_input_height
           PY
+          if grep -q "QThread: Destroyed while thread" gui-stderr.log gui-app.log; then
+            echo "Detected thread shutdown warning in smoke test logs."
+            exit 1
+          fi
           test "$app_exit_code" -eq 0
       - name: Verify codesign
         shell: bash
