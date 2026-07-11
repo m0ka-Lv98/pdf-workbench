@@ -6,7 +6,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QWidget
 
 from pdf_workbench import __version__
@@ -79,6 +80,7 @@ class StartupSearchSmokeController:
         self._ui_state_path = ui_state_path
         self._phase = "wait-document"
         self._completed = False
+        self._query_entered = False
 
         self._poll_timer = QTimer(window)
         self._poll_timer.setInterval(50)
@@ -103,25 +105,41 @@ class StartupSearchSmokeController:
         if self._phase == "wait-document":
             self._window.activateWindow()
             self._window.raise_()
-            self._window._toolbar_widget.search_button.click()
+            QTest.mouseClick(
+                self._window._toolbar_widget.search_button,
+                Qt.MouseButton.LeftButton,
+            )
             self._phase = "wait-search-ui"
             return
 
         if self._phase == "wait-search-ui":
             self._window.activateWindow()
             self._window.raise_()
-            self._window._search_bar.focus_search()
             self._app.processEvents()
-            if not self._window._search_ui_is_ready():
+            if not self._search_widgets_ready():
                 return
-            self._window._search_bar.search_input.setText(self._query)
-            self._window._search_bar.focus_search()
-            self._window._search_bar._emit_debounced_search()
+            if not self._window._search_bar.search_input.hasFocus():
+                QTest.mouseClick(
+                    self._window._search_bar.search_input,
+                    Qt.MouseButton.LeftButton,
+                )
+                self._app.processEvents()
+                return
+            if not self._query_entered:
+                self._window._search_bar.search_input.clear()
+                QTest.keyClicks(self._window._search_bar.search_input, self._query)
+                self._query_entered = True
+                self._app.processEvents()
+                return
             self._phase = "wait-results"
             return
 
         if self._phase == "wait-results":
-            self._window._search_bar.focus_search()
+            if not self._window._search_bar.search_input.hasFocus():
+                QTest.mouseClick(
+                    self._window._search_bar.search_input,
+                    Qt.MouseButton.LeftButton,
+                )
             self._app.processEvents()
             state = document.view.search_state
             if not self._diagnostic_conditions_met(state):
@@ -135,7 +153,7 @@ class StartupSearchSmokeController:
         if document is None:
             return False
         search_input = self._window._search_bar.search_input
-        if not self._window._search_ui_is_ready():
+        if not self._search_widgets_ready():
             return False
         if search_input.text() != self._query:
             return False
@@ -149,6 +167,27 @@ class StartupSearchSmokeController:
         if view_state.current_index != 1:
             return False
         return self._window._search_bar.counter_label.text() == f"1 / {self._expected_count}"
+
+    def _search_widgets_ready(self) -> bool:
+        if self._window._search_toolbar is None:
+            return False
+        if not self._window._search_toolbar.isVisible():
+            return False
+        if not self._window._search_bar.isVisible():
+            return False
+        if not self._window._search_bar.search_input.isVisible():
+            return False
+        if self._window._search_toolbar.geometry().width() <= 0:
+            return False
+        if self._window._search_toolbar.geometry().height() <= 0:
+            return False
+        if self._window._search_bar.geometry().width() <= 0:
+            return False
+        if self._window._search_bar.geometry().height() <= 0:
+            return False
+        if self._window._search_bar.search_input.geometry().width() <= 0:
+            return False
+        return self._window._search_bar.search_input.geometry().height() > 0
 
     def _finalize(self) -> None:
         if self._completed:
