@@ -4,16 +4,20 @@ import math
 from dataclasses import dataclass
 
 from PySide6.QtCore import QSignalBlocker, Qt, Signal
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
+    QPushButton,
     QSpinBox,
-    QStyle,
     QToolButton,
     QWidget,
 )
+
+from pdf_workbench.ui.icon_provider import IconName, IconProvider, IconTone
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,58 +41,35 @@ class DocumentToolbar(QWidget):
         super().__init__(parent)
         self.setObjectName("documentToolbar")
         self.setAccessibleName("Document toolbar")
-        root = QHBoxLayout(self)
-        root.setContentsMargins(8, 6, 8, 6)
-        root.setSpacing(8)
 
-        self.open_button = self._button(
-            "PDFを開く",
-            QStyle.StandardPixmap.SP_DialogOpenButton,
-            role="primary",
-            object_name="openPdfButton",
-            tooltip="PDFを開く",
-        )
-        self.search_button = self._button(
-            "検索",
-            QStyle.StandardPixmap.SP_FileDialogContentsView,
+        root = QHBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        self.open_button = QPushButton("開く", self)
+        self.open_button.setObjectName("openPdfButton")
+        self.open_button.setAccessibleName("Open PDF")
+        self.open_button.setToolTip("PDFを開く")
+        self.open_button.clicked.connect(self.open_requested.emit)
+        root.addWidget(self.open_button)
+
+        self.search_button = self._icon_button(
+            "Search document",
+            "検索 (⌘F / Ctrl+F)",
             object_name="openSearchButton",
-            tooltip="検索 (⌘F / Ctrl+F)",
         )
-        self.previous_button = self._button(
-            "前へ",
-            QStyle.StandardPixmap.SP_ArrowLeft,
+        self.search_button.clicked.connect(self.search_requested.emit)
+        root.addWidget(self.search_button)
+
+        root.addWidget(self._separator())
+
+        self.previous_button = self._icon_button(
+            "Previous page",
+            "前のページ",
             object_name="previousPageButton",
-            tooltip="前のページ",
-            short_text="←",
         )
-        self.next_button = self._button(
-            "次へ",
-            QStyle.StandardPixmap.SP_ArrowRight,
-            object_name="nextPageButton",
-            tooltip="次のページ",
-            short_text="→",
-        )
-        self.rotate_button = self._button(
-            "回転",
-            QStyle.StandardPixmap.SP_BrowserReload,
-            object_name="rotateClockwiseButton",
-            tooltip="時計回りに回転",
-            short_text="↻",
-        )
-        self.zoom_out_button = self._button(
-            "縮小",
-            None,
-            object_name="zoomOutButton",
-            tooltip="ズームを縮小",
-            short_text="−",  # noqa: RUF001
-        )
-        self.zoom_in_button = self._button(
-            "拡大",
-            None,
-            object_name="zoomInButton",
-            tooltip="ズームを拡大",
-            short_text="+",
-        )
+        self.previous_button.clicked.connect(self.previous_requested.emit)
+        root.addWidget(self.previous_button)
 
         self.page_field = QSpinBox(self)
         self.page_field.setObjectName("pageNumberInput")
@@ -97,13 +78,39 @@ class DocumentToolbar(QWidget):
         self.page_field.setMinimum(0)
         self.page_field.setMaximum(0)
         self.page_field.setSpecialValueText("—")
+        self.page_field.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
         self.page_field.setAlignment(Qt.AlignmentFlag.AlignRight)
         self.page_field.valueChanged.connect(self._emit_page_requested)
+        page_editor = self.page_field.findChild(QLineEdit)
+        if page_editor is not None:
+            page_editor.setObjectName("pageNumberEditor")
+            page_editor.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            page_editor.setFrame(False)
+        root.addWidget(self.page_field)
 
         self._page_label = QLabel("/ 0", self)
         self._page_label.setObjectName("pageTotalLabel")
         self._page_label.setAccessibleName("Page total")
         self._page_label.setProperty("muted", True)
+        root.addWidget(self._page_label)
+
+        self.next_button = self._icon_button(
+            "Next page",
+            "次のページ",
+            object_name="nextPageButton",
+        )
+        self.next_button.clicked.connect(self.next_requested.emit)
+        root.addWidget(self.next_button)
+
+        root.addWidget(self._separator())
+
+        self.zoom_out_button = self._icon_button(
+            "Zoom out",
+            "ズームを縮小",
+            object_name="zoomOutButton",
+        )
+        self.zoom_out_button.clicked.connect(lambda: self._nudge_zoom(-1 / 6))
+        root.addWidget(self.zoom_out_button)
 
         self.zoom_field = QComboBox(self)
         self.zoom_field.setObjectName("zoomControl")
@@ -118,39 +125,32 @@ class DocumentToolbar(QWidget):
         line_edit = self.zoom_field.lineEdit()
         if line_edit is None:
             raise RuntimeError("editable combo box is missing its line edit")
+        line_edit.setObjectName("zoomControlEditor")
+        line_edit.setFrame(False)
         line_edit.editingFinished.connect(self._commit_zoom_from_editor)
         line_edit.returnPressed.connect(self._commit_zoom_from_editor)
+        root.addWidget(self.zoom_field)
 
-        self._group(root, self.open_button, self.search_button)
-        self._group(root, self.previous_button, self.page_field, self._page_label, self.next_button)
-        self._group(
-            root,
-            self.zoom_out_button,
-            self.zoom_field,
-            self.zoom_in_button,
-            self.rotate_button,
+        self.zoom_in_button = self._icon_button(
+            "Zoom in",
+            "ズームを拡大",
+            object_name="zoomInButton",
         )
-
-        self.open_button.clicked.connect(self.open_requested.emit)
-        self.search_button.clicked.connect(self.search_requested.emit)
-        self.previous_button.clicked.connect(self.previous_requested.emit)
-        self.next_button.clicked.connect(self.next_requested.emit)
-        self.rotate_button.clicked.connect(self.rotate_requested.emit)
-        self.zoom_out_button.clicked.connect(lambda: self._nudge_zoom(-1 / 6))
         self.zoom_in_button.clicked.connect(lambda: self._nudge_zoom(0.2))
+        root.addWidget(self.zoom_in_button)
 
-        for button in (
-            self.open_button,
-            self.search_button,
-            self.previous_button,
-            self.next_button,
-            self.rotate_button,
-            self.zoom_out_button,
-            self.zoom_in_button,
-        ):
-            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.rotate_button = self._icon_button(
+            "Rotate clockwise",
+            "時計回りに回転",
+            object_name="rotateClockwiseButton",
+        )
+        self.rotate_button.clicked.connect(self.rotate_requested.emit)
+        root.addWidget(self.rotate_button)
 
-        self.setFixedHeight(48)
+        root.addStretch(1)
+
+        self.setFixedHeight(50)
+        self.refresh_theme_assets()
         self.setState(ToolbarState(False, 0, 0, 1.0))
 
     def setState(self, state: ToolbarState) -> None:
@@ -166,47 +166,49 @@ class DocumentToolbar(QWidget):
 
         with QSignalBlocker(self.page_field):
             if state.has_document:
+                self.page_field.setSpecialValueText("")
                 self.page_field.setMinimum(1)
                 self.page_field.setMaximum(max(1, state.page_count))
                 self.page_field.setValue(max(1, state.page_index + 1))
             else:
+                self.page_field.setSpecialValueText("—")
                 self.page_field.setMinimum(0)
                 self.page_field.setMaximum(0)
                 self.page_field.setValue(0)
         self._page_label.setText(f"/ {state.page_count}")
-
         display_text = f"{round(state.zoom_factor * 100)}%"
         self._set_zoom_text(display_text, remember=True)
 
-    def _button(
+    def refresh_theme_assets(self) -> None:
+        self.open_button.setIcon(IconProvider.icon(IconName.OPEN, tone=IconTone.INVERSE, size=18))
+        self.search_button.setIcon(IconProvider.icon(IconName.SEARCH, size=18))
+        self.previous_button.setIcon(IconProvider.icon(IconName.CHEVRON_LEFT, size=18))
+        self.next_button.setIcon(IconProvider.icon(IconName.CHEVRON_RIGHT, size=18))
+        self.zoom_out_button.setIcon(IconProvider.icon(IconName.ZOOM_OUT, size=18))
+        self.zoom_in_button.setIcon(IconProvider.icon(IconName.ZOOM_IN, size=18))
+        self.rotate_button.setIcon(IconProvider.icon(IconName.ROTATE_CLOCKWISE, size=18))
+
+    def _icon_button(
         self,
-        text: str,
-        icon: QStyle.StandardPixmap | None,
+        accessible_name: str,
+        tooltip: str,
         *,
         object_name: str,
-        tooltip: str,
-        short_text: str | None = None,
-        role: str = "outline",
     ) -> QToolButton:
         button = QToolButton(self)
         button.setObjectName(object_name)
-        button.setAccessibleName(text)
+        button.setAccessibleName(accessible_name)
         button.setToolTip(tooltip)
-        button.setText(short_text or text)
-        if icon is not None:
-            button.setIcon(self.style().standardIcon(icon))
-        button.setProperty("buttonRole", role)
+        button.setAutoRaise(True)
+        button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
         return button
 
-    def _group(self, layout: QHBoxLayout, *widgets: QWidget) -> None:
-        frame = QFrame(self)
-        frame.setObjectName("toolbarGroup")
-        group_layout = QHBoxLayout(frame)
-        group_layout.setContentsMargins(4, 0, 4, 0)
-        group_layout.setSpacing(6)
-        for widget in widgets:
-            group_layout.addWidget(widget)
-        layout.addWidget(frame)
+    def _separator(self) -> QFrame:
+        separator = QFrame(self)
+        separator.setObjectName("toolbarSeparator")
+        separator.setFrameShape(QFrame.Shape.VLine)
+        separator.setFrameShadow(QFrame.Shadow.Plain)
+        return separator
 
     def _emit_page_requested(self, value: int) -> None:
         if self.page_field.isEnabled():
@@ -262,3 +264,8 @@ class DocumentToolbar(QWidget):
     @staticmethod
     def _format_zoom(value: float) -> str:
         return f"{round(value * 100)}%"
+
+
+def button_has_icon(button: QPushButton | QToolButton) -> bool:
+    icon: QIcon = button.icon()
+    return not icon.isNull()
