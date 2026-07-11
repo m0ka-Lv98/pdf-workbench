@@ -8,6 +8,7 @@ from PySide6.QtWidgets import QApplication
 
 from pdf_workbench.services.page_coordinates import PageMetadata
 from pdf_workbench.services.pdf_renderer import DocumentMetadata, DocumentRevision
+from pdf_workbench.ui.icon_provider import IconName, IconProvider, is_icon_valid
 from pdf_workbench.ui.pdf_view import PagePlaceholder, PdfView
 from pdf_workbench.ui.theme import (
     ColorScheme,
@@ -40,28 +41,32 @@ class _ThemeRenderService(QObject):
         return True
 
 
-def test_load_stylesheet_returns_bootstrap_like_styles() -> None:
+def test_load_stylesheet_returns_workbench_theme_styles() -> None:
     light = load_stylesheet(ColorScheme.LIGHT)
     dark = load_stylesheet(ColorScheme.DARK)
 
-    assert "QToolButton" in light
-    assert "QToolButton" in dark
-    assert not any(line.startswith("QToolButton {") for line in light.splitlines())
-    assert not any(line.startswith("QPushButton {") for line in light.splitlines())
-    assert not any(line.startswith("QLineEdit {") for line in light.splitlines())
-    assert not any(line.startswith("QComboBox {") for line in light.splitlines())
-    assert not any(line.startswith("QSpinBox {") for line in light.splitlines())
-    assert not any(line.startswith("QLabel {") for line in light.splitlines())
-    assert "QMenu" not in light
-    assert "QTabBar::close-button" not in light
-    assert "QToolButton:focus" in light
+    assert "QWidget#searchSurface" in light
+    assert "QFrame#toolbarSeparator" in light
+    assert "QWidget#documentToolbar QPushButton#openPdfButton" in light
+    assert "QScrollArea#pdfScrollArea" in light
+    assert "QMenuBar" in light
+    assert "QTabWidget#documentTabs QTabBar::tab:selected" in light
+    assert "bootstrap_" not in light
+    assert "bootstrap_" not in dark
+    assert "#2563eb" in light.lower()
+    assert "#60a5fa" in dark.lower()
     assert "QWidget#documentToolbar QComboBox" in light
-    assert "QWidget#documentToolbar QToolButton" in light
     assert "QWidget#emptyState QPushButton" in light
     assert "QWidget#emptyState QLabel#emptyStateTitle" in light
     assert 'QFrame#pageCard[renderState="error"]' in light
-    assert "border-radius: 6px" in light
     assert light != dark
+
+
+def test_svg_icon_resources_are_available() -> None:
+    for name in IconName:
+        svg = IconProvider.load_svg(name)
+        assert "<svg" in svg
+        assert "currentColor" in svg
 
 
 def test_theme_controller_applies_stylesheet_and_tracks_scheme(qtbot) -> None:
@@ -113,3 +118,16 @@ def test_theme_application_does_not_change_geometry(qtbot, tmp_path: Path) -> No
 
     assert before_placeholder == after_placeholder
     assert before_view == after_view
+
+
+def test_icon_provider_returns_valid_icons_for_both_schemes(qtbot) -> None:
+    app = QApplication.instance()
+    assert isinstance(app, QApplication)
+
+    apply_application_theme(app, ColorScheme.LIGHT)
+    light_icon = IconProvider.icon(IconName.SEARCH)
+    apply_application_theme(app, ColorScheme.DARK)
+    dark_icon = IconProvider.icon(IconName.SEARCH)
+
+    assert is_icon_valid(light_icon)
+    assert is_icon_valid(dark_icon)

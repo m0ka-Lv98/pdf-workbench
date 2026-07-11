@@ -4,9 +4,10 @@ from pathlib import Path
 
 import pytest
 from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QWidget
 from pytestqt.qtbot import QtBot
 
-from pdf_workbench.ui.widgets.document_toolbar import DocumentToolbar, ToolbarState
+from pdf_workbench.ui.widgets.document_toolbar import DocumentToolbar, ToolbarState, button_has_icon
 from pdf_workbench.ui.widgets.empty_state import EmptyState
 
 
@@ -27,14 +28,20 @@ def test_document_toolbar_updates_state_and_emits_signals(qtbot: QtBot) -> None:
     assert toolbar.previous_button.isEnabled()
     assert toolbar.next_button.isEnabled()
     assert toolbar.page_field.minimum() == 1
-    assert toolbar.previous_button.text() == "←"
-    assert toolbar.next_button.text() == "→"
-    assert toolbar.zoom_out_button.text() == "−"  # noqa: RUF001
-    assert toolbar.zoom_in_button.text() == "+"
-    assert toolbar.rotate_button.text() == "↻"
+    assert toolbar.previous_button.text() == ""
+    assert toolbar.next_button.text() == ""
+    assert toolbar.zoom_out_button.text() == ""
+    assert toolbar.zoom_in_button.text() == ""
+    assert toolbar.rotate_button.text() == ""
     assert toolbar.previous_button.toolTip() == "前のページ"
     assert toolbar.zoom_out_button.toolTip() == "ズームを縮小"
     assert toolbar.zoom_in_button.toolTip() == "ズームを拡大"
+    assert toolbar.height() == 50
+    assert button_has_icon(toolbar.open_button)
+    assert button_has_icon(toolbar.search_button)
+    assert button_has_icon(toolbar.previous_button)
+    assert button_has_icon(toolbar.next_button)
+    assert button_has_icon(toolbar.rotate_button)
 
     page_requests: list[int] = []
     zoom_requests: list[float] = []
@@ -118,6 +125,37 @@ def test_document_toolbar_zoom_buttons_nudge_by_factor(qtbot: QtBot) -> None:
     assert emitted[1] == pytest.approx(1.0)
 
 
+def test_document_toolbar_does_not_use_toolbar_group_frames(qtbot: QtBot) -> None:
+    toolbar = DocumentToolbar()
+    qtbot.addWidget(toolbar)
+
+    assert toolbar.findChild(QWidget, "toolbarGroup") is None
+
+
+def test_document_toolbar_responsive_layout_keeps_primary_controls_visible(qtbot: QtBot) -> None:
+    toolbar = DocumentToolbar()
+    qtbot.addWidget(toolbar)
+    toolbar.setState(ToolbarState(True, 1, 12, 1.25))
+    toolbar.resize(800, toolbar.height())
+    toolbar.show()
+    qtbot.waitExposed(toolbar)
+
+    for widget in (
+        toolbar.open_button,
+        toolbar.search_button,
+        toolbar.previous_button,
+        toolbar.page_field,
+        toolbar.next_button,
+        toolbar.zoom_out_button,
+        toolbar.zoom_field,
+        toolbar.zoom_in_button,
+        toolbar.rotate_button,
+    ):
+        assert widget.isVisible()
+        assert widget.geometry().width() > 0
+        assert widget.geometry().height() > 0
+
+
 def test_document_toolbar_page_state_switches_minimum(qtbot: QtBot) -> None:
     toolbar = DocumentToolbar()
     qtbot.addWidget(toolbar)
@@ -157,6 +195,7 @@ def test_empty_state_shows_recent_files_and_emits_selection(qtbot: QtBot, tmp_pa
     assert empty_state._recent_message.isVisible() is False
     assert recent_buttons[0].toolTip() == str(files[0])
     assert recent_buttons[0].focusPolicy() == Qt.FocusPolicy.StrongFocus
+    assert not empty_state._icon_label.pixmap().isNull()
 
     requested: list[Path] = []
     empty_state.recent_file_requested.connect(requested.append)

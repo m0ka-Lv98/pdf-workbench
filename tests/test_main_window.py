@@ -47,13 +47,17 @@ def show_window(qtbot: QtBot, window: MainWindow) -> None:
 
 def assert_search_ui_ready(window: MainWindow) -> None:
     assert window._search_toolbar is not None
+    assert window._search_surface is not None
     assert window._search_toolbar.isVisible()
+    assert window._search_surface.isVisible()
     assert window._search_bar.isVisible()
     assert window._search_bar.search_input.isVisible()
     if QApplication.platformName() != "offscreen":
         assert window._search_bar.search_input.hasFocus()
     assert window._search_toolbar.geometry().width() > 0
     assert window._search_toolbar.geometry().height() > 0
+    assert window._search_surface.geometry().width() > 0
+    assert window._search_surface.geometry().height() > 0
     assert window._search_bar.geometry().width() > 0
     assert window._search_bar.geometry().height() > 0
     assert window._search_bar.search_input.geometry().width() > 0
@@ -63,12 +67,16 @@ def assert_search_ui_ready(window: MainWindow) -> None:
         window._search_bar.geometry().height()
         >= window._search_bar.search_input.geometry().height()
     )
+    assert window._search_surface.geometry().height() >= window._search_bar.geometry().height()
     if window._main_toolbar is not None:
         search_top = window._search_toolbar.mapTo(
             window,
             window._search_toolbar.rect().topLeft(),
         ).y()
         assert search_top >= window._main_toolbar.geometry().bottom()
+    toolbar_right = window._search_toolbar.rect().right()
+    surface_right = window._search_surface.geometry().right()
+    assert toolbar_right - surface_right < 32
 
 
 class DelayedTextBackend(PdfiumDocumentBackend):
@@ -133,6 +141,7 @@ def test_main_window_opens_and_closes_multiple_documents(
     assert window._tabs.tabBar().elideMode() == Qt.TextElideMode.ElideMiddle
     assert window._tabs.tabBar().usesScrollButtons() is True
     assert window._tabs.tabsClosable() is True
+    assert 34 <= window._tabs.tabBar().height() <= 40
 
     assert window.close_document_at(1) is True
     assert window._tabs.count() == 1
@@ -306,6 +315,37 @@ def test_main_window_toolbar_search_button_opens_search_ui(
     QTest.mouseClick(window._toolbar_widget.search_button, Qt.MouseButton.LeftButton)
     qtbot.waitUntil(lambda: window._search_ui_is_ready())
     assert_search_ui_ready(window)
+
+
+def test_main_window_responsive_toolbar_keeps_controls_visible_at_800_width(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    window = MainWindow(settings)
+    qtbot.addWidget(window)
+    window.resize(800, 600)
+    show_window(qtbot, window)
+
+    document_path = tmp_path / "responsive.pdf"
+    document_path.touch()
+    window.open_document(document_path)
+
+    for widget in (
+        window._toolbar_widget.open_button,
+        window._toolbar_widget.search_button,
+        window._toolbar_widget.previous_button,
+        window._toolbar_widget.page_field,
+        window._toolbar_widget.next_button,
+        window._toolbar_widget.zoom_out_button,
+        window._toolbar_widget.zoom_field,
+        window._toolbar_widget.zoom_in_button,
+        window._toolbar_widget.rotate_button,
+    ):
+        assert widget.geometry().width() > 0
+        assert widget.geometry().height() > 0
 
 
 def test_main_window_find_action_opens_search_ui(
