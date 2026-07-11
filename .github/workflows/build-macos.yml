@@ -131,27 +131,45 @@ jobs:
 
           rm -f "$stdout_log" "$stderr_log" "$copied_app_log" "$screenshot_path" "$ui_state_path" "$app_log_path"
 
-          PDF_WORKBENCH_BUILD_SHA="$SHORT_SHA" \
-          "$executable" \
-            "$input_pdf" \
-            --open-search \
-            --search-query Alpha \
-            --expected-search-count 2 \
-            --screenshot-path "$screenshot_path" \
-            --ui-state-path "$ui_state_path" \
-            >"$stdout_log" 2>"$stderr_log" &
-          app_pid=$!
-          app_exit_code=0
-          survived=true
+          APP_EXIT_CODE=$(PDF_WORKBENCH_BUILD_SHA="$SHORT_SHA" \
+            python - <<'PY'
+          import os
+          import subprocess
+          import sys
 
-          for second in 1 2 3 4 5 6 7 8 9 10; do
-            if ! kill -0 "$app_pid" 2>/dev/null; then
-              survived=false
-              wait "$app_pid" || app_exit_code=$?
-              break
-            fi
-            sleep 1
-          done
+          command = [
+              "dist/PDF Workbench.app/Contents/MacOS/PDF Workbench",
+              os.path.join(os.getcwd(), "tests/fixtures/real-search-english.pdf"),
+              "--open-search",
+              "--search-query",
+              "Alpha",
+              "--expected-search-count",
+              "2",
+              "--screenshot-path",
+              "gui-search.png",
+              "--ui-state-path",
+              "gui-search-state.json",
+          ]
+          environment = os.environ.copy()
+          with open("gui-stdout.log", "w", encoding="utf-8") as stdout, open(
+              "gui-stderr.log", "w", encoding="utf-8"
+          ) as stderr:
+              try:
+                  completed = subprocess.run(
+                      command,
+                      stdout=stdout,
+                      stderr=stderr,
+                      timeout=20,
+                      check=False,
+                      env=environment,
+                  )
+              except subprocess.TimeoutExpired:
+                  print("124")
+                  raise SystemExit(0)
+          print(str(completed.returncode))
+          PY
+          )
+          app_exit_code="$APP_EXIT_CODE"
 
           echo "App log path: $app_log_path"
           echo "App exit code: $app_exit_code"
@@ -171,22 +189,9 @@ jobs:
             : > "$copied_app_log"
           fi
 
-          if [ "$survived" != "true" ]; then
-            echo "GUI process exited before 10 seconds."
+          if [ "$app_exit_code" = "124" ]; then
+            echo "GUI process timed out before completing startup diagnostics."
             exit 1
-          fi
-
-          for second in 1 2 3 4 5; do
-            if ! kill -0 "$app_pid" 2>/dev/null; then
-              wait "$app_pid" || app_exit_code=$?
-              break
-            fi
-            sleep 1
-          done
-
-          if kill -0 "$app_pid" 2>/dev/null; then
-            kill -TERM "$app_pid"
-            wait "$app_pid" || app_exit_code=$?
           fi
 
           test -f "$screenshot_path"
