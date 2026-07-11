@@ -12,6 +12,7 @@ from PySide6.QtGui import QAction, QCloseEvent, QDragEnterEvent, QDropEvent, QKe
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
+    QHBoxLayout,
     QLineEdit,
     QMainWindow,
     QMessageBox,
@@ -20,6 +21,7 @@ from PySide6.QtWidgets import (
     QStatusBar,
     QTabWidget,
     QToolBar,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -63,7 +65,7 @@ class MainWindow(QMainWindow):
         self._toolbar_widget = DocumentToolbar(self)
         self._search_bar = SearchBar(self)
         self._main_toolbar: QToolBar | None = None
-        self._search_toolbar: QToolBar | None = None
+        self._search_toolbar: QWidget | None = None
         self._empty_state = EmptyState(self)
 
         self.setObjectName("mainWindow")
@@ -84,7 +86,12 @@ class MainWindow(QMainWindow):
         self._stack.setObjectName("mainStack")
         self._stack.addWidget(self._empty_state)
         self._stack.addWidget(self._tabs)
-        self.setCentralWidget(self._stack)
+        self._central_container = QWidget(self)
+        self._central_container.setObjectName("centralContainer")
+        self._central_layout = QVBoxLayout(self._central_container)
+        self._central_layout.setContentsMargins(0, 0, 0, 0)
+        self._central_layout.setSpacing(0)
+        self.setCentralWidget(self._central_container)
         status_bar = QStatusBar(self)
         status_bar.setObjectName("mainStatusBar")
         self.setStatusBar(status_bar)
@@ -218,20 +225,20 @@ class MainWindow(QMainWindow):
         self._main_toolbar = toolbar
 
     def _create_search_bar(self) -> None:
-        self._search_toolbar = QToolBar("検索", self)
+        self._search_toolbar = QWidget(self._central_container)
         self._search_toolbar.setObjectName("searchToolbar")
-        self._search_toolbar.setMovable(False)
-        self._search_toolbar.setFloatable(False)
-        self._search_toolbar.setAllowedAreas(Qt.ToolBarArea.TopToolBarArea)
         self._search_toolbar.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Fixed,
         )
-        self.addToolBarBreak(Qt.ToolBarArea.TopToolBarArea)
-        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self._search_toolbar)
+        layout = QHBoxLayout(self._search_toolbar)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(0)
+        layout.addWidget(self._search_bar)
+        self._central_layout.addWidget(self._search_toolbar)
+        self._central_layout.addWidget(self._stack, 1)
         self._search_toolbar.hide()
-        self._search_toolbar.addWidget(self._search_bar)
-        self._search_toolbar.toggleViewAction().setVisible(False)
+        self._search_toolbar.updateGeometry()
 
     def _choose_document(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(self, "PDFを開く", "", "PDF files (*.pdf)")
@@ -354,17 +361,30 @@ class MainWindow(QMainWindow):
         self.activateWindow()
         self.raise_()
         if self._search_toolbar is not None:
-            available_width = max(480, self.width() - 24)
-            self._search_toolbar.setMinimumWidth(available_width)
-            self._search_toolbar.resize(available_width, self._search_toolbar.sizeHint().height())
+            search_bar_height = max(
+                self._search_bar.sizeHint().height(),
+                self._search_bar.minimumSizeHint().height(),
+            )
+            self._search_toolbar.setMinimumHeight(search_bar_height)
             self._search_toolbar.show()
             self._search_toolbar.raise_()
         self._search_bar.show()
-        self._search_bar.setMinimumWidth(max(420, self.width() - 48))
+        self._search_bar.setMinimumHeight(
+            max(
+                self._search_bar.sizeHint().height(),
+                self._search_bar.minimumSizeHint().height(),
+            )
+        )
         self._search_bar.cancel_pending_search()
         self._search_bar.set_state(self._search_state_for(document))
         self._search_bar.focus_search()
         if self._search_toolbar is not None:
+            toolbar_layout = self._search_toolbar.layout()
+            if toolbar_layout is not None:
+                toolbar_layout.activate()
+            self._search_toolbar.adjustSize()
+            self._search_toolbar.updateGeometry()
+            self._central_layout.activate()
             self._search_toolbar.adjustSize()
         self._search_bar.adjustSize()
         self._search_bar.search_input.adjustSize()
@@ -671,21 +691,18 @@ class MainWindow(QMainWindow):
         if not self._search_bar.search_input.isVisible():
             return False
         if (
-            QApplication.platformName() != "offscreen"
-            and not self._search_bar.search_input.hasFocus()
-        ):
-            return False
-        if (
             self._search_toolbar.geometry().width() <= 0
             or self._search_toolbar.geometry().height() <= 0
         ):
             return False
         if self._search_bar.geometry().width() <= 0 or self._search_bar.geometry().height() <= 0:
             return False
-        return not (
+        if (
             self._search_bar.search_input.geometry().width() <= 0
             or self._search_bar.search_input.geometry().height() <= 0
-        )
+        ):
+            return False
+        return self._search_toolbar.geometry().height() >= self._search_bar.geometry().height()
 
     @staticmethod
     def _search_progress_text(state: object) -> str:
