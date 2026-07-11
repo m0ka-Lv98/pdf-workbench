@@ -230,3 +230,10 @@ jobs:
             gui-app.log
             gui-search.png
           if-no-files-found: warn
+      - name: Upload search screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}-${{ env.SHORT_SHA }}-search-screenshot
+          path: gui-search.png
+          if-no-files-found: warn

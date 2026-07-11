@@ -63,19 +63,25 @@ def main() -> int:
     if args.pdf is not None:
         window.open_document(args.pdf)
 
-    def run_startup_actions() -> None:
-        if (
-            (args.open_search or args.search_query is not None)
-            and window.open_search_bar()
-            and args.search_query is not None
-        ):
+    def prime_search_ui() -> None:
+        if not (args.open_search or args.search_query is not None):
+            return
+        if not window.open_search_bar():
+            return
+        if args.search_query is not None:
             window._search_bar.search_input.setText(args.search_query)
             window._search_bar._emit_debounced_search()
-        if args.screenshot_path is not None:
-            args.screenshot_path.parent.mkdir(parents=True, exist_ok=True)
-            window.grab().save(str(args.screenshot_path))
 
-    QTimer.singleShot(300, run_startup_actions)
+    def capture_screenshot() -> None:
+        if args.screenshot_path is None:
+            return
+        args.screenshot_path.parent.mkdir(parents=True, exist_ok=True)
+        window.grab().save(str(args.screenshot_path))
+
+    QTimer.singleShot(300, prime_search_ui)
+    if args.screenshot_path is not None:
+        screenshot_delay_ms = 900 if (args.open_search or args.search_query is not None) else 300
+        QTimer.singleShot(screenshot_delay_ms, capture_screenshot)
     if args.quit_after_ms is not None:
         QTimer.singleShot(args.quit_after_ms, app.quit)
 
