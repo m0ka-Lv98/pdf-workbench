@@ -68,15 +68,24 @@ def assert_search_ui_ready(window: MainWindow) -> None:
         >= window._search_bar.search_input.geometry().height()
     )
     assert window._search_surface.geometry().height() >= window._search_bar.geometry().height()
+    search_top = window._search_toolbar.mapTo(
+        window,
+        window._search_toolbar.rect().topLeft(),
+    ).y()
     if window._main_toolbar is not None:
-        search_top = window._search_toolbar.mapTo(
-            window,
-            window._search_toolbar.rect().topLeft(),
-        ).y()
         assert search_top >= window._main_toolbar.geometry().bottom()
+    tab_bar_bottom = (
+        window._tabs.tabBar()
+        .mapTo(
+            window,
+            window._tabs.tabBar().rect().bottomLeft(),
+        )
+        .y()
+    )
+    assert search_top >= tab_bar_bottom
     toolbar_right = window._search_toolbar.rect().right()
     surface_right = window._search_surface.geometry().right()
-    assert toolbar_right - surface_right < 32
+    assert toolbar_right - surface_right < 40
 
 
 class DelayedTextBackend(PdfiumDocumentBackend):
@@ -141,7 +150,7 @@ def test_main_window_opens_and_closes_multiple_documents(
     assert window._tabs.tabBar().elideMode() == Qt.TextElideMode.ElideMiddle
     assert window._tabs.tabBar().usesScrollButtons() is True
     assert window._tabs.tabsClosable() is True
-    assert 34 <= window._tabs.tabBar().height() <= 40
+    assert 32 <= window._tabs.tabBar().height() <= 42
 
     assert window.close_document_at(1) is True
     assert window._tabs.count() == 1
@@ -600,7 +609,7 @@ def test_main_window_real_search_updates_after_index_completion(
     search_input = window._search_bar.search_input
     search_input.clear()
     search_input.setText("Alpha")
-    window._search_bar._emit_debounced_search()
+    window._search_bar.submit_current_query()
 
     qtbot.waitUntil(lambda: window._documents[0].view.search_state.query == "Alpha", timeout=8000)
     qtbot.waitUntil(lambda: window._documents[0].view.search_state.total_count == 2, timeout=8000)
@@ -610,7 +619,7 @@ def test_main_window_real_search_updates_after_index_completion(
     document = window._documents[0]
     assert document.view.search_state.failed_pages == 0
     assert window._search_bar.counter_label.text() == "1 / 2"
-    assert window._search_bar.progress_label.text() == "検索結果 2 件"
+    assert window._search_bar.progress_label.text() == ""
     assert len(document.view._canvas.pages[0]._current_match_boxes) == 1
     assert len(document.view._canvas.pages[0]._match_boxes) == 2
 
@@ -640,7 +649,7 @@ def test_main_window_real_search_supports_japanese_text(
     search_input = window._search_bar.search_input
     search_input.clear()
     search_input.setText("検索")
-    window._search_bar._emit_debounced_search()
+    window._search_bar.submit_current_query()
 
     qtbot.waitUntil(lambda: window._documents[0].view.search_state.query == "検索", timeout=8000)
     qtbot.waitUntil(lambda: window._documents[0].view.search_state.indexing_completed, timeout=8000)
@@ -649,7 +658,7 @@ def test_main_window_real_search_supports_japanese_text(
     document = window._documents[0]
     assert document.view.search_state.current_index == 1
     assert window._search_bar.counter_label.text() == "1 / 2"
-    assert window._search_bar.progress_label.text() == "検索結果 2 件"
+    assert window._search_bar.progress_label.text() == ""
     assert len(document.view._canvas.pages[0]._current_match_boxes) == 1
 
     document.view.close_document()

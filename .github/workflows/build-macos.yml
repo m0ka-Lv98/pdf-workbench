@@ -112,12 +112,16 @@ jobs:
 
           payload = json.loads(Path("gui-search-light.json").read_text(encoding="utf-8"))
           assert payload["active_theme"] == "light"
-          assert payload["search_counter_text"] == "1 / 2"
+          assert payload["requested_window_size"] == [1100, 800]
+          assert payload["actual_window_size"] == [1100, 800]
+          assert payload["search_counter"] == "1 / 2"
           assert payload["visible_controls"]["search_surface"] is True
-          assert payload["toolbar_geometry"][2] > 0
+          assert payload["main_toolbar_geometry"][2] > 0
+          assert 52 <= payload["main_toolbar_geometry"][3] <= 56
+          assert payload["search_row_geometry"][3] <= 56
           assert payload["search_surface_geometry"][2] > 0
-          assert payload["page_field_geometry"][2] > 0
-          assert payload["zoom_field_geometry"][2] > 0
+          assert payload["page_input_geometry"][2] > 0
+          assert payload["zoom_control_geometry"][2] > 0
           PY
       - name: Package app bundle
         shell: bash
