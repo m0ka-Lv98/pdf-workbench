@@ -1,0 +1,300 @@
+QMainWindow#mainWindow {
+  background: #1e1f22;
+  color: #f2f4f7;
+}
+
+QMenuBar,
+QMenuBar::item,
+QMenu,
+QStatusBar#mainStatusBar,
+QWidget#centralContainer,
+QWidget#mainStack,
+QWidget#pdfView,
+QWidget#pdfContent {
+  background: transparent;
+  color: #f2f4f7;
+}
+
+QMenuBar {
+  background: #1e1f22;
+  border-bottom: 1px solid #3a3c42;
+}
+
+QMenuBar::item {
+  padding: 6px 8px;
+  margin: 2px 2px;
+  border-radius: 4px;
+}
+
+QMenuBar::item:selected,
+QMenu::item:selected {
+  background: #30343b;
+}
+
+QMenu {
+  background: #27282c;
+  border: 1px solid #3a3c42;
+  padding: 6px;
+}
+
+QMenu::item {
+  padding: 7px 12px;
+  border-radius: 4px;
+}
+
+QToolBar#mainToolbar {
+  background: #1e1f22;
+  border: none;
+  border-bottom: 1px solid #3a3c42;
+  padding: 0 10px;
+  spacing: 0;
+}
+
+QWidget#documentToolbar {
+  background: transparent;
+}
+
+QWidget#searchToolbar {
+  background: #1e1f22;
+  border-bottom: 1px solid #3a3c42;
+}
+
+QWidget#searchSurface {
+  background: #27282c;
+  border: 1px solid #3a3c42;
+  border-radius: 10px;
+}
+
+QFrame#toolbarSeparator {
+  background: #3a3c42;
+  min-width: 1px;
+  max-width: 1px;
+  margin: 10px 10px;
+}
+
+QWidget#documentToolbar QPushButton,
+QWidget#documentToolbar QToolButton,
+QWidget#searchBar QToolButton,
+QWidget#emptyState QPushButton {
+  min-height: 30px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: #f2f4f7;
+  padding: 0 10px;
+}
+
+QWidget#documentToolbar QPushButton#openPdfButton {
+  min-height: 34px;
+  padding: 0 14px;
+  background: #2563eb;
+  color: #ffffff;
+}
+
+QWidget#documentToolbar QToolButton,
+QWidget#searchBar QToolButton {
+  min-width: 30px;
+  max-width: 30px;
+  padding: 0;
+}
+
+QWidget#documentToolbar QPushButton:hover,
+QWidget#documentToolbar QToolButton:hover,
+QWidget#searchBar QToolButton:hover,
+QWidget#emptyState QPushButton:hover {
+  background: #30343b;
+}
+
+QWidget#documentToolbar QPushButton#openPdfButton:hover {
+  background: #1d4ed8;
+}
+
+QWidget#documentToolbar QPushButton:pressed,
+QWidget#documentToolbar QToolButton:pressed,
+QWidget#searchBar QToolButton:pressed,
+QWidget#emptyState QPushButton:pressed {
+  background: #3a3f48;
+}
+
+QWidget#documentToolbar QPushButton#openPdfButton:pressed {
+  background: #1e40af;
+}
+
+QWidget#documentToolbar QPushButton:disabled,
+QWidget#documentToolbar QToolButton:disabled,
+QWidget#documentToolbar QComboBox:disabled,
+QWidget#documentToolbar QSpinBox:disabled,
+QWidget#searchBar QLineEdit:disabled,
+QWidget#searchBar QToolButton:disabled,
+QWidget#emptyState QPushButton:disabled {
+  color: #6b7280;
+  background: transparent;
+}
+
+QWidget#documentToolbar QToolButton:checked,
+QWidget#searchBar QToolButton:checked {
+  background: #253247;
+}
+
+QWidget#documentToolbar QComboBox,
+QWidget#documentToolbar QSpinBox,
+QWidget#searchBar QLineEdit {
+  min-height: 30px;
+  border: 1px solid #3a3c42;
+  border-radius: 7px;
+  background: #27282c;
+  color: #f2f4f7;
+  padding: 0 10px;
+}
+
+QWidget#documentToolbar QSpinBox#pageNumberInput {
+  min-width: 58px;
+  max-width: 58px;
+}
+
+QWidget#documentToolbar QComboBox#zoomControl {
+  min-width: 84px;
+}
+
+QWidget#searchBar QLineEdit#searchInput {
+  min-width: 260px;
+}
+
+QWidget#documentToolbar QComboBox:hover,
+QWidget#documentToolbar QSpinBox:hover,
+QWidget#searchBar QLineEdit:hover {
+  border-color: #667085;
+}
+
+QWidget#documentToolbar QPushButton:focus,
+QWidget#documentToolbar QToolButton:focus,
+QWidget#documentToolbar QComboBox:focus,
+QWidget#documentToolbar QSpinBox:focus,
+QWidget#searchBar QLineEdit:focus,
+QWidget#searchBar QToolButton:focus,
+QWidget#emptyState QPushButton:focus {
+  border: 1px solid #60a5fa;
+}
+
+QWidget#documentToolbar QLabel,
+QWidget#searchBar QLabel,
+QStatusBar#mainStatusBar QLabel {
+  background: transparent;
+  border: none;
+}
+
+QLabel#pageTotalLabel,
+QLabel#searchProgressLabel,
+QLabel#statusSummaryLabel,
+QLabel#emptyStateSubtitle,
+QLabel#emptyStateRecentHint,
+QLabel#emptyStateRecentMessage {
+  color: #a4a7ae;
+}
+
+QLabel#searchResultCounter {
+  color: #f2f4f7;
+  font-weight: 600;
+}
+
+QStatusBar#mainStatusBar {
+  border-top: 1px solid #3a3c42;
+  min-height: 24px;
+}
+
+QStatusBar#mainStatusBar::item {
+  border: none;
+}
+
+QTabWidget#documentTabs::pane {
+  border: none;
+  background: transparent;
+}
+
+QTabWidget#documentTabs QTabBar::tab {
+  min-height: 34px;
+  background: transparent;
+  color: #a4a7ae;
+  padding: 0 12px;
+  margin: 0 2px;
+  border: none;
+  border-bottom: 2px solid transparent;
+}
+
+QTabWidget#documentTabs QTabBar::tab:selected {
+  color: #f2f4f7;
+  border-bottom-color: #60a5fa;
+  font-weight: 600;
+}
+
+QTabWidget#documentTabs QTabBar::tab:hover:!selected {
+  color: #f2f4f7;
+  background: rgba(242, 244, 247, 0.04);
+}
+
+QWidget#emptyState {
+  background: transparent;
+}
+
+QWidget#emptyState QLabel#emptyStateTitle {
+  font-size: 22px;
+  font-weight: 650;
+  color: #f2f4f7;
+}
+
+QWidget#emptyState QLabel#emptyStateIcon {
+  color: #a4a7ae;
+}
+
+QWidget#emptyState QPushButton[variant="primary"] {
+  background: #2563eb;
+  color: #ffffff;
+  padding: 0 18px;
+}
+
+QWidget#emptyState QPushButton[variant="primary"]:hover {
+  background: #1d4ed8;
+}
+
+QWidget#emptyState QPushButton[variant="recent"] {
+  text-align: left;
+  padding: 0 12px;
+  border: 1px solid #3a3c42;
+  background: #27282c;
+}
+
+QWidget#emptyState QPushButton[variant="recent"]:hover {
+  background: #30343b;
+  border-color: #667085;
+}
+
+QScrollArea#pdfScrollArea {
+  border: none;
+  background: #141518;
+}
+
+QWidget#pdfCanvas {
+  background: #141518;
+}
+
+QFrame#pageCard {
+  background: #27282c;
+  border: 1px solid #3a3c42;
+  border-radius: 2px;
+}
+
+QFrame#pageCard[renderState="not_requested"],
+QFrame#pageCard[renderState="queued"],
+QFrame#pageCard[renderState="rendering"] {
+  color: #a4a7ae;
+}
+
+QFrame#pageCard[renderState="error"] {
+  background: #43282c;
+  border-color: #f97066;
+  color: #ffb4ab;
+}
+
+QLabel#pdfStatusLabel[renderState="error"] {
+  color: #ffb4ab;
+}
