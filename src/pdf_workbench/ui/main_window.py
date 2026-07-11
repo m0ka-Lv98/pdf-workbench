@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
     QHBoxLayout,
+    QLabel,
     QLineEdit,
     QMainWindow,
     QMessageBox,
@@ -66,6 +67,7 @@ class MainWindow(QMainWindow):
         self._search_bar = SearchBar(self)
         self._main_toolbar: QToolBar | None = None
         self._search_toolbar: QWidget | None = None
+        self._search_surface: QWidget | None = None
         self._empty_state = EmptyState(self)
 
         self.setObjectName("mainWindow")
@@ -95,6 +97,9 @@ class MainWindow(QMainWindow):
         status_bar = QStatusBar(self)
         status_bar.setObjectName("mainStatusBar")
         self.setStatusBar(status_bar)
+        self._status_summary = QLabel("", self)
+        self._status_summary.setObjectName("statusSummaryLabel")
+        status_bar.addPermanentWidget(self._status_summary)
 
         self._empty_state.open_requested.connect(self._choose_document)
         self._empty_state.recent_file_requested.connect(self.open_document)
@@ -123,6 +128,7 @@ class MainWindow(QMainWindow):
         self._restore_window_state()
         self._refresh_recent_file_actions()
         self._update_window_title()
+        self.refresh_theme_assets()
         self._update_actions()
         self._update_status()
 
@@ -234,7 +240,15 @@ class MainWindow(QMainWindow):
         layout = QHBoxLayout(self._search_toolbar)
         layout.setContentsMargins(12, 10, 12, 10)
         layout.setSpacing(0)
-        layout.addWidget(self._search_bar)
+        layout.addStretch(1)
+        self._search_surface = QWidget(self._search_toolbar)
+        self._search_surface.setObjectName("searchSurface")
+        self._search_surface.setMaximumWidth(620)
+        surface_layout = QHBoxLayout(self._search_surface)
+        surface_layout.setContentsMargins(6, 6, 6, 6)
+        surface_layout.setSpacing(0)
+        surface_layout.addWidget(self._search_bar)
+        layout.addWidget(self._search_surface)
         self._central_layout.addWidget(self._search_toolbar)
         self._central_layout.addWidget(self._stack, 1)
         self._search_toolbar.hide()
@@ -365,9 +379,17 @@ class MainWindow(QMainWindow):
                 self._search_bar.sizeHint().height(),
                 self._search_bar.minimumSizeHint().height(),
             )
-            self._search_toolbar.setMinimumHeight(search_bar_height)
+            self._search_toolbar.setMinimumHeight(search_bar_height + 12)
+            self._search_toolbar.setMinimumWidth(self._central_container.width())
+            self._search_toolbar.resize(
+                self._central_container.width(),
+                self._search_toolbar.sizeHint().height(),
+            )
             self._search_toolbar.show()
             self._search_toolbar.raise_()
+        if self._search_surface is not None:
+            self._search_surface.setMinimumWidth(min(420, max(320, self.width() - 180)))
+            self._search_surface.setMaximumWidth(max(420, min(640, self.width() - 32)))
         self._search_bar.show()
         self._search_bar.setMinimumHeight(
             max(
@@ -382,10 +404,10 @@ class MainWindow(QMainWindow):
             toolbar_layout = self._search_toolbar.layout()
             if toolbar_layout is not None:
                 toolbar_layout.activate()
-            self._search_toolbar.adjustSize()
             self._search_toolbar.updateGeometry()
             self._central_layout.activate()
-            self._search_toolbar.adjustSize()
+        if self._search_surface is not None:
+            self._search_surface.adjustSize()
         self._search_bar.adjustSize()
         self._search_bar.search_input.adjustSize()
         QApplication.processEvents()
@@ -458,14 +480,13 @@ class MainWindow(QMainWindow):
         document = self._current_document()
         if document is None:
             self.statusBar().showMessage("準備完了")
+            self._status_summary.setText("")
             self._toolbar_widget.setState(ToolbarState(False, 0, 0, 1.0))
             return
         page_count = document.view.page_count
         current_page = 0 if page_count == 0 else document.view.page_index + 1
-        self.statusBar().showMessage(
-            f"{document.session.source_path.name}  "
-            f"{current_page} / {page_count} ページ  "
-            f"ズーム {document.session.zoom_factor:.0%}"
+        self._status_summary.setText(
+            f"{current_page} / {page_count} pages  ·  {document.session.zoom_factor:.0%}"
         )
         self._sync_toolbar(document)
 
@@ -703,6 +724,11 @@ class MainWindow(QMainWindow):
         ):
             return False
         return self._search_toolbar.geometry().height() >= self._search_bar.geometry().height()
+
+    def refresh_theme_assets(self) -> None:
+        self._toolbar_widget.refresh_theme_assets()
+        self._search_bar.refresh_theme_assets()
+        self._empty_state.refresh_theme_assets()
 
     @staticmethod
     def _search_progress_text(state: object) -> str:

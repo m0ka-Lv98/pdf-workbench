@@ -6,6 +6,8 @@ from PySide6.QtCore import QEvent, QObject, QSignalBlocker, Qt, QTimer, Signal
 from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QLineEdit, QSizePolicy, QToolButton, QWidget
 
+from pdf_workbench.ui.icon_provider import IconName, IconProvider
+
 
 @dataclass(frozen=True, slots=True)
 class SearchBarState:
@@ -50,16 +52,18 @@ class SearchBar(QWidget):
 
         self.previous_button = QToolButton(self)
         self.previous_button.setObjectName("previousSearchResultButton")
-        self.previous_button.setText("↑")
         self.previous_button.setAccessibleName("Previous search result")
         self.previous_button.setToolTip("前の検索結果")
+        self.previous_button.setAutoRaise(True)
+        self.previous_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
         self.previous_button.clicked.connect(self.previous_requested.emit)
 
         self.next_button = QToolButton(self)
         self.next_button.setObjectName("nextSearchResultButton")
-        self.next_button.setText("↓")
         self.next_button.setAccessibleName("Next search result")
         self.next_button.setToolTip("次の検索結果")
+        self.next_button.setAutoRaise(True)
+        self.next_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
         self.next_button.clicked.connect(self.next_requested.emit)
 
         self.counter_label = QLabel("0 / 0", self)
@@ -73,9 +77,10 @@ class SearchBar(QWidget):
 
         self.close_button = QToolButton(self)
         self.close_button.setObjectName("closeSearchButton")
-        self.close_button.setText("\u00d7")
         self.close_button.setAccessibleName("Close search")
         self.close_button.setToolTip("検索バーを閉じる")
+        self.close_button.setAutoRaise(True)
+        self.close_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
         self.close_button.clicked.connect(self.close_requested.emit)
 
         layout.addWidget(self.search_input)
@@ -87,6 +92,7 @@ class SearchBar(QWidget):
 
         self.search_input.installEventFilter(self)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.refresh_theme_assets()
 
     def set_state(self, state: SearchBarState) -> None:
         blocker = QSignalBlocker(self.search_input)
@@ -99,6 +105,11 @@ class SearchBar(QWidget):
         self.show()
         self.activateWindow()
         self.search_input.setFocus(Qt.FocusReason.ShortcutFocusReason)
+
+    def refresh_theme_assets(self) -> None:
+        self.previous_button.setIcon(IconProvider.icon(IconName.CHEVRON_LEFT, size=16))
+        self.next_button.setIcon(IconProvider.icon(IconName.CHEVRON_RIGHT, size=16))
+        self.close_button.setIcon(IconProvider.icon(IconName.CLOSE, size=16))
 
     def cancel_pending_search(self) -> None:
         self._search_timer.stop()
@@ -119,6 +130,7 @@ class SearchBar(QWidget):
             if key_event is None:
                 return super().eventFilter(watched, event)
             if key_event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                self.submit_current_query()
                 if key_event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
                     self.previous_requested.emit()
                 else:
