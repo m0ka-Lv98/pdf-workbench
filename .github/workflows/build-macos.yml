@@ -120,6 +120,7 @@ jobs:
           stderr_log="gui-stderr.log"
           copied_app_log="gui-app.log"
           screenshot_path="gui-search.png"
+          ui_state_path="gui-search-state.json"
           app_log_path=$(python - <<'PY'
           from platformdirs import user_log_dir
           from pathlib import Path
@@ -128,15 +129,16 @@ jobs:
           PY
           )
 
-          rm -f "$stdout_log" "$stderr_log" "$copied_app_log" "$screenshot_path" "$app_log_path"
+          rm -f "$stdout_log" "$stderr_log" "$copied_app_log" "$screenshot_path" "$ui_state_path" "$app_log_path"
 
           PDF_WORKBENCH_BUILD_SHA="$SHORT_SHA" \
           "$executable" \
             "$input_pdf" \
             --open-search \
             --search-query Alpha \
+            --expected-search-count 2 \
             --screenshot-path "$screenshot_path" \
-            --quit-after-ms 12000 \
+            --ui-state-path "$ui_state_path" \
             >"$stdout_log" 2>"$stderr_log" &
           app_pid=$!
           app_exit_code=0
@@ -161,6 +163,8 @@ jobs:
           test -f "$app_log_path" && cat "$app_log_path" || true
           echo "=== SCREENSHOT ==="
           test -f "$screenshot_path" && ls -l "$screenshot_path" || true
+          echo "=== UI STATE JSON ==="
+          test -f "$ui_state_path" && cat "$ui_state_path" || true
           if test -f "$app_log_path"; then
             cp "$app_log_path" "$copied_app_log"
           else
@@ -186,6 +190,31 @@ jobs:
           fi
 
           test -f "$screenshot_path"
+          test -f "$ui_state_path"
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          payload = json.loads(Path("gui-search-state.json").read_text(encoding="utf-8"))
+
+          assert payload["search_toolbar_visible"] is True
+          assert payload["search_bar_visible"] is True
+          assert payload["search_input_visible"] is True
+          assert payload["search_input_focused"] is True
+          assert payload["query"] == "Alpha"
+          assert payload["current_index"] == 1
+          assert payload["total_count"] == 2
+
+          for key in (
+              "search_toolbar_geometry",
+              "search_bar_geometry",
+              "search_input_geometry",
+          ):
+              geometry = payload[key]
+              assert isinstance(geometry, list) and len(geometry) == 4
+              assert geometry[2] > 0
+              assert geometry[3] > 0
+          PY
           test "$app_exit_code" -eq 0
       - name: Verify codesign
         shell: bash
@@ -217,7 +246,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          for file in cli-smoke-test.log gui-stdout.log gui-stderr.log gui-app.log gui-search.png; do
+          for file in cli-smoke-test.log gui-stdout.log gui-stderr.log gui-app.log gui-search.png gui-search-state.json; do
             if [ ! -f "$file" ]; then
               printf 'not generated\n' > "$file"
             fi
@@ -233,6 +262,7 @@ jobs:
             gui-stderr.log
             gui-app.log
             gui-search.png
+            gui-search-state.json
           if-no-files-found: warn
       - name: Upload search screenshot
         if: always()
@@ -240,4 +270,11 @@ jobs:
         with:
           name: ${{ matrix.artifact_name }}-${{ env.SHORT_SHA }}-search-screenshot
           path: gui-search.png
+          if-no-files-found: warn
+      - name: Upload search UI state
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}-${{ env.SHORT_SHA }}-search-ui-state
+          path: gui-search-state.json
           if-no-files-found: warn
