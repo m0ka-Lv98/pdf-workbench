@@ -318,6 +318,22 @@ QTabBar#documentTabBar::tab:hover:!selected {
   background: rgba(242, 244, 247, 0.04);
 }
 
+QTabBar#documentTabBar QToolButton#tabCloseButton {
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  padding: 0;
+  margin-right: 4px;
+}
+
+QTabBar#documentTabBar QToolButton#tabCloseButton:hover {
+  background: rgba(242, 244, 247, 0.1);
+}
+
+QTabBar#documentTabBar QToolButton#tabCloseButton:pressed {
+  background: rgba(242, 244, 247, 0.16);
+}
+
 QWidget#emptyState {
   background: transparent;
 }

@@ -149,6 +149,8 @@ def _build_ui_state(window: MainWindow, *, requested_window_size: str | None) ->
         "status_left_geometry": _geometry(window._status_left),
         "status_icon_geometry": _geometry(window._status_icon),
         "status_message_geometry": _geometry(window._status_message),
+        "status_message_text": window._status_message.text(),
+        "native_status_message": window.statusBar().currentMessage(),
         "page_input_geometry": _geometry(window._toolbar_widget.page_field),
         "zoom_control_geometry": _geometry(window._toolbar_widget.zoom_field),
         "pdf_canvas_geometry": _geometry(pdf_canvas_target),

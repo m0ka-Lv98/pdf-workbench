@@ -221,6 +221,8 @@ jobs:
           light_search = payloads["light-search-1100x800"]
           assert light_search["search_query"] == "Alpha"
           assert light_search["search_counter"] == "1 / 2"
+          assert light_search["status_message_text"] == "準備完了"
+          assert light_search["native_status_message"] == ""
           assert light_search["status_left_geometry"][2] > 0
           assert light_search["status_icon_geometry"][2] > 0
           assert (

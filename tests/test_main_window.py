@@ -8,7 +8,7 @@ import pytest
 from PySide6.QtCore import QMimeData, QPoint, QPointF, QSettings, Qt, QUrl
 from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent, QImage, QKeySequence
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QHBoxLayout, QMessageBox
+from PySide6.QtWidgets import QApplication, QHBoxLayout, QLabel, QMessageBox, QTabBar, QToolButton
 from pytestqt.qtbot import QtBot
 
 from pdf_test_utils import copy_pdf_fixture, create_blank_pdf, create_image_only_pdf
@@ -88,6 +88,13 @@ def assert_search_ui_ready(window: MainWindow) -> None:
     assert toolbar_right - surface_right < 40
 
 
+def assert_button_icon_valid(button: QToolButton) -> None:
+    icon = button.icon()
+    assert not icon.isNull()
+    pixmap = icon.pixmap(16, 16)
+    assert not pixmap.isNull()
+
+
 class DelayedTextBackend(PdfiumDocumentBackend):
     def __init__(self, path: Path, delay_seconds: float) -> None:
         super().__init__(path)
@@ -149,9 +156,12 @@ def test_main_window_opens_and_closes_multiple_documents(
     assert window._stack.currentWidget() is window._tabs
     assert window._tabs.tabBar().elideMode() == Qt.TextElideMode.ElideMiddle
     assert window._tabs.tabBar().usesScrollButtons() is True
-    assert window._tabs.tabsClosable() is True
+    assert window._tabs.tabsClosable() is False
     assert 32 <= window._tabs.tabBar().height() <= 42
     assert window._tabs.tabBar().drawBase() is False
+    close_button = window._tabs.tabBar().tabButton(0, QTabBar.ButtonPosition.RightSide)
+    assert isinstance(close_button, QToolButton)
+    assert close_button.objectName() == "tabCloseButton"
 
     assert window.close_document_at(1) is True
     assert window._tabs.count() == 1
@@ -394,10 +404,101 @@ def test_main_window_status_left_container_has_margin_and_valid_icon(
     assert 16 <= layout.contentsMargins().left() <= 18
     assert not window._status_icon.pixmap().isNull()
     assert window._status_message.geometry().left() > window._status_icon.geometry().right()
+    assert window.statusBar().currentMessage() == ""
+    assert window._status_message.text() == "準備完了"
+    assert len(window.findChildren(QLabel, "statusMessageLabel")) == 1
 
     right_layout = window._status_right.layout()
     assert isinstance(right_layout, QHBoxLayout)
     assert 16 <= right_layout.contentsMargins().right() <= 18
+
+
+def test_main_window_status_message_uses_custom_label_and_resets_after_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    window = MainWindow(settings)
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    window._set_status_message("エラーです", error=True, timeout_ms=10)
+
+    assert window.statusBar().currentMessage() == ""
+    assert window._status_message.text() == "エラーです"
+    assert window._status_icon.property("error") is True
+    assert window._status_icon.geometry().right() < window._status_message.geometry().left()
+
+    qtbot.waitUntil(lambda: window._status_message.text() == "準備完了")
+    assert window.statusBar().currentMessage() == ""
+    assert window._status_icon.property("error") is False
+
+
+def test_main_window_uses_custom_tab_close_buttons(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    window = MainWindow(settings)
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    first = tmp_path / "first.pdf"
+    second = tmp_path / "second.pdf"
+    first.touch()
+    second.touch()
+    window.open_document(first)
+    window.open_document(second)
+
+    tab_bar = window._tabs.tabBar()
+    first_button = tab_bar.tabButton(0, QTabBar.ButtonPosition.RightSide)
+    second_button = tab_bar.tabButton(1, QTabBar.ButtonPosition.RightSide)
+    assert isinstance(first_button, QToolButton)
+    assert isinstance(second_button, QToolButton)
+    assert first_button.toolTip() == "閉じる"
+    assert first_button.accessibleName() == "タブを閉じる"
+    assert_button_icon_valid(first_button)
+    assert_button_icon_valid(second_button)
+
+    QTest.mouseClick(first_button, Qt.MouseButton.LeftButton)
+    assert window._tabs.count() == 1
+    assert window._documents[0].session.source_path == second.resolve()
+
+    remaining_button = tab_bar.tabButton(0, QTabBar.ButtonPosition.RightSide)
+    assert isinstance(remaining_button, QToolButton)
+    QTest.mouseClick(remaining_button, Qt.MouseButton.LeftButton)
+    assert window._tabs.count() == 0
+
+
+def test_main_window_refreshes_tab_close_button_icons_on_theme_change(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    window = MainWindow(settings)
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = tmp_path / "theme.pdf"
+    document_path.touch()
+    window.open_document(document_path)
+    button = window._tabs.tabBar().tabButton(0, QTabBar.ButtonPosition.RightSide)
+    assert isinstance(button, QToolButton)
+    assert_button_icon_valid(button)
+
+    from pdf_workbench.ui.theme import ColorScheme, apply_application_theme
+
+    app = QApplication.instance()
+    assert isinstance(app, QApplication)
+    apply_application_theme(app, ColorScheme.DARK)
+    window.refresh_theme_assets()
+    assert_button_icon_valid(button)
 
 
 def test_main_window_find_action_opens_search_ui(

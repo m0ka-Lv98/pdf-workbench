@@ -5,9 +5,10 @@ import logging
 import os
 import sys
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QMimeData, QObject, QSettings, Qt
+from PySide6.QtCore import QEvent, QMimeData, QObject, QSettings, Qt, QTimer
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
@@ -28,7 +29,9 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QStackedWidget,
     QStatusBar,
+    QTabBar,
     QTabWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -56,6 +59,7 @@ class MainWindow(QMainWindow):
     _GEOMETRY_KEY = "main_window/geometry"
     _MAX_RECENT_FILES = 10
     _BASE_RENDER_SCALE = 1.5
+    _READY_STATUS_TEXT = "準備完了"
 
     def __init__(
         self,
@@ -80,6 +84,9 @@ class MainWindow(QMainWindow):
         self._workspace_overlay_host: QWidget | None = None
         self._empty_state = EmptyState(self)
         self._search_row_height = 54
+        self._status_reset_timer = QTimer(self)
+        self._status_reset_timer.setSingleShot(True)
+        self._status_reset_timer.timeout.connect(self._reset_status_message)
 
         self.setObjectName("mainWindow")
         self.setWindowTitle("PDF Workbench")
@@ -89,7 +96,7 @@ class MainWindow(QMainWindow):
         self._tabs = QTabWidget(self)
         self._tabs.setObjectName("documentTabs")
         self._tabs.setDocumentMode(True)
-        self._tabs.setTabsClosable(True)
+        self._tabs.setTabsClosable(False)
         tab_bar = self._tabs.tabBar()
         tab_bar.setObjectName("documentTabBar")
         tab_bar.setElideMode(Qt.TextElideMode.ElideMiddle)
@@ -97,7 +104,6 @@ class MainWindow(QMainWindow):
         tab_bar.setDrawBase(False)
         tab_bar.setFixedHeight(40)
         self._tabs.currentChanged.connect(self._on_current_tab_changed)
-        self._tabs.tabCloseRequested.connect(self.close_document_at)
         self._stack = QStackedWidget(self)
         self._stack.setObjectName("mainStack")
         self._stack.addWidget(self._empty_state)
@@ -120,7 +126,7 @@ class MainWindow(QMainWindow):
         status_left_layout.setSpacing(6)
         self._status_icon = QLabel("", self._status_left)
         self._status_icon.setObjectName("statusStateIcon")
-        self._status_message = QLabel("準備完了", self._status_left)
+        self._status_message = QLabel(self._READY_STATUS_TEXT, self._status_left)
         self._status_message.setObjectName("statusMessageLabel")
         status_left_layout.addWidget(self._status_icon)
         status_left_layout.addWidget(self._status_message)
@@ -136,8 +142,6 @@ class MainWindow(QMainWindow):
         status_right_layout.addStretch(1)
         status_right_layout.addWidget(self._status_summary)
         status_bar.addPermanentWidget(self._status_right)
-        status_bar.messageChanged.connect(self._on_status_message_changed)
-
         self._empty_state.open_requested.connect(self._choose_document)
         self._empty_state.recent_file_requested.connect(self.open_document)
         self._toolbar_widget.open_requested.connect(self._choose_document)
@@ -303,7 +307,10 @@ class MainWindow(QMainWindow):
         if existing_index is not None:
             self._tabs.setCurrentIndex(existing_index)
             self._remember_recent_file(normalized_path)
-            self._set_status_message(f"{normalized_path.name} はすでに開いています")
+            self._set_status_message(
+                f"{normalized_path.name} はすでに開いています",
+                timeout_ms=3000,
+            )
             return
 
         try:
@@ -327,6 +334,7 @@ class MainWindow(QMainWindow):
             IconProvider.icon(IconName.DOCUMENT, tone=IconTone.MUTED, size=16),
             self._tab_title(document),
         )
+        self._install_tab_close_button(view)
         self._tabs.setCurrentIndex(tab_index)
         self._stack.setCurrentWidget(self._tabs)
         self._remember_recent_file(session.source_path)
@@ -442,14 +450,14 @@ class MainWindow(QMainWindow):
         if document is None:
             return
         if not document.view.next_match():
-            self._set_status_message("検索結果がありません")
+            self._set_status_message("検索結果がありません", timeout_ms=3000)
 
     def _previous_match(self) -> None:
         document = self._current_document()
         if document is None:
             return
         if not document.view.previous_match():
-            self._set_status_message("検索結果がありません")
+            self._set_status_message("検索結果がありません", timeout_ms=3000)
 
     def _copy_selection(self) -> None:
         focus_widget = QApplication.focusWidget()
@@ -460,7 +468,7 @@ class MainWindow(QMainWindow):
         if document is None:
             return
         if not document.view.copy_selected_text():
-            self._set_status_message("コピーするテキストが選択されていません")
+            self._set_status_message("コピーするテキストが選択されていません", timeout_ms=3000)
 
     def _search_text_changed(self, query: str) -> None:
         document = self._current_document()
@@ -757,7 +765,8 @@ class MainWindow(QMainWindow):
         self._toolbar_widget.refresh_theme_assets()
         self._search_bar.refresh_theme_assets()
         self._empty_state.refresh_theme_assets()
-        self._set_status_icon(error=False)
+        self._refresh_tab_close_buttons()
+        self._set_status_icon(error=self._status_icon.property("error") is True)
 
     @staticmethod
     def _search_progress_text(state: object) -> str:
@@ -840,18 +849,33 @@ class MainWindow(QMainWindow):
             inset += self._search_row_height + 12
         document.view.set_search_overlay_inset(inset)
 
-    def _on_status_message_changed(self, message: str) -> None:
-        self._status_message.setText(message or "準備完了")
-
-    def _set_status_message(self, message: str, *, error: bool = False) -> None:
+    def _set_status_message(
+        self,
+        message: str,
+        *,
+        error: bool = False,
+        timeout_ms: int | None = None,
+    ) -> None:
+        self._status_reset_timer.stop()
         self._status_icon.setProperty("error", error)
         self._status_icon.style().unpolish(self._status_icon)
         self._status_icon.style().polish(self._status_icon)
         self._set_status_icon(error=error)
-        if error:
-            self.statusBar().showMessage(message, 5000)
-            return
-        self.statusBar().showMessage(message or "準備完了")
+        self._status_message.setText(message or self._READY_STATUS_TEXT)
+        self.statusBar().clearMessage()
+        effective_timeout = timeout_ms
+        if error and effective_timeout is None:
+            effective_timeout = 5000
+        if effective_timeout is not None and message:
+            self._status_reset_timer.start(effective_timeout)
+
+    def _reset_status_message(self) -> None:
+        self._status_icon.setProperty("error", False)
+        self._status_icon.style().unpolish(self._status_icon)
+        self._status_icon.style().polish(self._status_icon)
+        self._set_status_icon(error=False)
+        self._status_message.setText(self._READY_STATUS_TEXT)
+        self.statusBar().clearMessage()
 
     def _set_status_icon(self, *, error: bool) -> None:
         if error:
@@ -859,3 +883,30 @@ class MainWindow(QMainWindow):
         else:
             icon = IconProvider.icon(IconName.STATUS_SUCCESS, tone=IconTone.SUCCESS, size=16)
         self._status_icon.setPixmap(icon.pixmap(16, 16))
+
+    def _install_tab_close_button(self, view: PdfView) -> None:
+        tab_bar = self._tabs.tabBar()
+        button = QToolButton(tab_bar)
+        button.setObjectName("tabCloseButton")
+        button.setAccessibleName("タブを閉じる")
+        button.setToolTip("閉じる")
+        button.setAutoRaise(True)
+        button.setCursor(Qt.CursorShape.ArrowCursor)
+        button.setFixedSize(24, 24)
+        button.setIcon(IconProvider.icon(IconName.CLOSE, tone=IconTone.MUTED, size=16))
+        button.clicked.connect(partial(self._close_document_for_view, view))
+        index = self._tabs.indexOf(view)
+        if index >= 0:
+            tab_bar.setTabButton(index, QTabBar.ButtonPosition.RightSide, button)
+
+    def _refresh_tab_close_buttons(self) -> None:
+        tab_bar = self._tabs.tabBar()
+        for index in range(self._tabs.count()):
+            button = tab_bar.tabButton(index, QTabBar.ButtonPosition.RightSide)
+            if isinstance(button, QToolButton):
+                button.setIcon(IconProvider.icon(IconName.CLOSE, tone=IconTone.MUTED, size=16))
+
+    def _close_document_for_view(self, view: PdfView) -> None:
+        index = self._tabs.indexOf(view)
+        if index >= 0:
+            self.close_document_at(index)
