@@ -108,14 +108,21 @@ class StartupSearchSmokeController:
             return
 
         if self._phase == "wait-search-ui":
+            self._window.activateWindow()
+            self._window.raise_()
+            self._window._search_bar.focus_search()
+            self._app.processEvents()
             if not self._window._search_ui_is_ready():
                 return
             self._window._search_bar.search_input.setText(self._query)
+            self._window._search_bar.focus_search()
             self._window._search_bar._emit_debounced_search()
             self._phase = "wait-results"
             return
 
         if self._phase == "wait-results":
+            self._window._search_bar.focus_search()
+            self._app.processEvents()
             state = document.view.search_state
             if not self._diagnostic_conditions_met(state):
                 return
