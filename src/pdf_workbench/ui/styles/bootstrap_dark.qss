@@ -29,6 +29,13 @@ QToolBar#mainToolbar {
   border: none;
 }
 
+QToolBar#searchToolbar {
+  background: #212529;
+  spacing: 6px;
+  padding: 4px 6px;
+  border: none;
+}
+
 QWidget#documentToolbar,
 QWidget#documentToolbar QFrame#toolbarGroup,
 QWidget#emptyState,
@@ -99,6 +106,30 @@ QWidget#documentToolbar QSpinBox:focus,
 QWidget#emptyState QPushButton:focus,
 QTabWidget#documentTabs QTabBar::tab:focus {
   border-color: #6ea8fe;
+}
+
+QWidget#searchBar {
+  background: transparent;
+}
+
+QWidget#searchBar QLineEdit#searchInput,
+QWidget#searchBar QToolButton#previousSearchResultButton,
+QWidget#searchBar QToolButton#nextSearchResultButton,
+QWidget#searchBar QToolButton#closeSearchButton {
+  min-height: 32px;
+  border-radius: 6px;
+  border: 1px solid #495057;
+  background: #2b3035;
+  color: #f8f9fa;
+  padding: 4px 10px;
+}
+
+QWidget#searchBar QLabel#searchResultCounter,
+QWidget#searchBar QLabel#searchProgressLabel {
+  background: transparent;
+  border: none;
+  padding: 0 4px;
+  color: #adb5bd;
 }
 
 QWidget#emptyState QLabel#emptyStateTitle {

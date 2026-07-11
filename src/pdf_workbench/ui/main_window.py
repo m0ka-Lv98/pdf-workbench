@@ -2,19 +2,27 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtCore import QMimeData, QSettings, QSize, Qt
-from PySide6.QtGui import QAction, QCloseEvent, QDragEnterEvent, QDropEvent, QKeySequence
+from PySide6.QtCore import QEvent, QMimeData, QObject, QSettings, QSize, Qt
+from PySide6.QtGui import QAction, QCloseEvent, QDragEnterEvent, QDropEvent, QKeyEvent, QKeySequence
 from PySide6.QtWidgets import (
+    QApplication,
     QFileDialog,
+    QHBoxLayout,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
+    QSizePolicy,
     QStackedWidget,
     QStatusBar,
     QTabWidget,
     QToolBar,
+    QVBoxLayout,
+    QWidget,
 )
 
 from pdf_workbench.core.settings import configure_qsettings
@@ -23,6 +31,7 @@ from pdf_workbench.services.pdf_renderer import PdfRenderService
 from pdf_workbench.ui.pdf_view import PdfView
 from pdf_workbench.ui.widgets.document_toolbar import DocumentToolbar, ToolbarState
 from pdf_workbench.ui.widgets.empty_state import EmptyState
+from pdf_workbench.ui.widgets.search_bar import SearchBar, SearchBarState
 
 logger = logging.getLogger(__name__)
 
@@ -39,13 +48,24 @@ class MainWindow(QMainWindow):
     _MAX_RECENT_FILES = 10
     _BASE_RENDER_SCALE = 1.5
 
-    def __init__(self, settings: QSettings | None = None) -> None:
+    def __init__(
+        self,
+        settings: QSettings | None = None,
+        *,
+        render_service: PdfRenderService | None = None,
+    ) -> None:
         super().__init__()
         self._settings = settings if settings is not None else configure_qsettings()
-        self._render_service = PdfRenderService(self)
+        self._render_service = (
+            render_service if render_service is not None else PdfRenderService(self)
+        )
         self._documents: list[DocumentTab] = []
         self._recent_files: list[Path] = self._load_recent_files()
+        self._build_sha = os.environ.get("PDF_WORKBENCH_BUILD_SHA", "").strip()
         self._toolbar_widget = DocumentToolbar(self)
+        self._search_bar = SearchBar(self)
+        self._main_toolbar: QToolBar | None = None
+        self._search_toolbar: QWidget | None = None
         self._empty_state = EmptyState(self)
 
         self.setObjectName("mainWindow")
@@ -66,7 +86,12 @@ class MainWindow(QMainWindow):
         self._stack.setObjectName("mainStack")
         self._stack.addWidget(self._empty_state)
         self._stack.addWidget(self._tabs)
-        self.setCentralWidget(self._stack)
+        self._central_container = QWidget(self)
+        self._central_container.setObjectName("centralContainer")
+        self._central_layout = QVBoxLayout(self._central_container)
+        self._central_layout.setContentsMargins(0, 0, 0, 0)
+        self._central_layout.setSpacing(0)
+        self.setCentralWidget(self._central_container)
         status_bar = QStatusBar(self)
         status_bar.setObjectName("mainStatusBar")
         self.setStatusBar(status_bar)
@@ -74,15 +99,27 @@ class MainWindow(QMainWindow):
         self._empty_state.open_requested.connect(self._choose_document)
         self._empty_state.recent_file_requested.connect(self.open_document)
         self._toolbar_widget.open_requested.connect(self._choose_document)
+        self._toolbar_widget.search_requested.connect(self.open_search_bar)
         self._toolbar_widget.previous_requested.connect(self._previous_page)
         self._toolbar_widget.next_requested.connect(self._next_page)
         self._toolbar_widget.rotate_requested.connect(self._rotate_page)
         self._toolbar_widget.page_requested.connect(self._set_page_from_toolbar)
         self._toolbar_widget.zoom_requested.connect(self._set_zoom_from_toolbar)
+        self._search_bar.search_requested.connect(self._search_text_changed)
+        self._search_bar.next_requested.connect(self._next_match)
+        self._search_bar.previous_requested.connect(self._previous_match)
+        self._search_bar.close_requested.connect(self._close_search)
+        app = QApplication.instance()
+        focus_changed = getattr(app, "focusChanged", None)
+        if focus_changed is not None:
+            focus_changed.connect(self._on_focus_changed)
+        if app is not None:
+            app.installEventFilter(self)
 
         self._create_actions()
         self._create_menu()
         self._create_toolbar()
+        self._create_search_bar()
         self._restore_window_state()
         self._refresh_recent_file_actions()
         self._update_window_title()
@@ -118,6 +155,42 @@ class MainWindow(QMainWindow):
         self.zoom_out_action.setShortcut(QKeySequence.StandardKey.ZoomOut)
         self.zoom_out_action.triggered.connect(lambda: self._change_zoom(1 / 1.2))
 
+        self.find_action = QAction("検索", self)
+        find_shortcuts = list(QKeySequence.keyBindings(QKeySequence.StandardKey.Find))
+        if not find_shortcuts:
+            fallback = "Meta+F" if sys.platform == "darwin" else "Ctrl+F"
+            find_shortcuts = [QKeySequence(fallback)]
+        self.find_action.setShortcuts(find_shortcuts)
+        self.find_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+        self.find_action.triggered.connect(self.open_search_bar)
+
+        self.find_next_action = QAction("次の検索結果", self)
+        self.find_next_action.setShortcut(QKeySequence("F3"))
+        self.find_next_action.triggered.connect(self._next_match)
+
+        self.find_previous_action = QAction("前の検索結果", self)
+        self.find_previous_action.setShortcut(QKeySequence("Shift+F3"))
+        self.find_previous_action.triggered.connect(self._previous_match)
+
+        self.copy_action = QAction("コピー", self)
+        self.copy_action.setShortcut(QKeySequence.StandardKey.Copy)
+        self.copy_action.triggered.connect(self._copy_selection)
+
+        for action in (
+            self.open_action,
+            self.close_action,
+            self.exit_action,
+            self.previous_action,
+            self.next_action,
+            self.zoom_in_action,
+            self.zoom_out_action,
+            self.find_action,
+            self.find_next_action,
+            self.find_previous_action,
+            self.copy_action,
+        ):
+            self.addAction(action)
+
     def _create_menu(self) -> None:
         file_menu = self.menuBar().addMenu("ファイル")
         file_menu.addAction(self.open_action)
@@ -133,14 +206,39 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self.zoom_in_action)
         view_menu.addAction(self.zoom_out_action)
 
+        edit_menu = self.menuBar().addMenu("編集")
+        edit_menu.addAction(self.find_action)
+        edit_menu.addAction(self.find_next_action)
+        edit_menu.addAction(self.find_previous_action)
+        edit_menu.addSeparator()
+        edit_menu.addAction(self.copy_action)
+
     def _create_toolbar(self) -> None:
         toolbar = QToolBar("メイン", self)
         toolbar.setObjectName("mainToolbar")
         toolbar.setMovable(False)
         toolbar.setFloatable(False)
         toolbar.setIconSize(QSize(18, 18))
+        toolbar.setAllowedAreas(Qt.ToolBarArea.TopToolBarArea)
         self.addToolBar(toolbar)
         toolbar.addWidget(self._toolbar_widget)
+        self._main_toolbar = toolbar
+
+    def _create_search_bar(self) -> None:
+        self._search_toolbar = QWidget(self._central_container)
+        self._search_toolbar.setObjectName("searchToolbar")
+        self._search_toolbar.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        layout = QHBoxLayout(self._search_toolbar)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(0)
+        layout.addWidget(self._search_bar)
+        self._central_layout.addWidget(self._search_toolbar)
+        self._central_layout.addWidget(self._stack, 1)
+        self._search_toolbar.hide()
+        self._search_toolbar.updateGeometry()
 
     def _choose_document(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(self, "PDFを開く", "", "PDF files (*.pdf)")
@@ -170,6 +268,8 @@ class MainWindow(QMainWindow):
             return
 
         view.state_changed.connect(self._update_status)
+        view.search_state_changed.connect(lambda: self._on_view_search_state_changed(view))
+        view.selection_changed.connect(self._update_actions)
         view.error_occurred.connect(lambda message: self.statusBar().showMessage(message, 5000))
         document = DocumentTab(session=session, view=view)
         self._documents.append(document)
@@ -254,6 +354,88 @@ class MainWindow(QMainWindow):
         self._sync_toolbar(document)
         self._update_status()
 
+    def open_search_bar(self) -> bool:
+        document = self._current_document()
+        if document is None:
+            return False
+        self.activateWindow()
+        self.raise_()
+        if self._search_toolbar is not None:
+            search_bar_height = max(
+                self._search_bar.sizeHint().height(),
+                self._search_bar.minimumSizeHint().height(),
+            )
+            self._search_toolbar.setMinimumHeight(search_bar_height)
+            self._search_toolbar.show()
+            self._search_toolbar.raise_()
+        self._search_bar.show()
+        self._search_bar.setMinimumHeight(
+            max(
+                self._search_bar.sizeHint().height(),
+                self._search_bar.minimumSizeHint().height(),
+            )
+        )
+        self._search_bar.cancel_pending_search()
+        self._search_bar.set_state(self._search_state_for(document))
+        self._search_bar.focus_search()
+        if self._search_toolbar is not None:
+            toolbar_layout = self._search_toolbar.layout()
+            if toolbar_layout is not None:
+                toolbar_layout.activate()
+            self._search_toolbar.adjustSize()
+            self._search_toolbar.updateGeometry()
+            self._central_layout.activate()
+            self._search_toolbar.adjustSize()
+        self._search_bar.adjustSize()
+        self._search_bar.search_input.adjustSize()
+        QApplication.processEvents()
+        return self._search_ui_is_ready()
+
+    def _prompt_search(self) -> None:
+        self.open_search_bar()
+
+    def _next_match(self) -> None:
+        document = self._current_document()
+        if document is None:
+            return
+        if not document.view.next_match():
+            self.statusBar().showMessage("検索結果がありません", 5000)
+
+    def _previous_match(self) -> None:
+        document = self._current_document()
+        if document is None:
+            return
+        if not document.view.previous_match():
+            self.statusBar().showMessage("検索結果がありません", 5000)
+
+    def _copy_selection(self) -> None:
+        focus_widget = QApplication.focusWidget()
+        if isinstance(focus_widget, QLineEdit) and focus_widget.hasSelectedText():
+            focus_widget.copy()
+            return
+        document = self._current_document()
+        if document is None:
+            return
+        if not document.view.copy_selected_text():
+            self.statusBar().showMessage("コピーするテキストが選択されていません", 5000)
+
+    def _search_text_changed(self, query: str) -> None:
+        document = self._current_document()
+        if document is None:
+            return
+        document.view.search(query)
+        self._sync_search_bar(document)
+
+    def _close_search(self) -> None:
+        document = self._current_document()
+        self._search_bar.cancel_pending_search()
+        if self._search_toolbar is not None:
+            self._search_toolbar.hide()
+        if document is None:
+            return
+        document.view.search("")
+        self._sync_search_bar(document)
+
     def _set_page_from_toolbar(self, page_index: int) -> None:
         document = self._current_document()
         if document is None:
@@ -330,23 +512,85 @@ class MainWindow(QMainWindow):
         return f"{document.session.source_path.name}{suffix}"
 
     def _update_window_title(self) -> None:
+        suffix = ""
+        if self._build_sha:
+            suffix = f" [{self._build_sha}]"
         document = self._current_document()
         if document is None:
-            self.setWindowTitle("PDF Workbench")
+            self.setWindowTitle(f"PDF Workbench{suffix}")
             return
-        self.setWindowTitle(f"{self._tab_title(document)} - PDF Workbench")
+        self.setWindowTitle(f"{self._tab_title(document)} - PDF Workbench{suffix}")
 
     def _update_actions(self) -> None:
         has_document = self._current_document() is not None
+        focus_widget = QApplication.focusWidget()
+        text_selected = False
+        if focus_widget is not None and hasattr(focus_widget, "hasSelectedText"):
+            try:
+                text_selected = bool(focus_widget.hasSelectedText())
+            except Exception:
+                text_selected = False
+        document = self._current_document()
+        document_selection = bool(document and document.view.selected_text)
         self.close_action.setEnabled(has_document)
         self.previous_action.setEnabled(has_document)
         self.next_action.setEnabled(has_document)
         self.zoom_in_action.setEnabled(has_document)
         self.zoom_out_action.setEnabled(has_document)
+        self.find_action.setEnabled(has_document)
+        self.find_next_action.setEnabled(has_document)
+        self.find_previous_action.setEnabled(has_document)
+        self.copy_action.setEnabled(text_selected or document_selection)
+        if not has_document and self._search_toolbar is not None:
+            self._search_bar.cancel_pending_search()
+            self._search_toolbar.hide()
 
     def _on_current_tab_changed(self, _index: int) -> None:
+        document = self._current_document()
+        if document is not None and self._is_search_open():
+            self._search_bar.cancel_pending_search()
+            self._sync_search_bar(document)
         self._update_window_title()
         self._update_actions()
+        self._update_status()
+
+    def _on_focus_changed(self, _old: QWidget | None, _new: QWidget | None) -> None:
+        self._update_actions()
+
+    @staticmethod
+    def _is_find_shortcut_event(event: QKeyEvent) -> bool:
+        if event.key() != Qt.Key.Key_F:
+            return False
+        expected_modifier = (
+            Qt.KeyboardModifier.MetaModifier
+            if sys.platform == "darwin"
+            else Qt.KeyboardModifier.ControlModifier
+        )
+        return bool(event.modifiers() & expected_modifier)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if (
+            isinstance(watched, QWidget)
+            and isinstance(event, QKeyEvent)
+            and event.type() in (QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress)
+            and self._is_find_shortcut_event(event)
+        ):
+            focus_widget = QApplication.focusWidget()
+            if (
+                focus_widget is not None
+                and focus_widget is not self._search_bar.search_input
+                and isinstance(focus_widget, QLineEdit)
+            ):
+                return super().eventFilter(watched, event)
+            if self._current_document() is not None and self.isAncestorOf(watched):
+                self.find_action.trigger()
+                return True
+        return super().eventFilter(watched, event)
+
+    def _on_view_search_state_changed(self, view: PdfView) -> None:
+        document = self._current_document()
+        if document is not None and document.view is view:
+            self._sync_search_bar(document)
         self._update_status()
 
     def _remember_recent_file(self, path: Path) -> None:
@@ -410,6 +654,88 @@ class MainWindow(QMainWindow):
                 zoom_factor=document.session.zoom_factor,
             )
         )
+        self._sync_search_bar(document)
+
+    def _sync_search_bar(self, document: DocumentTab) -> None:
+        state = document.view.search_state
+        if not self._is_search_open():
+            return
+        self._search_bar.set_state(
+            SearchBarState(
+                query=state.query,
+                current_index=state.current_index,
+                total_count=state.total_count,
+                progress_text=self._search_progress_text(state),
+            )
+        )
+
+    def _search_state_for(self, document: DocumentTab) -> SearchBarState:
+        state = document.view.search_state
+        return SearchBarState(
+            query=state.query,
+            current_index=state.current_index,
+            total_count=state.total_count,
+            progress_text=self._search_progress_text(state),
+        )
+
+    def _is_search_open(self) -> bool:
+        return self._search_toolbar is not None and self._search_toolbar.isVisible()
+
+    def _search_ui_is_ready(self) -> bool:
+        if self._search_toolbar is None:
+            return False
+        if not self._search_toolbar.isVisible():
+            return False
+        if not self._search_bar.isVisible():
+            return False
+        if not self._search_bar.search_input.isVisible():
+            return False
+        if (
+            self._search_toolbar.geometry().width() <= 0
+            or self._search_toolbar.geometry().height() <= 0
+        ):
+            return False
+        if self._search_bar.geometry().width() <= 0 or self._search_bar.geometry().height() <= 0:
+            return False
+        if (
+            self._search_bar.search_input.geometry().width() <= 0
+            or self._search_bar.search_input.geometry().height() <= 0
+        ):
+            return False
+        return self._search_toolbar.geometry().height() >= self._search_bar.geometry().height()
+
+    @staticmethod
+    def _search_progress_text(state: object) -> str:
+        from pdf_workbench.ui.pdf_view import PdfSearchState
+
+        if not isinstance(state, PdfSearchState):
+            raise TypeError("state must be PdfSearchState")
+        if not state.indexing_completed:
+            text = f"索引作成中 {state.indexed_pages} / {state.total_pages}"
+            if state.failed_pages:
+                text += f"\uff08{state.failed_pages}ページ失敗\uff09"
+            return text
+        if state.text_pages_with_content == 0 and state.total_pages > 0:
+            if state.image_only_pages == state.total_pages:
+                text = "OCRが必要な画像PDF"
+            else:
+                text = "テキストレイヤーがありません"
+            if state.failed_pages:
+                text += f"\uff08{state.failed_pages}ページ失敗\uff09"
+            return text
+        if state.total_count == 0 and state.query:
+            text = "検索結果 0 件"
+            if state.failed_pages:
+                text += f"\uff08{state.failed_pages}ページ失敗\uff09"
+            return text
+        if state.failed_pages:
+            return f"索引完了\uff08{state.failed_pages}ページ失敗\uff09"
+        if state.query:
+            return f"検索結果 {state.total_count} 件"
+        text = "索引完了"
+        if state.failed_pages:
+            text += f"\uff08{state.failed_pages}ページ失敗\uff09"
+        return text
 
     def _report_error(self, title: str, message: str) -> None:
         self.statusBar().showMessage(message, 5000)

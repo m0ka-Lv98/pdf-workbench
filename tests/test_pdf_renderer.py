@@ -11,11 +11,13 @@ from pdf_workbench.services.page_coordinates import PageMetadata
 from pdf_workbench.services.pdf_renderer import (
     DocumentMetadata,
     DocumentRevision,
+    PageTextIndex,
     PdfiumDocumentBackend,
     PdfRenderWorker,
     RenderCacheKey,
     RenderImageCache,
     RenderRequest,
+    TextCharacterBox,
 )
 
 
@@ -33,6 +35,52 @@ def make_revision(
     path = tmp_path / name
     path.write_bytes(content)
     return DocumentRevision.from_path(path)
+
+
+def create_text_pdf(path: Path, pages: list[str]) -> Path:
+    objects: list[bytes] = [
+        b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n",
+        f"2 0 obj << /Type /Pages /Count {len(pages)} /Kids [".encode("ascii"),
+    ]
+    page_object_numbers = [3 + index * 2 for index in range(len(pages))]
+    content_object_numbers = [4 + index * 2 for index in range(len(pages))]
+    objects[1] += b" ".join(f"{number} 0 R".encode("ascii") for number in page_object_numbers)
+    objects[1] += b"] >> endobj\n"
+    for page_number, content_number, text in zip(
+        page_object_numbers,
+        content_object_numbers,
+        pages,
+        strict=True,
+    ):
+        content = f"BT /F1 18 Tf 40 100 Td ({text}) Tj ET".encode("latin-1")
+        objects.append(
+            f"{page_number} 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] "
+            f"/Resources << /Font << /F1 100 0 R >> >> /Contents {content_number} 0 R "
+            f">> endobj\n".encode("ascii")
+        )
+        objects.append(
+            f"{content_number} 0 obj << /Length {len(content)} >> stream\n".encode("ascii")
+            + content
+            + b"\nendstream\nendobj\n"
+        )
+    objects.append(b"100 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n")
+    pdf = bytearray(b"%PDF-1.4\n")
+    offsets = [0]
+    for obj in objects:
+        offsets.append(len(pdf))
+        pdf.extend(obj)
+    xref_start = len(pdf)
+    pdf.extend(f"xref\n0 {len(offsets)}\n".encode("ascii"))
+    pdf.extend(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        pdf.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
+    pdf.extend(
+        (
+            f"trailer << /Size {len(offsets)} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n"
+        ).encode("ascii")
+    )
+    path.write_bytes(pdf)
+    return path
 
 
 class FakeBackend:
@@ -58,6 +106,20 @@ class FakeBackend:
         image = make_image()
         image.setDevicePixelRatio(device_pixel_ratio)
         return image
+
+    def extract_text_page(self, page_index: int, revision: DocumentRevision) -> PageTextIndex:
+        return PageTextIndex(
+            revision=revision,
+            page_index=page_index,
+            text=f"page {page_index}",
+            characters=(
+                TextCharacterBox(
+                    pdfium_index=0,
+                    text="p",
+                    box=PageMetadata.from_size(10, 10).geometry.visible_box,
+                ),
+            ),
+        )
 
     def close(self) -> None:
         self.closed = True
@@ -182,6 +244,26 @@ def test_pdfium_backend_sets_device_pixel_ratio(tmp_path: Path) -> None:
     assert metadata.pages[0].geometry.visible_box.height > 0
 
 
+def test_pdfium_backend_extracts_text_and_character_boxes(tmp_path: Path) -> None:
+    pdf_path = create_text_pdf(tmp_path / "text.pdf", ["Hello world"])
+
+    backend = PdfiumDocumentBackend(pdf_path)
+    try:
+        page_text = backend.extract_text_page(
+            0,
+            DocumentRevision.from_path(pdf_path),
+        )
+    finally:
+        backend.close()
+
+    assert page_text.page_index == 0
+    assert "Hello world" in page_text.text
+    assert page_text.characters
+    assert page_text.characters[0].text.strip() == "H"
+    assert page_text.characters[0].box.width > 0
+    assert page_text.characters[0].box.height > 0
+
+
 @pytest.mark.parametrize(
     ("logical_zoom", "device_pixel_ratio", "rotation"),
     [
@@ -251,6 +333,25 @@ def test_render_worker_closes_only_target_document_and_keeps_others(tmp_path: Pa
     worker._process_next()
 
     assert backends["b"].render_calls == [0]
+
+
+def test_render_worker_indexes_text_pages_in_background(tmp_path: Path) -> None:
+    cache = RenderImageCache(max_bytes=1024 * 1024)
+    backend = FakeBackend("sample")
+    worker = PdfRenderWorker(lambda _path: backend, cache)
+    revision = make_revision(tmp_path)
+    path = tmp_path / "sample.pdf"
+    text_pages: list[PageTextIndex] = []
+    worker.text_page_indexed.connect(
+        lambda _document_id, _revision, page_text: text_pages.append(page_text)
+    )
+
+    worker.open_document("doc-1", path, 1, revision)
+    worker._process_next()
+
+    assert backend.render_calls == []
+    assert len(worker._pending_text_requests) == 1
+    assert text_pages and text_pages[0].page_index == 0
 
 
 def test_service_shutdown_returns_bool(qtbot: QtBot) -> None:
