@@ -837,7 +837,7 @@ class MainWindow(QMainWindow):
             return
         inset = 24
         if self._is_search_open():
-            inset += self._search_row_height + 8
+            inset += self._search_row_height + 12
         document.view.set_search_overlay_inset(inset)
 
     def _on_status_message_changed(self, message: str) -> None:
