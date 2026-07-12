@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass
 from io import BufferedRandom
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 from pdf_workbench.core.app_paths import ensure_app_directories
@@ -39,14 +40,10 @@ class SessionWorkspaceLease:
             return
         try:
             if os.name == "nt":
-                import msvcrt
-
                 self.handle.seek(0)
-                msvcrt.locking(self.handle.fileno(), msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]
+                _unlock_windows_handle(self.handle)
             else:
-                import fcntl
-
-                fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
+                _unlock_posix_handle(self.handle)
         finally:
             self.handle.close()
             self.released = True
@@ -152,18 +149,14 @@ class SessionWorkspaceManager:
             lock_path.touch(exist_ok=True)
             handle = lock_path.open("a+b")
             if os.name == "nt":
-                import msvcrt
-
                 handle.seek(0)
                 if lock_path.stat().st_size == 0:
                     handle.write(b"0")
                     handle.flush()
                 handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
+                _lock_windows_handle(handle)
             else:
-                import fcntl
-
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                _lock_posix_handle(handle)
         except OSError as exc:
             if "handle" in locals():
                 handle.close()
@@ -221,3 +214,31 @@ class SessionWorkspaceManager:
                     logger.exception("Failed to remove session workspace: %s", resolved_directory)
                     return
                 time.sleep(self._cleanup_delay_seconds)
+
+
+def _lock_windows_handle(handle: BufferedRandom) -> None:
+    import msvcrt
+
+    msvcrt_module: Any = msvcrt
+    msvcrt_module.locking(handle.fileno(), msvcrt_module.LK_NBLCK, 1)
+
+
+def _unlock_windows_handle(handle: BufferedRandom) -> None:
+    import msvcrt
+
+    msvcrt_module: Any = msvcrt
+    msvcrt_module.locking(handle.fileno(), msvcrt_module.LK_UNLCK, 1)
+
+
+def _lock_posix_handle(handle: BufferedRandom) -> None:
+    import fcntl
+
+    fcntl_module: Any = fcntl
+    fcntl_module.flock(handle.fileno(), fcntl_module.LOCK_EX | fcntl_module.LOCK_NB)
+
+
+def _unlock_posix_handle(handle: BufferedRandom) -> None:
+    import fcntl
+
+    fcntl_module: Any = fcntl
+    fcntl_module.flock(handle.fileno(), fcntl_module.LOCK_UN)
