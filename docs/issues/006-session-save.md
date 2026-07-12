@@ -11,7 +11,7 @@ Prevent source-file corruption and provide a reliable edit lifecycle.
 - [x] Working-copy management
 - [x] Atomic save-as
 - [x] Reopen validation after save
-- [ ] Recovery metadata for interrupted sessions
+- [x] Recovery metadata for interrupted sessions
 - [ ] File-change detection when another process modifies the source
 
 ## Acceptance criteria

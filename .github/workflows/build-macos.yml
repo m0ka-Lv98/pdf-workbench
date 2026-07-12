@@ -72,6 +72,7 @@ jobs:
           command = [
               "dist/PDF Workbench.app/Contents/MacOS/PDF Workbench",
               os.path.join(os.getcwd(), "tests/fixtures/real-search-english.pdf"),
+              "--skip-recovery-prompt",
               "--window-size",
               "1100x800",
               "--color-scheme",
@@ -136,6 +137,7 @@ jobs:
             local stem="$1"
             shift
             python -m pdf_workbench "$@" \
+              --skip-recovery-prompt \
               --screenshot-path "$review_dir/$stem.png" \
               --ui-state-path "$review_dir/$stem.json" \
               --quit-after-ms 1800
