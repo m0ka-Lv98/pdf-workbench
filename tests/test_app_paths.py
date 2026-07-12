@@ -15,6 +15,7 @@ def test_configure_logging_writes_to_user_log_dir(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    monkeypatch.setattr(app_paths, "user_cache_dir", lambda *_args: str(tmp_path / "cache"))
     monkeypatch.setattr(app_paths, "user_config_dir", lambda *_args: str(tmp_path / "config"))
     monkeypatch.setattr(app_paths, "user_log_dir", lambda *_args: str(tmp_path / "logs"))
 
@@ -29,6 +30,7 @@ def test_configure_qsettings_uses_user_config_dir(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    monkeypatch.setattr(app_paths, "user_cache_dir", lambda *_args: str(tmp_path / "cache"))
     monkeypatch.setattr(app_paths, "user_config_dir", lambda *_args: str(tmp_path / "config"))
     monkeypatch.setattr(app_paths, "user_log_dir", lambda *_args: str(tmp_path / "logs"))
 
