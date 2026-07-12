@@ -182,6 +182,21 @@ jobs:
             --color-scheme light \
             --open-search \
             --search-query Alpha
+
+          capture_recovery_dialog() {
+            local stem="$1"
+            local size="$2"
+            local scheme="$3"
+            python scripts/capture_recovery_dialog.py \
+              --window-size "$size" \
+              --color-scheme "$scheme" \
+              --output-png "$review_dir/$stem.png" \
+              --output-json "$review_dir/$stem.json"
+          }
+
+          capture_recovery_dialog "light-recovery-dialog-1100x800" "1100x800" "light"
+          capture_recovery_dialog "dark-recovery-dialog-1100x800" "1100x800" "dark"
+          capture_recovery_dialog "light-recovery-dialog-800x600" "800x600" "light"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -201,6 +216,12 @@ jobs:
             ui-review/light-document-800x600.json
             ui-review/light-search-800x600.png
             ui-review/light-search-800x600.json
+            ui-review/light-recovery-dialog-1100x800.png
+            ui-review/light-recovery-dialog-1100x800.json
+            ui-review/dark-recovery-dialog-1100x800.png
+            ui-review/dark-recovery-dialog-1100x800.json
+            ui-review/light-recovery-dialog-800x600.png
+            ui-review/light-recovery-dialog-800x600.json
           if-no-files-found: error
       - name: Verify UI review screenshots
         shell: bash
@@ -222,6 +243,9 @@ jobs:
               "dark-search-1100x800": [1100, 800],
               "light-document-800x600": [800, 600],
               "light-search-800x600": [800, 600],
+              "light-recovery-dialog-1100x800": [1100, 800],
+              "dark-recovery-dialog-1100x800": [1100, 800],
+              "light-recovery-dialog-800x600": [800, 600],
           }
 
           def center_y(rect: list[int]) -> int:
@@ -358,6 +382,29 @@ jobs:
               compact_search["search_surface_window_geometry"],
               compact_search["search_input_surface_geometry"],
           )
+
+          for stem in (
+              "light-recovery-dialog-1100x800",
+              "dark-recovery-dialog-1100x800",
+              "light-recovery-dialog-800x600",
+          ):
+              payload = payloads[stem]
+              assert payload["candidate_count"] == 3
+              assert payload["recoverable_count"] == 1
+              assert payload["discardable_count"] == 2
+              assert payload["recover_enabled"] is False
+              assert payload["discard_enabled"] is True
+              assert payload["later_visible"] is True
+              assert payload["fits_in_screen"] is True
+              assert payload["tree_geometry"][2] > 0 and payload["tree_geometry"][3] > 0
+              assert (
+                  payload["button_row_geometry"][2] > 0
+                  and payload["button_row_geometry"][3] > 0
+              )
+
+          compact_recovery = payloads["light-recovery-dialog-800x600"]
+          assert compact_recovery["dialog_geometry"][2] <= 800
+          assert compact_recovery["dialog_geometry"][3] <= 600
 
           assert_edge_has_accent(
               "light-search-1100x800",

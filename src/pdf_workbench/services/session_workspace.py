@@ -33,6 +33,7 @@ class SessionWorkspaceLease:
     session_id: str
     lock_path: Path
     handle: BufferedRandom
+    owned_by_manager: bool = False
     released: bool = False
 
     def release(self) -> None:
@@ -100,6 +101,7 @@ class SessionWorkspaceManager:
             working_copy_path,
         )
 
+        lease: SessionWorkspaceLease | None = None
         try:
             workspace_directory.mkdir(parents=True, exist_ok=False)
             shutil.copy2(resolved_source, working_copy_path)
@@ -115,8 +117,19 @@ class SessionWorkspaceManager:
                 session_id=session_id,
             )
             self.adopt_session_lock(session_id, lease)
+            lease = None
             return session
         except Exception as exc:
+            local_lease = lease
+            if local_lease is not None and not local_lease.released:
+                try:
+                    local_lease.release()
+                except OSError as release_error:
+                    logger.warning(
+                        "Failed to release unattached workspace lease: session_id=%s (%s)",
+                        session_id,
+                        release_error,
+                    )
             self._cleanup_workspace_directory(workspace_directory)
             if isinstance(exc, WorkspaceCreationError):
                 raise
@@ -172,9 +185,12 @@ class SessionWorkspaceManager:
         )
 
     def adopt_session_lock(self, session_id: str, lease: SessionWorkspaceLease) -> None:
+        if lease.released:
+            raise WorkspaceLockError("release済みのセッションロックは採用できません")
         previous = self._active_leases.pop(session_id, None)
         if previous is not None:
             previous.release()
+        lease.owned_by_manager = True
         self._active_leases[session_id] = lease
 
     def release_session_lock(self, session_id: str) -> None:
@@ -185,6 +201,8 @@ class SessionWorkspaceManager:
             lease.release()
         except OSError as exc:
             logger.warning("Failed to release workspace lock: session_id=%s (%s)", session_id, exc)
+        finally:
+            lease.owned_by_manager = False
 
     def release_all_locks(self) -> None:
         for session_id in list(self._active_leases):

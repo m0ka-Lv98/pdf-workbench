@@ -42,7 +42,7 @@ from pdf_workbench.services.pdf_renderer import (
 from pdf_workbench.services.pdf_save_service import PdfSaveError, PdfSaveService, SaveResult
 from pdf_workbench.services.session_recovery import RecoveryMetadataError, SessionRecoveryService
 from pdf_workbench.services.session_workspace import SessionWorkspaceManager
-from pdf_workbench.ui.main_window import DocumentTab, MainWindow
+from pdf_workbench.ui.main_window import DocumentTab, MainWindow, RestoreSessionResult
 from pdf_workbench.ui.pdf_view import PdfView
 from pdf_workbench.ui.widgets.search_bar import SearchBar, SearchInputSurface
 
@@ -1081,6 +1081,37 @@ def test_main_window_avoids_duplicate_tabs_for_same_document(
     assert window._recent_files == [document_path.resolve()]
 
 
+def test_main_window_restore_session_releases_duplicate_recovery_lock(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    settings = create_settings(tmp_path)
+    workspace_manager = create_workspace_manager(tmp_path)
+    render_service = PdfRenderService()
+    window = MainWindow(
+        settings,
+        render_service=render_service,
+        workspace_manager=workspace_manager,
+        save_service=PdfSaveService(),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = create_blank_pdf(tmp_path / "duplicate-recovery.pdf", 1)
+    window.open_document(document_path)
+    qtbot.waitUntil(lambda: window._tabs.count() == 1)
+
+    duplicate_session = workspace_manager.create_session(document_path)
+
+    result = window.restore_session(duplicate_session)
+
+    assert result is RestoreSessionResult.DUPLICATE
+    assert window._tabs.count() == 1
+    assert duplicate_session.session_id not in workspace_manager._active_leases
+    assert duplicate_session.workspace_directory.exists()
+    assert render_service.shutdown() is True
+
+
 def test_main_window_drops_missing_recent_files_from_menu(
     monkeypatch: pytest.MonkeyPatch,
     qtbot: QtBot,
@@ -1140,6 +1171,63 @@ def test_main_window_search_toolbar_starts_hidden(
     assert window._search_toolbar.isHidden()
     assert window.find_action.isEnabled() is False
     assert window._toolbar_widget.search_button.isEnabled() is False
+
+
+def test_main_window_restores_page_after_async_document_load(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    settings = create_settings(tmp_path)
+    workspace_manager = create_workspace_manager(tmp_path)
+    render_service = PdfRenderService()
+    window = MainWindow(
+        settings,
+        render_service=render_service,
+        workspace_manager=workspace_manager,
+        save_service=PdfSaveService(),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = create_blank_pdf(tmp_path / "restore-page.pdf", 3)
+    session = workspace_manager.create_session(document_path)
+    session.set_navigation_state(page_index=2, zoom_factor=1.25)
+
+    result = window.restore_session(session)
+
+    assert result is RestoreSessionResult.ATTACHED
+    qtbot.waitUntil(lambda: window._documents[0].view.page_count == 3)
+    qtbot.waitUntil(lambda: window._documents[0].view.page_index == 2)
+    assert window._documents[0].session.current_page_index == 2
+    assert window._documents[0].session.zoom_factor == pytest.approx(1.25)
+
+
+def test_main_window_clamps_restored_page_after_async_document_load(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    settings = create_settings(tmp_path)
+    workspace_manager = create_workspace_manager(tmp_path)
+    render_service = PdfRenderService()
+    window = MainWindow(
+        settings,
+        render_service=render_service,
+        workspace_manager=workspace_manager,
+        save_service=PdfSaveService(),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = create_blank_pdf(tmp_path / "restore-clamp.pdf", 3)
+    session = workspace_manager.create_session(document_path)
+    session.set_navigation_state(page_index=8, zoom_factor=1.0)
+
+    result = window.restore_session(session)
+
+    assert result is RestoreSessionResult.ATTACHED
+    qtbot.waitUntil(lambda: window._documents[0].view.page_count == 3)
+    qtbot.waitUntil(lambda: window._documents[0].view.page_index == 2)
+    assert window._documents[0].session.current_page_index == 2
 
 
 def test_main_window_toolbar_search_button_opens_search_ui(

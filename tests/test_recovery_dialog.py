@@ -5,6 +5,7 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QMessageBox
 from pytestqt.qtbot import QtBot
 
 from pdf_workbench.domain.document_session import FileFingerprint, SourceStatus
@@ -21,6 +22,7 @@ def make_candidate(
     *,
     name: str,
     recoverable: bool,
+    discardable: bool | None = None,
     source_status: SourceStatus = SourceStatus.UNCHANGED,
 ) -> RecoveryCandidate:
     workspace_directory = tmp_path / name
@@ -48,6 +50,7 @@ def make_candidate(
             RecoveryValidationStatus.VALID if recoverable else RecoveryValidationStatus.INVALID
         ),
         recoverable=recoverable,
+        discardable=recoverable if discardable is None else discardable,
         error_message=None if recoverable else "metadataが破損しています",
         working_copy_size_bytes=1024,
     )
@@ -72,6 +75,7 @@ def test_recovery_dialog_recovers_only_checked_recoverable_candidates(
         tmp_path,
         name="b" * 32,
         recoverable=False,
+        discardable=True,
         source_status=SourceStatus.UNREADABLE,
     )
     dialog = RecoveryDialog([valid_candidate, invalid_candidate])
@@ -81,9 +85,73 @@ def test_recovery_dialog_recovers_only_checked_recoverable_candidates(
     first_item = dialog._tree.topLevelItem(0)
     second_item = dialog._tree.topLevelItem(1)
     first_item.setCheckState(0, Qt.CheckState.Checked)
-    assert not second_item.flags() & Qt.ItemFlag.ItemIsUserCheckable
+    assert second_item.flags() & Qt.ItemFlag.ItemIsUserCheckable
 
     QTest.mouseClick(dialog._recover_button, Qt.MouseButton.LeftButton)
 
     assert dialog.result_value.action is RecoveryDialogAction.RECOVER
     assert dialog.result_value.candidates == [valid_candidate]
+
+
+def test_recovery_dialog_allows_discard_for_invalid_discardable_candidate(
+    qtbot: QtBot,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    candidate = make_candidate(
+        tmp_path,
+        name="c" * 32,
+        recoverable=False,
+        discardable=True,
+    )
+    dialog = RecoveryDialog([candidate])
+    qtbot.addWidget(dialog)
+    dialog.show()
+
+    item = dialog._tree.topLevelItem(0)
+    assert item.flags() & Qt.ItemFlag.ItemIsUserCheckable
+    item.setCheckState(0, Qt.CheckState.Checked)
+    assert dialog._recover_button.isEnabled() is False
+    assert dialog._discard_button.isEnabled() is True
+
+    monkeypatch.setattr(
+        "pdf_workbench.ui.dialogs.recovery_dialog.QMessageBox.question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
+    )
+    QTest.mouseClick(dialog._discard_button, Qt.MouseButton.LeftButton)
+
+    assert dialog.result_value.action is RecoveryDialogAction.DISCARD
+    assert dialog.result_value.candidates == [candidate]
+
+
+def test_recovery_dialog_disables_unsafe_invalid_candidate(qtbot: QtBot, tmp_path: Path) -> None:
+    candidate = make_candidate(
+        tmp_path,
+        name="d" * 32,
+        recoverable=False,
+        discardable=False,
+    )
+    dialog = RecoveryDialog([candidate])
+    qtbot.addWidget(dialog)
+    dialog.show()
+
+    item = dialog._tree.topLevelItem(0)
+    assert not item.flags() & Qt.ItemFlag.ItemIsUserCheckable
+    assert dialog._recover_button.isEnabled() is False
+    assert dialog._discard_button.isEnabled() is False
+
+
+def test_recovery_dialog_fits_within_800x600(qtbot: QtBot, tmp_path: Path) -> None:
+    dialog = RecoveryDialog([make_candidate(tmp_path, name="e" * 32, recoverable=True)])
+    qtbot.addWidget(dialog)
+    dialog.resize(800, 600)
+    dialog.show()
+    qtbot.waitUntil(dialog.isVisible)
+
+    assert dialog.width() <= 800
+    assert dialog.height() <= 600
+    assert dialog._tree.geometry().width() > 0
+    assert dialog._tree.geometry().height() > 0
+    assert dialog._button_row_widget is not None
+    assert dialog._button_row_widget.geometry().width() > 0
+    assert dialog._button_row_widget.geometry().height() > 0

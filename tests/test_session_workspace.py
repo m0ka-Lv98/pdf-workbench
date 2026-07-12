@@ -84,3 +84,42 @@ def test_workspace_manager_detects_managed_paths_safely(tmp_path: Path) -> None:
 
     assert manager.contains_managed_path(managed_file) is True
     assert manager.contains_managed_path(external_file) is False
+
+
+def test_workspace_manager_releases_unadopted_lease_on_document_session_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source_path = create_blank_pdf(tmp_path / "source.pdf", 1)
+    manager = SessionWorkspaceManager(tmp_path / "sessions")
+
+    def fail_post_init(self) -> None:
+        raise ValueError("constructor failure")
+
+    monkeypatch.setattr(
+        "pdf_workbench.domain.document_session.DocumentSession.__post_init__",
+        fail_post_init,
+    )
+
+    with pytest.raises(WorkspaceCreationError, match="作業コピー"):
+        manager.create_session(source_path)
+
+    assert list(manager.sessions_root.iterdir()) == []
+
+
+def test_workspace_manager_releases_unadopted_lease_on_adopt_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source_path = create_blank_pdf(tmp_path / "source.pdf", 1)
+    manager = SessionWorkspaceManager(tmp_path / "sessions")
+
+    def fail_adopt(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("adopt failure")
+
+    monkeypatch.setattr(manager, "adopt_session_lock", fail_adopt)
+
+    with pytest.raises(WorkspaceCreationError, match="作業コピー"):
+        manager.create_session(source_path)
+
+    assert list(manager.sessions_root.iterdir()) == []

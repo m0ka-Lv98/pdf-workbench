@@ -6,6 +6,7 @@ from enum import StrEnum
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QApplication,
     QDialog,
     QHBoxLayout,
     QLabel,
@@ -41,9 +42,19 @@ class RecoveryDialog(QDialog):
         super().__init__(parent)
         self.setObjectName("recoveryDialog")
         self.setWindowTitle("中断されたセッションを復旧")
-        self.resize(920, 520)
         self._candidates = candidates
         self._result = RecoveryDialogResult(RecoveryDialogAction.LATER, [])
+        self._button_row_widget: QWidget | None = None
+
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            width = min(920, max(640, available.width() - 80))
+            height = min(520, max(420, available.height() - 80))
+            self.resize(width, height)
+        else:
+            self.resize(800, 520)
+        self.setMinimumSize(640, 420)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
@@ -77,10 +88,11 @@ class RecoveryDialog(QDialog):
         for index, candidate in enumerate(candidates):
             item = QTreeWidgetItem(self._tree)
             item.setData(0, Qt.ItemDataRole.UserRole, index)
-            item.setFlags(
-                item.flags() | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled
-            )
-            item.setCheckState(0, Qt.CheckState.Unchecked)
+            selectable = candidate.recoverable or candidate.discardable
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEnabled)
+            if selectable:
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(0, Qt.CheckState.Unchecked)
             item.setText(1, candidate.metadata.source_path.name)
             source_path_text = str(candidate.metadata.source_path)
             item.setText(2, source_path_text)
@@ -89,13 +101,19 @@ class RecoveryDialog(QDialog):
             item.setText(4, self._status_text(candidate))
             item.setToolTip(4, candidate.error_message or self._status_text(candidate))
             item.setText(5, self._format_size(candidate.working_copy_size_bytes))
-            if not candidate.recoverable:
+            if not selectable:
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
                 item.setText(0, "不可")
-            else:
+            elif candidate.recoverable:
                 item.setText(0, "選択")
+            else:
+                item.setText(0, "破棄")
 
         button_row = QHBoxLayout()
+        button_row_widget = QWidget(self)
+        button_row_widget.setObjectName("recoveryDialogButtons")
+        button_row_widget.setLayout(button_row)
+        self._button_row_widget = button_row_widget
         button_row.addStretch(1)
         self._recover_button = QPushButton("選択項目を復元", self)
         self._discard_button = QPushButton("選択項目を破棄", self)
@@ -111,7 +129,7 @@ class RecoveryDialog(QDialog):
         layout.addWidget(title)
         layout.addWidget(description)
         layout.addWidget(self._tree, 1)
-        layout.addLayout(button_row)
+        layout.addWidget(button_row_widget)
         self._update_button_state()
 
     @property
@@ -137,7 +155,7 @@ class RecoveryDialog(QDialog):
 
     def _update_button_state(self) -> None:
         selected = self._selected_candidates()
-        self._discard_button.setEnabled(bool(selected))
+        self._discard_button.setEnabled(any(candidate.discardable for candidate in selected))
         self._recover_button.setEnabled(any(candidate.recoverable for candidate in selected))
 
     def _recover_selected(self) -> None:
@@ -148,7 +166,7 @@ class RecoveryDialog(QDialog):
         self.accept()
 
     def _discard_selected(self) -> None:
-        selected = self._selected_candidates()
+        selected = [candidate for candidate in self._selected_candidates() if candidate.discardable]
         if not selected:
             return
         result = QMessageBox.question(
@@ -170,7 +188,9 @@ class RecoveryDialog(QDialog):
     @staticmethod
     def _status_text(candidate: RecoveryCandidate) -> str:
         if not candidate.recoverable:
-            return candidate.error_message or "復元不可"
+            if candidate.discardable:
+                return candidate.error_message or "復元不可・破棄可能"
+            return candidate.error_message or "安全のため自動削除できません"
         status_parts: list[str] = []
         if candidate.metadata.is_modified:
             status_parts.append("未保存の変更あり")

@@ -10,6 +10,7 @@ from pdf_workbench.__main__ import (
     build_parser,
 )
 from pdf_workbench.ui.dialogs.recovery_dialog import RecoveryDialogAction, RecoveryDialogResult
+from pdf_workbench.ui.main_window import RestoreSessionResult
 
 
 class FakeWindow:
@@ -21,14 +22,19 @@ class FakeWindow:
     def open_document(self, path: Path) -> None:
         self.opened.append(path)
 
-    def restore_session(self, session: object) -> bool:
+    def restore_session(self, session: object) -> RestoreSessionResult:
         self.restored.append(session)
-        return True
+        return RestoreSessionResult.ATTACHED
 
 
 class FakeCandidate:
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, *, source_path: Path | None = None) -> None:
         self.workspace_directory = Path(f"/tmp/{name}")
+        self.metadata = type(
+            "Metadata",
+            (),
+            {"source_path": source_path or Path(f"/tmp/{name}.pdf")},
+        )()
 
 
 class FakeRecoveryDialog:
@@ -130,6 +136,52 @@ def test_handle_startup_recovery_recovers_selected_and_releases_others(monkeypat
     assert released == [second]
 
 
+def test_handle_startup_recovery_keeps_second_duplicate_candidate(monkeypatch) -> None:
+    source_path = Path("/tmp/shared.pdf")
+    first = FakeCandidate("first", source_path=source_path)
+    second = FakeCandidate("second", source_path=source_path)
+    released: list[FakeCandidate] = []
+    restored: list[FakeCandidate] = []
+    messages: list[str] = []
+    window = FakeWindow()
+
+    class FakeRecoveryService:
+        def scan_candidates(self):
+            class Result:
+                def __init__(self) -> None:
+                    self.candidates = [first, second]
+
+            return Result()
+
+        def release_candidate(self, candidate: FakeCandidate) -> None:
+            released.append(candidate)
+
+    monkeypatch.setattr("pdf_workbench.__main__.RecoveryDialog", FakeRecoveryDialog)
+    monkeypatch.setattr(
+        "pdf_workbench.__main__._restore_candidate",
+        lambda _window, _service, candidate: (
+            restored.append(candidate),
+            RestoreSessionResult.ATTACHED,
+        )[1],
+    )
+    monkeypatch.setattr(
+        "pdf_workbench.__main__.QMessageBox.information",
+        lambda _parent, _title, message: messages.append(message),
+    )
+    FakeRecoveryDialog.next_result = RecoveryDialogResult(
+        RecoveryDialogAction.RECOVER,
+        [first, second],
+    )
+
+    _handle_startup_recovery(window, FakeRecoveryService())  # type: ignore[arg-type]
+
+    assert restored == [first]
+    assert released == [second]
+    assert messages == [
+        "同じ元ファイルの復旧セッションが既に開かれているため、この候補は後で復旧できるよう保持しました。"
+    ]
+
+
 def test_restore_candidate_passes_restored_session_to_window(monkeypatch) -> None:
     candidate = FakeCandidate("restore")
     session = object()
@@ -144,8 +196,9 @@ def test_restore_candidate_passes_restored_session_to_window(monkeypatch) -> Non
 
     monkeypatch.setattr("pdf_workbench.__main__.QMessageBox.critical", lambda *args, **kwargs: 0)
 
-    _restore_candidate(window, FakeRecoveryService(), candidate)  # type: ignore[arg-type]
+    result = _restore_candidate(window, FakeRecoveryService(), candidate)  # type: ignore[arg-type]
 
+    assert result is RestoreSessionResult.ATTACHED
     assert window.restored == [session]
 
 
@@ -167,8 +220,9 @@ def test_restore_candidate_releases_candidate_and_reports_error(monkeypatch) -> 
         lambda _parent, _title, message: reported.append(message),
     )
 
-    _restore_candidate(window, FakeRecoveryService(), candidate)  # type: ignore[arg-type]
+    result = _restore_candidate(window, FakeRecoveryService(), candidate)  # type: ignore[arg-type]
 
+    assert result is RestoreSessionResult.FAILED
     assert released == [candidate]
     assert reported == ["boom"]
 

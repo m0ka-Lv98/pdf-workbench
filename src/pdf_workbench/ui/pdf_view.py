@@ -375,6 +375,7 @@ class PdfView(QWidget):
     error_occurred = Signal(str)
     search_state_changed = Signal()
     selection_changed = Signal()
+    document_loaded = Signal()
 
     def __init__(
         self,
@@ -646,6 +647,7 @@ class PdfView(QWidget):
         self._content.adjustSize()
         self._schedule_visible_page_update()
         self._refresh_page_overlays()
+        self.document_loaded.emit()
         self.state_changed.emit()
 
     def _on_document_failed(self, document_id: object, generation: int, message: str) -> None:

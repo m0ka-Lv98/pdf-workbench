@@ -5,6 +5,7 @@ import logging
 import os
 import sys
 from dataclasses import dataclass
+from enum import StrEnum
 from functools import partial
 from pathlib import Path
 
@@ -61,6 +62,12 @@ logger = logging.getLogger(__name__)
 class DocumentTab:
     session: DocumentSession
     view: PdfView
+
+
+class RestoreSessionResult(StrEnum):
+    ATTACHED = "attached"
+    DUPLICATE = "duplicate"
+    FAILED = "failed"
 
 
 class MainWindow(QMainWindow):
@@ -375,11 +382,16 @@ class MainWindow(QMainWindow):
             self._report_error("PDFを開けません", str(exc))
             return
 
-    def restore_session(self, session: DocumentSession) -> bool:
+    def restore_session(self, session: DocumentSession) -> RestoreSessionResult:
         existing_index = self._find_document_index(session.source_path)
         if existing_index is not None:
             self._tabs.setCurrentIndex(existing_index)
-            return True
+            self._workspace_manager.release_session_lock(session.session_id)
+            self._set_status_message(
+                "同じ元ファイルの復旧候補は保持したまま、既存タブを表示しました。",
+                timeout_ms=4000,
+            )
+            return RestoreSessionResult.DUPLICATE
         try:
             self._attach_session(session, cleanup_on_failure=False)
         except Exception as exc:
@@ -387,8 +399,8 @@ class MainWindow(QMainWindow):
             self._workspace_manager.release_session_lock(session.session_id)
             logger.exception("Failed to restore interrupted session: %s", session.session_id)
             self._report_error("復旧に失敗しました", str(exc))
-            return False
-        return True
+            return RestoreSessionResult.FAILED
+        return RestoreSessionResult.ATTACHED
 
     def close_document_at(self, index: int) -> bool:
         if not 0 <= index < len(self._documents):
@@ -936,9 +948,26 @@ class MainWindow(QMainWindow):
         try:
             view = PdfView(self._render_service, self)
             view.set_zoom(self._BASE_RENDER_SCALE * session.zoom_factor)
+            restored_page_index = session.current_page_index
+
+            def apply_restored_page() -> None:
+                if view is None or view.page_count <= 0:
+                    return
+                target_page_index = min(restored_page_index, view.page_count - 1)
+                view.set_page(target_page_index)
+                session.set_navigation_state(
+                    page_index=target_page_index,
+                    zoom_factor=session.zoom_factor,
+                )
+                self._schedule_recovery_metadata_persist(session)
+
+            view.document_loaded.connect(
+                apply_restored_page,
+                Qt.ConnectionType.SingleShotConnection,
+            )
             view.open_document(session.document_path)
-            if session.current_page_index > 0:
-                view.set_page(session.current_page_index)
+            if view.page_count > 0:
+                apply_restored_page()
         except Exception:
             if view is not None:
                 try:

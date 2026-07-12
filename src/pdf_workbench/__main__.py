@@ -19,7 +19,7 @@ from pdf_workbench.services.pdf_save_service import PdfSaveService
 from pdf_workbench.services.session_recovery import RecoveryCandidate, SessionRecoveryService
 from pdf_workbench.services.session_workspace import SessionWorkspaceManager
 from pdf_workbench.ui.dialogs.recovery_dialog import RecoveryDialog, RecoveryDialogAction
-from pdf_workbench.ui.main_window import MainWindow
+from pdf_workbench.ui.main_window import MainWindow, RestoreSessionResult
 from pdf_workbench.ui.theme import ColorScheme, ThemeController, apply_application_theme
 
 logger = logging.getLogger(__name__)
@@ -164,11 +164,22 @@ def _handle_startup_recovery(
     dialog.activateWindow()
     dialog.exec()
     result = dialog.result_value
+    restored_source_paths: set[Path] = set()
 
     selected = set(id(candidate) for candidate in result.candidates)
     for candidate in scan_result.candidates:
         if result.action is RecoveryDialogAction.RECOVER and id(candidate) in selected:
-            _restore_candidate(window, recovery_service, candidate)
+            if candidate.metadata.source_path in restored_source_paths:
+                recovery_service.release_candidate(candidate)
+                QMessageBox.information(
+                    window,
+                    "復旧候補を保持しました",
+                    "同じ元ファイルの復旧セッションが既に開かれているため、この候補は後で復旧できるよう保持しました。",
+                )
+                continue
+            restore_result = _restore_candidate(window, recovery_service, candidate)
+            if restore_result is not RestoreSessionResult.FAILED:
+                restored_source_paths.add(candidate.metadata.source_path)
             continue
         if result.action is RecoveryDialogAction.DISCARD and id(candidate) in selected:
             _discard_candidate(window, recovery_service, candidate)
@@ -180,16 +191,15 @@ def _restore_candidate(
     window: MainWindow,
     recovery_service: SessionRecoveryService,
     candidate: RecoveryCandidate,
-) -> None:
+) -> RestoreSessionResult:
     try:
         session = recovery_service.restore_candidate(candidate)
     except Exception as exc:
         logger.exception("Failed to restore interrupted session: %s", candidate.workspace_directory)
         QMessageBox.critical(window, "復旧に失敗しました", str(exc))
         recovery_service.release_candidate(candidate)
-        return
-    if not window.restore_session(session):
-        return
+        return RestoreSessionResult.FAILED
+    return window.restore_session(session)
 
 
 def _discard_candidate(

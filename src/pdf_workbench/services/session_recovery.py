@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import os
+import shutil
 import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -62,6 +63,7 @@ class RecoveryCandidate:
     source_status: SourceStatus
     validation_status: RecoveryValidationStatus
     recoverable: bool
+    discardable: bool
     error_message: str | None
     lease: SessionWorkspaceLease | None = None
     working_copy_size_bytes: int = 0
@@ -75,6 +77,7 @@ class RecoveryScanResult:
 class SessionRecoveryService:
     SCHEMA_VERSION = 1
     MAX_JSON_BYTES = 1024 * 1024
+    DISCARDING_MARKER_NAME = ".discarding"
 
     def __init__(
         self,
@@ -118,6 +121,8 @@ class SessionRecoveryService:
     def scan_candidates(self) -> RecoveryScanResult:
         candidates: list[RecoveryCandidate] = []
         for child in sorted(self._workspace_manager.sessions_root.iterdir()):
+            if child.name.startswith("."):
+                continue
             candidate = self._scan_workspace(child)
             if candidate is not None:
                 candidates.append(candidate)
@@ -144,16 +149,35 @@ class SessionRecoveryService:
         )
         session.mark_recovered(candidate.source_status)
         self.write_metadata(session)
+        # adopt後はworkspace managerが唯一のlease ownerになる。
         self._workspace_manager.adopt_session_lock(session.session_id, candidate.lease)
         candidate.lease = None
         return session
 
     def discard_candidate(self, candidate: RecoveryCandidate) -> None:
-        self._validate_workspace_directory(candidate.workspace_directory)
-        if candidate.lease is not None:
-            candidate.lease.release()
+        if not candidate.discardable:
+            raise RecoveryMetadataError("この候補は安全に破棄できません")
+        resolved_workspace = self._validate_workspace_directory(candidate.workspace_directory)
+        lease = candidate.lease
+        if lease is None:
+            raise RecoveryMetadataError("破棄候補のロックが保持されていません")
+        marker_path = resolved_workspace / self.DISCARDING_MARKER_NAME
+        try:
+            self._create_discarding_marker(marker_path)
+            self._remove_workspace_contents_for_discard(
+                resolved_workspace,
+                keep_names={self._workspace_manager.LOCK_NAME, self.DISCARDING_MARKER_NAME},
+            )
+        except OSError as exc:
+            raise RecoveryMetadataError("復旧候補の破棄に失敗しました") from exc
+        finally:
+            if candidate.lease is not None and not candidate.lease.released:
+                candidate.lease.release()
             candidate.lease = None
-        self._workspace_manager.cleanup_workspace_directory(candidate.workspace_directory)
+        try:
+            self._remove_discarding_lock_and_directory(resolved_workspace, marker_path)
+        except OSError as exc:
+            raise RecoveryMetadataError("復旧候補の破棄に失敗しました") from exc
 
     def release_candidate(self, candidate: RecoveryCandidate) -> None:
         if candidate.lease is None:
@@ -162,11 +186,19 @@ class SessionRecoveryService:
         candidate.lease = None
 
     def _scan_workspace(self, workspace_directory: Path) -> RecoveryCandidate | None:
+        marker_path = workspace_directory / self.DISCARDING_MARKER_NAME
+        if marker_path.exists():
+            self._resume_discarding_workspace(workspace_directory)
+            return None
         try:
             resolved_workspace = self._validate_workspace_directory(workspace_directory)
         except RecoveryMetadataError as exc:
             logger.warning("Found invalid workspace candidate: %s (%s)", workspace_directory, exc)
-            return self._invalid_candidate(workspace_directory, str(exc))
+            return self._invalid_candidate(
+                workspace_directory,
+                str(exc),
+                discardable=self._workspace_is_discardable(workspace_directory),
+            )
         session_id = resolved_workspace.name
         try:
             lease = self._workspace_manager.acquire_workspace_lock(session_id, resolved_workspace)
@@ -191,6 +223,7 @@ class SessionRecoveryService:
                 source_status=source_status,
                 validation_status=RecoveryValidationStatus.VALID,
                 recoverable=True,
+                discardable=True,
                 error_message=None,
                 lease=lease,
                 working_copy_size_bytes=working_copy_size,
@@ -204,6 +237,7 @@ class SessionRecoveryService:
                 source_status=SourceStatus.UNREADABLE,
                 validation_status=RecoveryValidationStatus.INVALID,
                 recoverable=False,
+                discardable=True,
                 error_message=str(exc),
                 lease=lease,
                 working_copy_size_bytes=self._safe_size(
@@ -244,6 +278,8 @@ class SessionRecoveryService:
         self,
         workspace_directory: Path,
         error_message: str,
+        *,
+        discardable: bool,
     ) -> RecoveryCandidate:
         session_id = workspace_directory.name
         resolved_workspace = workspace_directory.expanduser().resolve(strict=False)
@@ -254,6 +290,7 @@ class SessionRecoveryService:
             source_status=SourceStatus.UNREADABLE,
             validation_status=RecoveryValidationStatus.INVALID,
             recoverable=False,
+            discardable=discardable,
             error_message=error_message,
             lease=None,
             working_copy_size_bytes=self._safe_size(
@@ -273,7 +310,7 @@ class SessionRecoveryService:
         if not isinstance(payload, dict):
             raise RecoveryMetadataError("metadataの形式が不正です")
         schema_version = payload.get("schema_version")
-        if schema_version != self.SCHEMA_VERSION:
+        if type(schema_version) is not int or schema_version != self.SCHEMA_VERSION:
             raise RecoveryMetadataError("schema versionに対応していません")
         metadata_session_id = payload.get("session_id")
         if metadata_session_id != session_id:
@@ -292,12 +329,12 @@ class SessionRecoveryService:
             raise RecoveryMetadataError("fingerprintが不正です")
         size_bytes = source_fingerprint_payload.get("size_bytes")
         modified_time_ns = source_fingerprint_payload.get("modified_time_ns")
-        if not isinstance(size_bytes, int) or size_bytes < 0:
+        if type(size_bytes) is not int or size_bytes < 0:
             raise RecoveryMetadataError("fingerprint sizeが不正です")
-        if not isinstance(modified_time_ns, int) or modified_time_ns < 0:
+        if type(modified_time_ns) is not int or modified_time_ns < 0:
             raise RecoveryMetadataError("fingerprint mtimeが不正です")
         current_page_index = payload.get("current_page_index")
-        if not isinstance(current_page_index, int) or current_page_index < 0:
+        if type(current_page_index) is not int or current_page_index < 0:
             raise RecoveryMetadataError("page indexが不正です")
         zoom_factor = payload.get("zoom_factor")
         if not isinstance(zoom_factor, (float, int)) or not math.isfinite(float(zoom_factor)):
@@ -398,6 +435,85 @@ class SessionRecoveryService:
             return path.stat().st_size
         except OSError:
             return 0
+
+    def _workspace_is_discardable(self, workspace_directory: Path) -> bool:
+        if workspace_directory.is_symlink():
+            return False
+        resolved_workspace = workspace_directory.expanduser().resolve(strict=False)
+        if resolved_workspace.parent != self._workspace_manager.sessions_root:
+            return False
+        if not resolved_workspace.is_dir():
+            return False
+        lock_path = resolved_workspace / self._workspace_manager.LOCK_NAME
+        return lock_path.exists() and lock_path.is_file() and not lock_path.is_symlink()
+
+    @staticmethod
+    def _create_discarding_marker(marker_path: Path) -> None:
+        with open(marker_path, "xb") as handle:
+            handle.write(b"discarding\n")
+
+    def _remove_workspace_contents_for_discard(
+        self,
+        workspace_directory: Path,
+        *,
+        keep_names: set[str],
+    ) -> None:
+        for child in workspace_directory.iterdir():
+            if child.name in keep_names:
+                continue
+            if child.is_symlink():
+                child.unlink()
+                continue
+            if child.is_dir():
+                shutil.rmtree(child)
+                continue
+            child.unlink()
+
+    def _remove_discarding_lock_and_directory(
+        self,
+        workspace_directory: Path,
+        marker_path: Path,
+    ) -> None:
+        lock_path = workspace_directory / self._workspace_manager.LOCK_NAME
+        if marker_path.exists():
+            marker_path.unlink()
+        if lock_path.exists():
+            lock_path.unlink()
+        workspace_directory.rmdir()
+
+    def _resume_discarding_workspace(self, workspace_directory: Path) -> None:
+        if not self._workspace_is_discardable(workspace_directory):
+            logger.warning("Ignoring unsafe discarding workspace: %s", workspace_directory)
+            return
+        resolved_workspace = workspace_directory.expanduser().resolve()
+        session_id = resolved_workspace.name
+        try:
+            lease = self._workspace_manager.acquire_workspace_lock(session_id, resolved_workspace)
+        except WorkspaceLockActiveError:
+            return
+        except WorkspaceLockError as exc:
+            logger.warning(
+                "Failed to resume workspace discard: %s (%s)",
+                resolved_workspace,
+                exc,
+            )
+            return
+        marker_path = resolved_workspace / self.DISCARDING_MARKER_NAME
+        try:
+            self._remove_workspace_contents_for_discard(
+                resolved_workspace,
+                keep_names={self._workspace_manager.LOCK_NAME, self.DISCARDING_MARKER_NAME},
+            )
+        except OSError:
+            logger.exception("Failed to remove stale discarding workspace: %s", resolved_workspace)
+            return
+        finally:
+            if not lease.released:
+                lease.release()
+        try:
+            self._remove_discarding_lock_and_directory(resolved_workspace, marker_path)
+        except OSError:
+            logger.exception("Failed to finalize stale workspace discard: %s", resolved_workspace)
 
     @staticmethod
     def _fsync_parent_directory(directory: Path) -> None:
