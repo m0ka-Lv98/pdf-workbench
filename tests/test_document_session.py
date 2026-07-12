@@ -1,27 +1,80 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
-from pdf_workbench.domain.document_session import DocumentSession
+from pdf_workbench.domain.document_session import DocumentSession, FileFingerprint
+
+
+def create_session(tmp_path: Path) -> DocumentSession:
+    source_path = tmp_path / "sample.pdf"
+    source_path.write_bytes(b"%PDF-1.7\n% test\n")
+    workspace_directory = tmp_path / "workspace"
+    workspace_directory.mkdir()
+    working_copy_path = workspace_directory / "working.pdf"
+    working_copy_path.write_bytes(source_path.read_bytes())
+    return DocumentSession(
+        source_path=source_path,
+        working_copy_path=working_copy_path,
+        workspace_directory=workspace_directory,
+        source_fingerprint=FileFingerprint.from_path(source_path),
+    )
 
 
 def test_document_session_normalizes_pdf_path(tmp_path: Path) -> None:
-    path = tmp_path / "sample.pdf"
-    path.touch()
-    session = DocumentSession(path)
-    assert session.source_path == path.resolve()
+    session = create_session(tmp_path)
+    assert session.source_path == (tmp_path / "sample.pdf").resolve()
+    assert session.working_copy_path == (tmp_path / "workspace" / "working.pdf").resolve()
+    assert session.workspace_directory == (tmp_path / "workspace").resolve()
+    assert session.document_path == session.working_copy_path
+    assert session.display_path == session.source_path
     assert session.is_modified is False
 
 
 def test_document_session_rejects_non_pdf(tmp_path: Path) -> None:
+    workspace_directory = tmp_path / "workspace"
+    workspace_directory.mkdir()
     with pytest.raises(ValueError, match="PDF"):
-        DocumentSession(tmp_path / "sample.txt")
+        DocumentSession(
+            source_path=tmp_path / "sample.txt",
+            working_copy_path=workspace_directory / "working.pdf",
+            workspace_directory=workspace_directory,
+            source_fingerprint=FileFingerprint(size_bytes=0, modified_time_ns=0),
+        )
 
 
 def test_mark_modified_records_operation(tmp_path: Path) -> None:
-    path = tmp_path / "sample.pdf"
-    path.touch()
-    session = DocumentSession(path)
+    session = create_session(tmp_path)
     session.mark_modified("rotate page 1")
     assert session.is_modified is True
     assert session.operation_history == ["rotate page 1"]
+
+
+def test_mark_saved_updates_source_path_and_fingerprint(tmp_path: Path) -> None:
+    session = create_session(tmp_path)
+    session.mark_modified("delete page 2")
+    target_path = tmp_path / "saved-as.pdf"
+    target_path.write_bytes(b"%PDF-1.7\n% saved\n")
+    saved_at = datetime.now(UTC)
+    fingerprint = FileFingerprint.from_path(target_path)
+
+    session.mark_saved(target_path, fingerprint, saved_at)
+
+    assert session.source_path == target_path.resolve()
+    assert session.display_path == target_path.resolve()
+    assert session.source_fingerprint == fingerprint
+    assert session.last_saved_at == saved_at
+    assert session.is_modified is False
+
+
+def test_zoom_and_current_page_changes_do_not_mark_modified(tmp_path: Path) -> None:
+    session = create_session(tmp_path)
+
+    session.current_page_index = 3
+    session.zoom_factor = 1.5
+
+    assert session.current_page_index == 3
+    assert session.zoom_factor == pytest.approx(1.5)
+    assert session.is_modified is False
