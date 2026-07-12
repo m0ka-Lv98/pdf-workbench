@@ -68,7 +68,7 @@ class DocumentSession:
         fingerprint: FileFingerprint,
         saved_at: datetime,
     ) -> None:
-        self.source_path = source_path.expanduser().resolve()
+        self.source_path = source_path
         self.source_fingerprint = fingerprint
         self.last_saved_at = saved_at
         self.is_modified = False

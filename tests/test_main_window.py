@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QTabBar,
     QToolButton,
+    QWidget,
 )
 from pytestqt.qtbot import QtBot
 
@@ -33,12 +35,13 @@ from pdf_workbench.services.page_coordinates import PageMetadata
 from pdf_workbench.services.pdf_renderer import (
     DocumentMetadata,
     DocumentRevision,
+    PageTextIndex,
     PdfiumDocumentBackend,
     PdfRenderService,
 )
 from pdf_workbench.services.pdf_save_service import PdfSaveError, PdfSaveService, SaveResult
 from pdf_workbench.services.session_workspace import SessionWorkspaceManager
-from pdf_workbench.ui.main_window import MainWindow
+from pdf_workbench.ui.main_window import DocumentTab, MainWindow
 from pdf_workbench.ui.pdf_view import PdfView
 from pdf_workbench.ui.widgets.search_bar import SearchBar, SearchInputSurface
 
@@ -135,20 +138,25 @@ def assert_search_ui_ready(window: MainWindow) -> None:
         bottom_right = widget.mapTo(window._search_surface, widget.rect().bottomRight())
         child_rect = QRect(top_left, bottom_right)
         assert window._search_surface.rect().contains(child_rect)
-    for widget in child_widgets[:2]:
-        top_left = widget.mapTo(window._search_bar.search_input_surface, widget.rect().topLeft())
-        bottom_right = widget.mapTo(
+    input_widgets: tuple[QWidget, ...] = child_widgets[:2]
+    for input_widget in input_widgets:
+        top_left = input_widget.mapTo(
             window._search_bar.search_input_surface,
-            widget.rect().bottomRight(),
+            input_widget.rect().topLeft(),
+        )
+        bottom_right = input_widget.mapTo(
+            window._search_bar.search_input_surface,
+            input_widget.rect().bottomRight(),
         )
         child_rect = QRect(top_left, bottom_right)
         assert input_surface_rect.contains(child_rect)
     surface_center_y = window._search_bar.search_input_surface.geometry().center().y()
-    for widget in (
+    center_aligned_widgets: tuple[QWidget, ...] = (
         window._search_bar.search_icon,
         window._search_bar.search_input,
-    ):
-        assert abs(widget.geometry().center().y() - surface_center_y) <= 1
+    )
+    for center_widget in center_aligned_widgets:
+        assert abs(center_widget.geometry().center().y() - surface_center_y) <= 1
 
 
 def assert_button_icon_valid(button: QToolButton) -> None:
@@ -163,7 +171,11 @@ class DelayedTextBackend(PdfiumDocumentBackend):
         super().__init__(path)
         self._delay_seconds = delay_seconds
 
-    def extract_text_page(self, page_index: int, revision: DocumentRevision):  # type: ignore[override]
+    def extract_text_page(
+        self,
+        page_index: int,
+        revision: DocumentRevision,
+    ) -> PageTextIndex:
         time.sleep(self._delay_seconds)
         return super().extract_text_page(page_index, revision)
 
@@ -218,6 +230,16 @@ class FakeSaveService(PdfSaveService):
             fingerprint=fingerprint,
             saved_at=saved_at,
         )
+
+
+class TrackingWorkspaceManager(SessionWorkspaceManager):
+    def __init__(self, sessions_root: Path) -> None:
+        super().__init__(sessions_root)
+        self.cleaned_sessions: list[str] = []
+
+    def cleanup_session(self, session: DocumentSession) -> None:
+        self.cleaned_sessions.append(session.session_id)
+        super().cleanup_session(session)
 
 
 def test_main_window_opens_and_closes_multiple_documents(
@@ -485,6 +507,161 @@ def test_main_window_save_as_rejects_target_open_in_another_tab(
     assert window.close_current_document() is True
 
 
+@pytest.mark.parametrize(
+    "target_factory",
+    [
+        lambda document, manager, root: document.session.working_copy_path,
+        lambda document, manager, root: document.session.workspace_directory / "other.pdf",
+        lambda document, manager, root: manager.sessions_root / "root-target.pdf",
+    ],
+)
+def test_main_window_save_as_rejects_managed_paths(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+    target_factory: Callable[[DocumentTab, SessionWorkspaceManager, Path], Path],
+) -> None:
+    patch_pdf_open(monkeypatch)
+    save_service = FakeSaveService()
+    settings = create_settings(tmp_path)
+    workspace_manager = create_workspace_manager(tmp_path)
+    window = MainWindow(
+        settings,
+        workspace_manager=workspace_manager,
+        save_service=save_service,
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = create_blank_pdf(tmp_path / "managed-path-source.pdf", 1)
+    window.open_document(document_path)
+    document = window._documents[0]
+    document.session.mark_modified("edit")
+    original_source_path = document.session.source_path
+    original_fingerprint = document.session.source_fingerprint
+    original_working_copy_bytes = document.session.document_path.read_bytes()
+
+    target_path = target_factory(document, workspace_manager, tmp_path)
+    monkeypatch.setattr(
+        QFileDialog,
+        "getSaveFileName",
+        lambda *args, **kwargs: (str(target_path), "PDF files (*.pdf)"),
+    )
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
+    )
+    monkeypatch.setattr(
+        QMessageBox,
+        "critical",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Ok,
+    )
+
+    assert window._save_current_document_as() is False
+    assert save_service.calls == []
+    assert document.session.is_modified is True
+    assert document.session.source_path == original_source_path
+    assert document.session.source_fingerprint == original_fingerprint
+    assert document.session.document_path.read_bytes() == original_working_copy_bytes
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    assert window.close_current_document() is True
+
+
+def test_main_window_save_as_rejects_other_session_workspace_path(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    save_service = FakeSaveService()
+    settings = create_settings(tmp_path)
+    workspace_manager = create_workspace_manager(tmp_path)
+    window = MainWindow(
+        settings,
+        workspace_manager=workspace_manager,
+        save_service=save_service,
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    first = create_blank_pdf(tmp_path / "first.pdf", 1)
+    second = create_blank_pdf(tmp_path / "second.pdf", 1)
+    window.open_document(first)
+    window.open_document(second)
+    first_document = window._documents[0]
+    second_document = window._documents[1]
+    second_document.session.mark_modified("edit")
+    original_source_path = second_document.session.source_path
+    original_fingerprint = second_document.session.source_fingerprint
+    original_working_copy_bytes = second_document.session.document_path.read_bytes()
+
+    monkeypatch.setattr(
+        QFileDialog,
+        "getSaveFileName",
+        lambda *args, **kwargs: (
+            str(first_document.session.workspace_directory / "forbidden.pdf"),
+            "PDF files (*.pdf)",
+        ),
+    )
+    monkeypatch.setattr(
+        QMessageBox,
+        "critical",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Ok,
+    )
+
+    assert window._save_current_document_as() is False
+    assert save_service.calls == []
+    assert second_document.session.is_modified is True
+    assert second_document.session.source_path == original_source_path
+    assert second_document.session.source_fingerprint == original_fingerprint
+    assert second_document.session.document_path.read_bytes() == original_working_copy_bytes
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    assert window.close_document_at(1) is True
+    assert window.close_document_at(0) is True
+
+
+def test_main_window_save_as_allows_similar_non_managed_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    save_service = FakeSaveService()
+    settings = create_settings(tmp_path)
+    workspace_manager = create_workspace_manager(tmp_path)
+    window = MainWindow(
+        settings,
+        workspace_manager=workspace_manager,
+        save_service=save_service,
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = create_blank_pdf(tmp_path / "allowed-save-as-source.pdf", 1)
+    target_directory = tmp_path / "sessions-copy"
+    target_directory.mkdir()
+    target_path = target_directory / "allowed.pdf"
+    window.open_document(document_path)
+
+    monkeypatch.setattr(
+        QFileDialog,
+        "getSaveFileName",
+        lambda *args, **kwargs: (str(target_path), "PDF files (*.pdf)"),
+    )
+
+    assert window._save_current_document_as() is True
+    assert save_service.calls[0][0] == target_path.resolve()
+
+
 def test_main_window_close_modified_document_save_failure_keeps_tab_open(
     monkeypatch: pytest.MonkeyPatch,
     qtbot: QtBot,
@@ -624,6 +801,127 @@ def test_main_window_close_event_cleans_all_session_workspaces(
     assert all(not workspace.exists() for workspace in workspaces)
 
 
+def test_main_window_close_event_cleans_each_session_once(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    workspace_manager = TrackingWorkspaceManager(tmp_path / "sessions")
+    window = MainWindow(
+        settings,
+        workspace_manager=workspace_manager,
+        save_service=FakeSaveService(),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    first = create_blank_pdf(tmp_path / "first-close-once.pdf", 1)
+    second = create_blank_pdf(tmp_path / "second-close-once.pdf", 1)
+    window.open_document(first)
+    window.open_document(second)
+    session_ids = [document.session.session_id for document in window._documents]
+
+    event = QCloseEvent()
+    window.closeEvent(event)
+
+    assert event.isAccepted() is True
+    assert workspace_manager.cleaned_sessions == session_ids[::-1]
+
+
+def test_main_window_open_document_cleans_workspace_on_view_constructor_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    workspace_manager = create_workspace_manager(tmp_path)
+    window = MainWindow(settings, workspace_manager=workspace_manager)
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    document_path = create_blank_pdf(tmp_path / "constructor-failure.pdf", 1)
+
+    def fail_constructor(*_args: object, **_kwargs: object) -> PdfView:
+        raise RuntimeError("view constructor failed")
+
+    monkeypatch.setattr("pdf_workbench.ui.main_window.PdfView", fail_constructor)
+    monkeypatch.setattr(
+        QMessageBox,
+        "critical",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Ok,
+    )
+
+    window.open_document(document_path)
+
+    assert window._tabs.count() == 0
+    assert window._documents == []
+    assert list(workspace_manager.sessions_root.iterdir()) == []
+
+
+def test_main_window_open_document_cleans_workspace_on_set_zoom_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    workspace_manager = create_workspace_manager(tmp_path)
+    window = MainWindow(settings, workspace_manager=workspace_manager)
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    document_path = create_blank_pdf(tmp_path / "zoom-failure.pdf", 1)
+
+    original_set_zoom = PdfView.set_zoom
+
+    def fail_set_zoom(self: PdfView, zoom: float) -> None:
+        raise RuntimeError(f"zoom failure {zoom}")
+
+    monkeypatch.setattr(PdfView, "set_zoom", fail_set_zoom)
+    monkeypatch.setattr(
+        QMessageBox,
+        "critical",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Ok,
+    )
+
+    window.open_document(document_path)
+
+    monkeypatch.setattr(PdfView, "set_zoom", original_set_zoom)
+    assert window._tabs.count() == 0
+    assert window._documents == []
+    assert list(workspace_manager.sessions_root.iterdir()) == []
+
+
+def test_main_window_open_document_cleans_workspace_on_open_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    settings = create_settings(tmp_path)
+    workspace_manager = create_workspace_manager(tmp_path)
+    window = MainWindow(settings, workspace_manager=workspace_manager)
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    document_path = create_blank_pdf(tmp_path / "open-failure.pdf", 1)
+
+    def fail_open(self: PdfView, _path: Path) -> None:
+        raise RuntimeError("open failure")
+
+    monkeypatch.setattr(PdfView, "open_document", fail_open)
+    monkeypatch.setattr(
+        QMessageBox,
+        "critical",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Ok,
+    )
+
+    window.open_document(document_path)
+
+    assert window._tabs.count() == 0
+    assert window._documents == []
+    assert list(workspace_manager.sessions_root.iterdir()) == []
+
+
 def test_main_window_persists_recent_files_and_geometry(
     monkeypatch: pytest.MonkeyPatch,
     qtbot: QtBot,
@@ -754,6 +1052,7 @@ def test_main_window_toolbar_search_button_opens_search_ui(
     qtbot.waitUntil(lambda: window._search_ui_is_ready())
     assert_search_ui_ready(window)
     document = window._documents[0]
+    assert window._search_surface is not None
     surface_bottom = window._search_surface.mapTo(
         window,
         window._search_surface.rect().bottomLeft(),
@@ -1242,6 +1541,7 @@ def test_main_window_real_search_updates_after_index_completion(
     qtbot.waitUntil(lambda: document.view.search_state.current_index == 1)
 
     document.view.close_document()
+    assert isinstance(document.view._render_service, PdfRenderService)
     assert document.view._render_service.shutdown()
 
 
@@ -1273,6 +1573,7 @@ def test_main_window_real_search_supports_japanese_text(
     assert len(document.view._canvas.pages[0]._current_match_boxes) == 1
 
     document.view.close_document()
+    assert isinstance(document.view._render_service, PdfRenderService)
     assert document.view._render_service.shutdown()
 
 
@@ -1295,6 +1596,7 @@ def test_main_window_real_search_reports_blank_pdf_without_text_layer(
 
     document = window._documents[0]
     document.view.close_document()
+    assert isinstance(document.view._render_service, PdfRenderService)
     assert document.view._render_service.shutdown()
 
 
@@ -1317,6 +1619,7 @@ def test_main_window_real_search_reports_image_pdf_needs_ocr(
 
     document = window._documents[0]
     document.view.close_document()
+    assert isinstance(document.view._render_service, PdfRenderService)
     assert document.view._render_service.shutdown()
 
 
@@ -1342,10 +1645,15 @@ def test_main_window_copy_action_falls_back_to_pdf_view_when_line_edit_has_no_se
     monkeypatch.setattr(QApplication, "focusWidget", staticmethod(lambda: line_edit))
 
     copied = {"pdf": 0}
+
+    def copy_selected_text() -> bool:
+        copied["pdf"] += 1
+        return True
+
     monkeypatch.setattr(
         window._documents[0].view,
         "copy_selected_text",
-        lambda: copied.__setitem__("pdf", copied["pdf"] + 1) or True,
+        copy_selected_text,
     )
 
     window._copy_selection()

@@ -73,3 +73,13 @@ def test_workspace_manager_cleanup_is_idempotent(tmp_path: Path) -> None:
     manager.cleanup_session(session)
 
     assert not session.workspace_directory.exists()
+
+
+def test_workspace_manager_detects_managed_paths_safely(tmp_path: Path) -> None:
+    sessions_root = tmp_path / "sessions"
+    manager = SessionWorkspaceManager(sessions_root)
+    managed_file = sessions_root / "abc" / "working.pdf"
+    external_file = tmp_path / "sessions-copy" / "abc.pdf"
+
+    assert manager.contains_managed_path(managed_file) is True
+    assert manager.contains_managed_path(external_file) is False

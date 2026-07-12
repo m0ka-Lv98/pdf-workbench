@@ -344,6 +344,8 @@ class MainWindow(QMainWindow):
             )
             return
 
+        session: DocumentSession | None = None
+        view: PdfView | None = None
         try:
             session = self._workspace_manager.create_session(normalized_path)
             view = PdfView(self._render_service, self)
@@ -354,10 +356,20 @@ class MainWindow(QMainWindow):
             self._report_error("PDFを開けません", str(exc))
             return
         except Exception as exc:
+            if view is not None:
+                try:
+                    view.close_document()
+                except Exception:
+                    logger.exception("Failed to close view after open error: %s", path)
+                view.deleteLater()
+            if session is not None:
+                self._workspace_manager.cleanup_session(session)
             logger.exception("Failed to open PDF: %s", path)
             self._report_error("PDFを開けません", str(exc))
             return
 
+        assert session is not None
+        assert view is not None
         view.state_changed.connect(self._update_status)
         view.search_state_changed.connect(lambda: self._on_view_search_state_changed(view))
         view.selection_changed.connect(self._update_actions)
@@ -544,6 +556,12 @@ class MainWindow(QMainWindow):
         )
         if destination.suffix.lower() != ".pdf":
             destination = destination.with_suffix(".pdf")
+        if self._workspace_manager.contains_managed_path(destination):
+            self._report_error(
+                "保存できません",
+                "アプリの一時作業フォルダ内には保存できません。別の保存先を選択してください。",
+            )
+            return False
         if self._find_save_conflict(destination, session) is not None:
             self._report_error(
                 "保存できません",
@@ -685,7 +703,6 @@ class MainWindow(QMainWindow):
             self._set_status_message("PDFレンダラーの終了を待ち切れませんでした", error=True)
             event.ignore()
             return
-        self._workspace_manager.cleanup_sessions([document.session for document in self._documents])
         self._save_window_state()
         event.accept()
 

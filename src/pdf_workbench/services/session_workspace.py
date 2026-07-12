@@ -35,6 +35,13 @@ class SessionWorkspaceManager:
     def sessions_root(self) -> Path:
         return self._sessions_root
 
+    def contains_managed_path(self, path: Path) -> bool:
+        resolved_path = path.expanduser().resolve()
+        try:
+            return resolved_path.is_relative_to(self._sessions_root)
+        except ValueError:
+            return False
+
     def create_session(self, source_path: Path) -> DocumentSession:
         resolved_source = source_path.expanduser().resolve()
         if not resolved_source.exists():
@@ -90,7 +97,9 @@ class SessionWorkspaceManager:
         resolved_directory = workspace_directory.expanduser().resolve()
         if not resolved_directory.exists():
             return
-        if resolved_directory.parent != self._sessions_root:
+        if not self.contains_managed_path(resolved_directory) or (
+            resolved_directory.parent != self._sessions_root
+        ):
             logger.warning(
                 "Refusing to clean unexpected workspace directory: %s",
                 resolved_directory,
