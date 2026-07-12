@@ -7,12 +7,14 @@ import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
 
 import pikepdf
-import pypdfium2 as pdfium  # type: ignore[import-untyped]
 
 from pdf_workbench.domain.document_session import DocumentSession, FileFingerprint
+from pdf_workbench.services.pdf_document_validator import (
+    PdfDocumentValidationError,
+    PdfDocumentValidator,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,9 @@ class SaveResult:
 
 
 class PdfSaveService:
+    def __init__(self, validator: PdfDocumentValidator | None = None) -> None:
+        self._validator = validator if validator is not None else PdfDocumentValidator()
+
     def save_atomic(
         self,
         session: DocumentSession,
@@ -137,43 +142,9 @@ class PdfSaveService:
             raise PdfValidationError("保存候補ファイルのサイズが不正です")
 
         try:
-            with pikepdf.open(str(path)) as pdf:
-                if len(pdf.pages) != expected_page_count:
-                    raise PdfValidationError("保存候補PDFのページ数が一致しません")
-        except PdfValidationError:
-            raise
-        except Exception as exc:
-            raise PdfValidationError("保存候補PDFを再オープンできません") from exc
-
-        try:
-            pdf_document = pdfium.PdfDocument(str(path))
-        except Exception as exc:
-            raise PdfValidationError("保存候補PDFをPDFiumで開けません") from exc
-
-        try:
-            if len(pdf_document) != expected_page_count:
-                raise PdfValidationError("PDFium上のページ数が一致しません")
-            if len(pdf_document) > 0:
-                page = pdf_document[0]
-                bitmap: Any | None = None
-                pil_image: Any | None = None
-                try:
-                    bitmap = page.render(scale=0.2)
-                    pil_image = bitmap.to_pil()
-                    if pil_image.width <= 0 or pil_image.height <= 0:
-                        raise PdfValidationError("先頭ページの描画検証に失敗しました")
-                finally:
-                    if pil_image is not None and hasattr(pil_image, "close"):
-                        pil_image.close()
-                    if bitmap is not None and hasattr(bitmap, "close"):
-                        bitmap.close()
-                    page.close()
-        except PdfValidationError:
-            raise
-        except Exception as exc:
-            raise PdfValidationError("保存候補PDFのレンダリング検証に失敗しました") from exc
-        finally:
-            pdf_document.close()
+            self._validator.validate(str(path), expected_page_count=expected_page_count)
+        except PdfDocumentValidationError as exc:
+            raise PdfValidationError(str(exc)) from exc
 
     def _build_fingerprint(self, path: Path) -> FileFingerprint:
         try:

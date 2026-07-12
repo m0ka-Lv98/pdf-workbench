@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from pdf_workbench.domain.document_session import DocumentSession, FileFingerprint
+from pdf_workbench.domain.document_session import DocumentSession, FileFingerprint, SourceStatus
 
 
 def create_session(tmp_path: Path) -> DocumentSession:
@@ -72,9 +72,40 @@ def test_mark_saved_updates_source_path_and_fingerprint(tmp_path: Path) -> None:
 def test_zoom_and_current_page_changes_do_not_mark_modified(tmp_path: Path) -> None:
     session = create_session(tmp_path)
 
-    session.current_page_index = 3
-    session.zoom_factor = 1.5
+    session.set_navigation_state(page_index=3, zoom_factor=1.5)
 
     assert session.current_page_index == 3
     assert session.zoom_factor == pytest.approx(1.5)
     assert session.is_modified is False
+
+
+def test_recovery_flags_follow_source_status_and_clear_after_save(tmp_path: Path) -> None:
+    session = create_session(tmp_path)
+    session.mark_recovered(SourceStatus.MODIFIED)
+
+    assert session.recovered_from_interrupted_session is True
+    assert session.requires_save_as is True
+    assert session.recovery_source_status is SourceStatus.MODIFIED
+
+    saved_path = tmp_path / "saved.pdf"
+    saved_path.write_bytes(b"%PDF-1.7\n% saved\n")
+    session.mark_saved(
+        saved_path,
+        FileFingerprint.from_path(saved_path),
+        datetime.now(UTC),
+    )
+
+    assert session.recovered_from_interrupted_session is False
+    assert session.requires_save_as is False
+    assert session.recovery_source_status is None
+
+
+def test_mark_modified_limits_operation_history(tmp_path: Path) -> None:
+    session = create_session(tmp_path)
+
+    for index in range(150):
+        session.mark_modified(f"op-{index}")
+
+    assert len(session.operation_history) == DocumentSession.MAX_OPERATION_HISTORY
+    assert session.operation_history[0] == "op-50"
+    assert session.operation_history[-1] == "op-149"

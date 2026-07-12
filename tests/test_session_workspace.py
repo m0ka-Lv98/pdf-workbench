@@ -21,6 +21,7 @@ def test_workspace_manager_creates_working_copy_without_modifying_source(tmp_pat
     assert session.source_path.read_bytes() == source_bytes
     assert session.workspace_directory.parent == manager.sessions_root
     assert session.workspace_directory.name == session.session_id
+    assert (session.workspace_directory / manager.LOCK_NAME).exists()
 
 
 def test_workspace_manager_creates_unique_session_directories(tmp_path: Path) -> None:
