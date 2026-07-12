@@ -36,7 +36,7 @@ class SearchBar(QWidget):
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(10)
+        layout.setSpacing(8)
         layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
         self.search_input = QLineEdit(self)
@@ -45,8 +45,10 @@ class SearchBar(QWidget):
         self.search_input.setAccessibleName("Search input")
         self.search_input.setToolTip("検索語句を入力します")
         self.search_input.setMinimumWidth(320)
+        self.search_input.setMaximumWidth(360)
+        self.search_input.setFixedHeight(38)
         self.search_input.setSizePolicy(
-            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
             QSizePolicy.Policy.Fixed,
         )
         self.search_input.textChanged.connect(self._on_text_changed)
@@ -68,6 +70,7 @@ class SearchBar(QWidget):
         self.previous_button.setToolTip("前の検索結果")
         self.previous_button.setAutoRaise(True)
         self.previous_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self.previous_button.setFixedSize(34, 34)
         self.previous_button.clicked.connect(self.previous_requested.emit)
 
         self.next_button = QToolButton(self)
@@ -76,12 +79,15 @@ class SearchBar(QWidget):
         self.next_button.setToolTip("次の検索結果")
         self.next_button.setAutoRaise(True)
         self.next_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self.next_button.setFixedSize(34, 34)
         self.next_button.clicked.connect(self.next_requested.emit)
 
         self.counter_label = QLabel("0 / 0", self)
         self.counter_label.setObjectName("searchResultCounter")
         self.counter_label.setAccessibleName("Search result counter")
         self.counter_label.setToolTip("検索結果の件数")
+        self.counter_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.counter_label.setMinimumWidth(48)
         self.progress_label = QLabel("", self)
         self.progress_label.setObjectName("searchProgressLabel")
         self.progress_label.setAccessibleName("Search progress")
@@ -93,6 +99,7 @@ class SearchBar(QWidget):
         self.close_button.setToolTip("検索バーを閉じる")
         self.close_button.setAutoRaise(True)
         self.close_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self.close_button.setFixedSize(34, 34)
         self.close_button.clicked.connect(self.close_requested.emit)
 
         layout.addWidget(self.search_input, 1)
@@ -103,8 +110,8 @@ class SearchBar(QWidget):
         layout.addWidget(self.close_button)
 
         self.search_input.installEventFilter(self)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.setMinimumHeight(36)
+        self.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        self.setFixedHeight(40)
         self.refresh_theme_assets()
 
     def set_state(self, state: SearchBarState) -> None:

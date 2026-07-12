@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QMimeData, QObject, QSettings, Qt, QTimer
+from PySide6.QtCore import QEvent, QMimeData, QObject, QRect, QSettings, Qt, QTimer
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
@@ -83,7 +83,7 @@ class MainWindow(QMainWindow):
         self._search_surface: QWidget | None = None
         self._workspace_overlay_host: QWidget | None = None
         self._empty_state = EmptyState(self)
-        self._search_row_height = 54
+        self._search_row_height = 52
         self._status_reset_timer = QTimer(self)
         self._status_reset_timer.setSingleShot(True)
         self._status_reset_timer.timeout.connect(self._reset_status_message)
@@ -286,9 +286,13 @@ class MainWindow(QMainWindow):
         layout.addStretch(1)
         self._search_surface = QWidget(self._search_toolbar)
         self._search_surface.setObjectName("searchSurface")
-        self._search_surface.setMaximumWidth(660)
+        self._search_surface.setMaximumWidth(620)
+        self._search_surface.setSizePolicy(
+            QSizePolicy.Policy.Maximum,
+            QSizePolicy.Policy.Fixed,
+        )
         surface_layout = QHBoxLayout(self._search_surface)
-        surface_layout.setContentsMargins(8, 6, 8, 6)
+        surface_layout.setContentsMargins(0, 0, 0, 0)
         surface_layout.setSpacing(0)
         surface_layout.addWidget(self._search_bar)
         layout.addWidget(self._search_surface)
@@ -431,8 +435,8 @@ class MainWindow(QMainWindow):
             self._search_toolbar.show()
             self._search_toolbar.raise_()
         if self._search_surface is not None:
-            self._search_surface.setMinimumWidth(min(420, max(320, self.width() - 240)))
-            self._search_surface.setMaximumWidth(max(540, min(660, self.width() - 64)))
+            self._search_surface.setMinimumWidth(min(420, max(320, self.width() - 280)))
+            self._search_surface.setMaximumWidth(max(420, min(620, self.width() - 64)))
         self._search_bar.show()
         self._search_bar.cancel_pending_search()
         self._search_bar.set_state(self._search_state_for(document))
@@ -759,7 +763,9 @@ class MainWindow(QMainWindow):
             return False
         if self._search_surface is None:
             return False
-        return self._search_surface.geometry().height() >= self._search_bar.geometry().height()
+        if self._search_surface.geometry().height() < self._search_bar.sizeHint().height():
+            return False
+        return self._search_widgets_fit_surface()
 
     def refresh_theme_assets(self) -> None:
         self._toolbar_widget.refresh_theme_assets()
@@ -832,13 +838,36 @@ class MainWindow(QMainWindow):
             self._search_toolbar.hide()
             return
         host = self._workspace_overlay_host
-        top_margin = self._tabs.tabBar().height() + 16
+        top_margin = self._tabs.tabBar().height() + 14
         self._search_toolbar.setGeometry(0, top_margin, host.width(), self._search_row_height)
         if self._search_surface is not None:
-            max_surface_width = min(660, max(420, host.width() - 72))
+            max_surface_width = min(620, max(420, host.width() - 72))
             self._search_surface.setMaximumWidth(max_surface_width)
-            self._search_surface.setFixedHeight(44)
+            self._search_surface.setFixedHeight(
+                max(40, self._search_bar.sizeHint().height()),
+            )
         self._search_toolbar.raise_()
+
+    def _search_widgets_fit_surface(self) -> bool:
+        if self._search_surface is None:
+            return False
+        surface_rect = self._search_surface.rect()
+        if not surface_rect.contains(self._search_bar.geometry()):
+            return False
+        child_widgets = (
+            self._search_bar.search_input,
+            self._search_bar.previous_button,
+            self._search_bar.next_button,
+            self._search_bar.close_button,
+            self._search_bar.counter_label,
+        )
+        for widget in child_widgets:
+            top_left = widget.mapTo(self._search_surface, widget.rect().topLeft())
+            bottom_right = widget.mapTo(self._search_surface, widget.rect().bottomRight())
+            child_rect = QRect(top_left, bottom_right)
+            if not surface_rect.contains(child_rect):
+                return False
+        return True
 
     def _apply_search_inset(self) -> None:
         document = self._current_document()

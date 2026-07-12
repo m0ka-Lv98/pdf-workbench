@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import QMimeData, QPoint, QPointF, QSettings, Qt, QUrl
+from PySide6.QtCore import QMimeData, QPoint, QPointF, QRect, QSettings, Qt, QUrl
 from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent, QImage, QKeySequence
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QHBoxLayout, QLabel, QMessageBox, QTabBar, QToolButton
@@ -67,6 +67,7 @@ def assert_search_ui_ready(window: MainWindow) -> None:
         window._search_bar.geometry().height()
         >= window._search_bar.search_input.geometry().height()
     )
+    assert window._search_surface.geometry().height() >= window._search_bar.sizeHint().height()
     assert window._search_surface.geometry().height() >= window._search_bar.geometry().height()
     search_top = window._search_toolbar.mapTo(
         window,
@@ -86,6 +87,21 @@ def assert_search_ui_ready(window: MainWindow) -> None:
     toolbar_right = window._search_toolbar.rect().right()
     surface_right = window._search_surface.geometry().right()
     assert toolbar_right - surface_right < 40
+    assert (
+        window._search_bar.search_input.geometry().bottom()
+        <= window._search_surface.rect().bottom()
+    )
+    for widget in (
+        window._search_bar.search_input,
+        window._search_bar.previous_button,
+        window._search_bar.next_button,
+        window._search_bar.close_button,
+        window._search_bar.counter_label,
+    ):
+        top_left = widget.mapTo(window._search_surface, widget.rect().topLeft())
+        bottom_right = widget.mapTo(window._search_surface, widget.rect().bottomRight())
+        child_rect = QRect(top_left, bottom_right)
+        assert window._search_surface.rect().contains(child_rect)
 
 
 def assert_button_icon_valid(button: QToolButton) -> None:

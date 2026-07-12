@@ -56,9 +56,9 @@ QWidget#searchToolbar {
 }
 
 QWidget#searchSurface {
-  background: rgba(248, 249, 251, 0.94);
-  border: 1px solid #d9dde3;
-  border-radius: 8px;
+  background: transparent;
+  border: none;
+  border-radius: 0;
 }
 
 QWidget#toolbarSeparator {
@@ -104,8 +104,10 @@ QWidget#documentToolbar QToolButton#zoomInButton {
 
 QWidget#documentToolbar QToolButton,
 QWidget#searchBar QToolButton {
-  min-width: 32px;
-  max-width: 32px;
+  min-width: 34px;
+  max-width: 34px;
+  min-height: 34px;
+  max-height: 34px;
   padding: 0;
 }
 
@@ -207,9 +209,14 @@ QWidget#documentToolbar QComboBox QLineEdit#zoomControlEditor {
 
 QWidget#searchBar QLineEdit#searchInput {
   min-width: 320px;
+  max-width: 360px;
+  min-height: 36px;
+  max-height: 36px;
   border-radius: 7px;
-  border-color: transparent;
+  border: 1px solid #d9dde3;
   background: #ffffff;
+  padding-left: 6px;
+  padding-right: 6px;
 }
 
 QWidget#documentToolbar QComboBox:hover,
@@ -220,7 +227,7 @@ QWidget#emptyState QPushButton[variant="recent"]:hover {
 }
 
 QWidget#searchBar QLineEdit#searchInput:hover {
-  border-color: transparent;
+  border-color: #c1c8d1;
 }
 
 QWidget#documentToolbar QPushButton:focus,
@@ -234,7 +241,7 @@ QWidget#emptyState QPushButton:focus {
 }
 
 QWidget#searchBar QLineEdit#searchInput:focus {
-  border-color: transparent;
+  border-color: #2563eb;
 }
 
 QWidget#documentToolbar QLabel,
@@ -257,6 +264,7 @@ QLabel#emptyStateRecentMessage {
 QLabel#searchResultCounter {
   color: #20242a;
   font-weight: 600;
+  min-width: 48px;
 }
 
 QLabel#statusStateIcon[error="true"],
