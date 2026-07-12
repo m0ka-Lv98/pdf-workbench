@@ -1,0 +1,392 @@
+name: Build macOS application
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/build-macos.yml"
+      - "packaging/pdf_workbench_macos.spec"
+      - "packaging/pdf_workbench_onedir.spec"
+      - "packaging/pdf_workbench_onefile.spec"
+      - "src/**"
+      - "tests/**"
+      - "pyproject.toml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    env:
+      PR_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Set build metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          short_sha="${PR_SOURCE_SHA::7}"
+          echo "SHORT_SHA=$short_sha" >> "$GITHUB_ENV"
+          echo "ARCHIVE_NAME=PDF-Workbench-macOS-arm64-$short_sha.zip" >> "$GITHUB_ENV"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev]"
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: mypy src/pdf_workbench
+      - run: pytest --cov=pdf_workbench
+        env:
+          QT_QPA_PLATFORM: offscreen
+      - name: Build macOS app
+        run: pyinstaller packaging/pdf_workbench_macos.spec --noconfirm --clean
+      - name: Verify bundled resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          find "dist/PDF Workbench.app" -name "workbench_light.qss" -print -quit | grep -q .
+          find "dist/PDF Workbench.app" -name "workbench_dark.qss" -print -quit | grep -q .
+          find "dist/PDF Workbench.app" -name "search.svg" -print -quit | grep -q .
+          find "dist/PDF Workbench.app" -name "document.svg" -print -quit | grep -q .
+      - name: Smoke test packaged UI
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          executable="dist/PDF Workbench.app/Contents/MacOS/PDF Workbench"
+          stdout_log="gui-stdout.log"
+          stderr_log="gui-stderr.log"
+          screenshot_path="gui-search-light.png"
+          ui_state_path="gui-search-light.json"
+
+          rm -f "$stdout_log" "$stderr_log" "$screenshot_path" "$ui_state_path"
+
+          APP_EXIT_CODE=$(PDF_WORKBENCH_BUILD_SHA="$SHORT_SHA" \
+            python - <<'PY'
+          import os
+          import subprocess
+
+          command = [
+              "dist/PDF Workbench.app/Contents/MacOS/PDF Workbench",
+              os.path.join(os.getcwd(), "tests/fixtures/real-search-english.pdf"),
+              "--window-size",
+              "1100x800",
+              "--color-scheme",
+              "light",
+              "--open-search",
+              "--search-query",
+              "Alpha",
+              "--screenshot-path",
+              "gui-search-light.png",
+              "--ui-state-path",
+              "gui-search-light.json",
+              "--quit-after-ms",
+              "9000",
+          ]
+          with open("gui-stdout.log", "w", encoding="utf-8") as stdout, open(
+              "gui-stderr.log", "w", encoding="utf-8"
+          ) as stderr:
+              completed = subprocess.run(
+                  command,
+                  stdout=stdout,
+                  stderr=stderr,
+                  timeout=20,
+                  check=False,
+                  env=os.environ.copy(),
+              )
+          print(str(completed.returncode))
+          PY
+          )
+          test "$APP_EXIT_CODE" -eq 0
+          test -f "$screenshot_path"
+          test -f "$ui_state_path"
+          if grep -q "QThread: Destroyed while thread is still running" "$stdout_log" "$stderr_log"; then
+            exit 1
+          fi
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          payload = json.loads(Path("gui-search-light.json").read_text(encoding="utf-8"))
+          assert payload["active_theme"] == "light"
+          assert payload["requested_window_size"] == [1100, 800]
+          assert payload["actual_window_size"] == [1100, 800]
+          assert payload["search_counter"] == "1 / 2"
+          assert payload["visible_controls"]["search_surface"] is True
+          assert payload["main_toolbar_geometry"][2] > 0
+          assert 52 <= payload["main_toolbar_geometry"][3] <= 56
+          assert payload["search_row_geometry"][3] <= 56
+          assert payload["search_surface_geometry"][2] > 0
+          assert payload["page_input_geometry"][2] > 0
+          assert payload["zoom_control_geometry"][2] > 0
+          PY
+      - name: Capture UI review screenshots
+        shell: bash
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          set -euo pipefail
+          review_dir="ui-review"
+          mkdir -p "$review_dir"
+
+          capture_ui() {
+            local stem="$1"
+            shift
+            python -m pdf_workbench "$@" \
+              --screenshot-path "$review_dir/$stem.png" \
+              --ui-state-path "$review_dir/$stem.json" \
+              --quit-after-ms 1800
+          }
+
+          capture_ui "light-empty-1100x800" \
+            --window-size 1100x800 \
+            --color-scheme light
+
+          capture_ui "light-document-1100x800" \
+            tests/fixtures/real-search-english.pdf \
+            --window-size 1100x800 \
+            --color-scheme light
+
+          capture_ui "light-search-1100x800" \
+            tests/fixtures/real-search-english.pdf \
+            --window-size 1100x800 \
+            --color-scheme light \
+            --open-search \
+            --search-query Alpha
+
+          capture_ui "dark-document-1100x800" \
+            tests/fixtures/real-search-english.pdf \
+            --window-size 1100x800 \
+            --color-scheme dark
+
+          capture_ui "dark-search-1100x800" \
+            tests/fixtures/real-search-english.pdf \
+            --window-size 1100x800 \
+            --color-scheme dark \
+            --open-search \
+            --search-query Alpha
+
+          capture_ui "light-document-800x600" \
+            tests/fixtures/real-search-english.pdf \
+            --window-size 800x600 \
+            --color-scheme light
+
+          capture_ui "light-search-800x600" \
+            tests/fixtures/real-search-english.pdf \
+            --window-size 800x600 \
+            --color-scheme light \
+            --open-search \
+            --search-query Alpha
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pdf-workbench-ui-review-${{ env.SHORT_SHA }}
+          path: |
+            ui-review/light-empty-1100x800.png
+            ui-review/light-empty-1100x800.json
+            ui-review/light-document-1100x800.png
+            ui-review/light-document-1100x800.json
+            ui-review/light-search-1100x800.png
+            ui-review/light-search-1100x800.json
+            ui-review/dark-document-1100x800.png
+            ui-review/dark-document-1100x800.json
+            ui-review/dark-search-1100x800.png
+            ui-review/dark-search-1100x800.json
+            ui-review/light-document-800x600.png
+            ui-review/light-document-800x600.json
+            ui-review/light-search-800x600.png
+            ui-review/light-search-800x600.json
+          if-no-files-found: error
+      - name: Verify UI review screenshots
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import math
+          from pathlib import Path
+
+          from PySide6.QtGui import QColor, QImage
+
+          review_dir = Path("ui-review")
+          expected_sizes = {
+              "light-empty-1100x800": [1100, 800],
+              "light-document-1100x800": [1100, 800],
+              "light-search-1100x800": [1100, 800],
+              "dark-document-1100x800": [1100, 800],
+              "dark-search-1100x800": [1100, 800],
+              "light-document-800x600": [800, 600],
+              "light-search-800x600": [800, 600],
+          }
+
+          def center_y(rect: list[int]) -> int:
+              return rect[1] + rect[3] // 2
+
+          def contains_rect(outer: list[int], inner: list[int]) -> bool:
+              return (
+                  inner[0] >= outer[0]
+                  and inner[1] >= outer[1]
+                  and inner[0] + inner[2] <= outer[0] + outer[2]
+                  and inner[1] + inner[3] <= outer[1] + outer[3]
+              )
+
+          def color_distance(color: QColor, expected: tuple[int, int, int]) -> float:
+              return math.sqrt(
+                  (color.red() - expected[0]) ** 2
+                  + (color.green() - expected[1]) ** 2
+                  + (color.blue() - expected[2]) ** 2
+              )
+
+          def assert_edge_has_accent(
+              stem: str,
+              image: QImage,
+              rect: list[int],
+              expected: tuple[int, int, int],
+          ) -> None:
+              x, y, width, height = rect
+              samples = {
+                  "top": [
+                      (x + width // 2 + dx, yy)
+                      for yy in (y, y + 1)
+                      for dx in (-2, -1, 0, 1, 2)
+                  ],
+                  "bottom": [
+                      (x + width // 2 + dx, yy)
+                      for yy in (y + height - 2, y + height - 1)
+                      for dx in (-2, -1, 0, 1, 2)
+                  ],
+                  "left": [
+                      (xx, y + height // 2 + dy)
+                      for xx in (x, x + 1)
+                      for dy in (-2, -1, 0, 1, 2)
+                  ],
+                  "right": [
+                      (xx, y + height // 2 + dy)
+                      for xx in (x + width - 2, x + width - 1)
+                      for dy in (-2, -1, 0, 1, 2)
+                  ],
+              }
+              for side, points in samples.items():
+                  distances: list[tuple[tuple[int, int], tuple[int, int, int], float]] = []
+                  matched = False
+                  for px, py in points:
+                      if 0 <= px < image.width() and 0 <= py < image.height():
+                          color = image.pixelColor(px, py)
+                          rgb = (color.red(), color.green(), color.blue())
+                          distance = color_distance(color, expected)
+                          distances.append(((px, py), rgb, distance))
+                          if distance <= 28:
+                              matched = True
+                  assert matched, (
+                      f"{stem} {side} expected={expected} "
+                      f"samples={distances}"
+                  )
+
+          payloads: dict[str, dict[str, object]] = {}
+          images: dict[str, QImage] = {}
+          for stem, expected_size in expected_sizes.items():
+              image = QImage(str(review_dir / f"{stem}.png"))
+              assert not image.isNull(), stem
+              assert [image.width(), image.height()] == expected_size, stem
+              images[stem] = image
+              payload = json.loads((review_dir / f"{stem}.json").read_text(encoding="utf-8"))
+              payloads[stem] = payload
+              assert payload["requested_window_size"] == expected_size, stem
+              assert payload["actual_window_size"] == expected_size, stem
+
+          compact = payloads["light-document-800x600"]
+          assert compact["window_minimum_size_hint"][0] <= 800
+          assert 56 <= compact["page_input_geometry"][2] <= 64
+          assert 90 <= compact["zoom_control_geometry"][2] <= 104
+          assert compact["main_toolbar_geometry"][2] > 0
+          assert compact["visible_controls"]["rotate"] is True
+
+          for stem in ("light-search-1100x800", "dark-search-1100x800"):
+              payload = payloads[stem]
+              search_surface = payload["search_surface_window_geometry"]
+              input_surface = payload["search_input_surface_geometry"]
+              input_surface_border = payload["search_input_surface_border_geometry"]
+              input_surface_size = payload["search_input_surface_size"]
+              first_page = payload["first_page_window_geometry"]
+              assert search_surface[2] > 0 and search_surface[3] > 0
+              assert input_surface[2] > 0 and input_surface[3] == 40
+              assert input_surface_border[2] > 0 and input_surface_border[3] == 40
+              assert input_surface == input_surface_border
+              assert input_surface_size == [360, 40]
+              assert first_page[2] > 0 and first_page[3] > 0
+              assert first_page[1] >= search_surface[1] + search_surface[3] + 8
+              assert contains_rect(search_surface, input_surface)
+
+              icon = payload["search_icon_geometry"]
+              line_edit = payload["search_line_edit_geometry"]
+              clear_button = payload["search_clear_button_geometry"]
+              assert icon[3] <= 18
+              assert line_edit[3] <= 28
+              assert clear_button[3] <= 26
+              assert abs(center_y(icon) - center_y(input_surface)) <= 1
+              assert abs(center_y(line_edit) - center_y(input_surface)) <= 1
+              assert abs(center_y(clear_button) - center_y(input_surface)) <= 1
+              assert abs(center_y(icon) - center_y(line_edit)) <= 1
+              assert contains_rect(input_surface, icon)
+              assert contains_rect(input_surface, line_edit)
+              assert contains_rect(input_surface, clear_button)
+
+          light_search = payloads["light-search-1100x800"]
+          assert light_search["search_query"] == "Alpha"
+          assert light_search["search_counter"] == "1 / 2"
+          assert light_search["status_message_text"] == "準備完了"
+          assert light_search["native_status_message"] == ""
+          assert light_search["status_left_geometry"][2] > 0
+          assert light_search["status_icon_geometry"][2] > 0
+          assert (
+              light_search["status_message_geometry"][0]
+              > light_search["status_icon_geometry"][0] + light_search["status_icon_geometry"][2]
+          )
+
+          compact_search = payloads["light-search-800x600"]
+          assert compact_search["search_query"] == "Alpha"
+          assert compact_search["search_counter"] == "1 / 2"
+          assert compact_search["search_input_surface_geometry"][3] == 40
+          assert compact_search["search_input_surface_border_geometry"][3] == 40
+          assert compact_search["search_input_surface_size"] == [360, 40]
+          assert contains_rect(
+              compact_search["search_surface_window_geometry"],
+              compact_search["search_input_surface_geometry"],
+          )
+
+          assert_edge_has_accent(
+              "light-search-1100x800",
+              images["light-search-1100x800"],
+              light_search["search_input_surface_border_geometry"],
+              (37, 99, 235),
+          )
+          assert_edge_has_accent(
+              "dark-search-1100x800",
+              images["dark-search-1100x800"],
+              payloads["dark-search-1100x800"]["search_input_surface_border_geometry"],
+              (96, 165, 250),
+          )
+          PY
+      - name: Package app bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          ditto -c -k --sequesterRsrc --keepParent \
+            "dist/PDF Workbench.app" \
+            "artifacts/$ARCHIVE_NAME"
+          shasum -a 256 "artifacts/$ARCHIVE_NAME" > "artifacts/$ARCHIVE_NAME.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pdf-workbench-macos-arm64-${{ env.SHORT_SHA }}
+          path: |
+            artifacts/${{ env.ARCHIVE_NAME }}
+            artifacts/${{ env.ARCHIVE_NAME }}.sha256
+            gui-search-light.png
+            gui-search-light.json
+            gui-stdout.log
+            gui-stderr.log
+          if-no-files-found: error

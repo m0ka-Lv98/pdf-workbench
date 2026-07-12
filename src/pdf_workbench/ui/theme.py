@@ -14,7 +14,7 @@ class ColorScheme(StrEnum):
 
 
 def _stylesheet_name(scheme: ColorScheme) -> str:
-    return "bootstrap_dark.qss" if scheme is ColorScheme.DARK else "bootstrap_light.qss"
+    return "workbench_dark.qss" if scheme is ColorScheme.DARK else "workbench_light.qss"
 
 
 def load_stylesheet(scheme: ColorScheme) -> str:
@@ -40,6 +40,9 @@ def detect_system_color_scheme() -> ColorScheme:
 def apply_application_theme(app: QApplication, scheme: ColorScheme) -> None:
     app.setProperty("colorScheme", scheme.value)
     app.setStyleSheet(load_stylesheet(scheme))
+    from pdf_workbench.ui.icon_provider import IconProvider
+
+    IconProvider.invalidate_cache()
 
 
 def _is_dark(color: QColor) -> bool:
@@ -66,6 +69,10 @@ class ThemeController(QObject):
             return
         self._current_scheme = scheme
         apply_application_theme(self._app, scheme)
+        for widget in self._app.topLevelWidgets():
+            refresh = getattr(widget, "refresh_theme_assets", None)
+            if callable(refresh):
+                refresh()
         self.scheme_changed.emit(scheme)
 
     @property

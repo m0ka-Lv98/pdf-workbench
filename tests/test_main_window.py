@@ -5,10 +5,10 @@ import time
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import QMimeData, QPoint, QPointF, QSettings, Qt, QUrl
-from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent, QKeySequence
+from PySide6.QtCore import QMimeData, QPoint, QPointF, QRect, QSettings, Qt, QUrl
+from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent, QImage, QKeySequence
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QHBoxLayout, QLabel, QMessageBox, QTabBar, QToolButton
 from pytestqt.qtbot import QtBot
 
 from pdf_test_utils import copy_pdf_fixture, create_blank_pdf, create_image_only_pdf
@@ -21,6 +21,7 @@ from pdf_workbench.services.pdf_renderer import (
 )
 from pdf_workbench.ui.main_window import MainWindow
 from pdf_workbench.ui.pdf_view import PdfView
+from pdf_workbench.ui.widgets.search_bar import SearchBar, SearchInputSurface
 
 
 def patch_pdf_open(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -47,28 +48,91 @@ def show_window(qtbot: QtBot, window: MainWindow) -> None:
 
 def assert_search_ui_ready(window: MainWindow) -> None:
     assert window._search_toolbar is not None
+    assert window._search_surface is not None
     assert window._search_toolbar.isVisible()
+    assert window._search_surface.isVisible()
     assert window._search_bar.isVisible()
+    assert window._search_bar.search_input_surface.isVisible()
     assert window._search_bar.search_input.isVisible()
     if QApplication.platformName() != "offscreen":
         assert window._search_bar.search_input.hasFocus()
+        assert window._search_bar.search_input_surface.property("focused") is True
     assert window._search_toolbar.geometry().width() > 0
     assert window._search_toolbar.geometry().height() > 0
+    assert window._search_surface.geometry().width() > 0
+    assert window._search_surface.geometry().height() > 0
     assert window._search_bar.geometry().width() > 0
     assert window._search_bar.geometry().height() > 0
+    assert window._search_bar.search_input_surface.geometry().width() > 0
+    assert window._search_bar.search_input_surface.geometry().height() == 40
     assert window._search_bar.search_input.geometry().width() > 0
-    assert window._search_bar.search_input.geometry().height() > 0
+    assert window._search_bar.search_input.geometry().height() == 28
     assert window._search_toolbar.geometry().height() >= window._search_bar.geometry().height()
     assert (
         window._search_bar.geometry().height()
         >= window._search_bar.search_input.geometry().height()
     )
+    assert window._search_surface.geometry().height() >= window._search_bar.sizeHint().height()
+    assert window._search_surface.geometry().height() >= window._search_bar.geometry().height()
+    search_top = window._search_toolbar.mapTo(
+        window,
+        window._search_toolbar.rect().topLeft(),
+    ).y()
     if window._main_toolbar is not None:
-        search_top = window._search_toolbar.mapTo(
-            window,
-            window._search_toolbar.rect().topLeft(),
-        ).y()
         assert search_top >= window._main_toolbar.geometry().bottom()
+    tab_bar_bottom = (
+        window._tabs.tabBar()
+        .mapTo(
+            window,
+            window._tabs.tabBar().rect().bottomLeft(),
+        )
+        .y()
+    )
+    assert search_top >= tab_bar_bottom
+    toolbar_right = window._search_toolbar.rect().right()
+    surface_right = window._search_surface.geometry().right()
+    assert toolbar_right - surface_right < 40
+    input_surface_rect = window._search_bar.search_input_surface.rect()
+    child_widgets = (
+        window._search_bar.search_icon,
+        window._search_bar.search_input,
+        window._search_bar.previous_button,
+        window._search_bar.next_button,
+        window._search_bar.close_button,
+        window._search_bar.counter_label,
+    )
+    for widget in (
+        window._search_bar.search_input_surface,
+        window._search_bar.previous_button,
+        window._search_bar.next_button,
+        window._search_bar.close_button,
+        window._search_bar.counter_label,
+    ):
+        top_left = widget.mapTo(window._search_surface, widget.rect().topLeft())
+        bottom_right = widget.mapTo(window._search_surface, widget.rect().bottomRight())
+        child_rect = QRect(top_left, bottom_right)
+        assert window._search_surface.rect().contains(child_rect)
+    for widget in child_widgets[:2]:
+        top_left = widget.mapTo(window._search_bar.search_input_surface, widget.rect().topLeft())
+        bottom_right = widget.mapTo(
+            window._search_bar.search_input_surface,
+            widget.rect().bottomRight(),
+        )
+        child_rect = QRect(top_left, bottom_right)
+        assert input_surface_rect.contains(child_rect)
+    surface_center_y = window._search_bar.search_input_surface.geometry().center().y()
+    for widget in (
+        window._search_bar.search_icon,
+        window._search_bar.search_input,
+    ):
+        assert abs(widget.geometry().center().y() - surface_center_y) <= 1
+
+
+def assert_button_icon_valid(button: QToolButton) -> None:
+    icon = button.icon()
+    assert not icon.isNull()
+    pixmap = icon.pixmap(16, 16)
+    assert not pixmap.isNull()
 
 
 class DelayedTextBackend(PdfiumDocumentBackend):
@@ -132,7 +196,12 @@ def test_main_window_opens_and_closes_multiple_documents(
     assert window._stack.currentWidget() is window._tabs
     assert window._tabs.tabBar().elideMode() == Qt.TextElideMode.ElideMiddle
     assert window._tabs.tabBar().usesScrollButtons() is True
-    assert window._tabs.tabsClosable() is True
+    assert window._tabs.tabsClosable() is False
+    assert 32 <= window._tabs.tabBar().height() <= 42
+    assert window._tabs.tabBar().drawBase() is False
+    close_button = window._tabs.tabBar().tabButton(0, QTabBar.ButtonPosition.RightSide)
+    assert isinstance(close_button, QToolButton)
+    assert close_button.objectName() == "tabCloseButton"
 
     assert window.close_document_at(1) is True
     assert window._tabs.count() == 1
@@ -288,6 +357,78 @@ def test_main_window_search_toolbar_starts_hidden(
 
 
 def test_main_window_toolbar_search_button_opens_search_ui(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    settings = create_settings(tmp_path)
+    window = MainWindow(settings)
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = create_blank_pdf(tmp_path / "toolbar-search.pdf", 1)
+    window.open_document(document_path)
+    qtbot.waitUntil(lambda: bool(window._documents[0].view._canvas.pages))
+
+    assert window._toolbar_widget.search_button.isEnabled() is True
+    QTest.mouseClick(window._toolbar_widget.search_button, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(lambda: window._search_ui_is_ready())
+    assert_search_ui_ready(window)
+    document = window._documents[0]
+    surface_bottom = window._search_surface.mapTo(
+        window,
+        window._search_surface.rect().bottomLeft(),
+    ).y()
+    page_top = (
+        document.view._canvas.pages[0]
+        .mapTo(
+            window,
+            document.view._canvas.pages[0].rect().topLeft(),
+        )
+        .y()
+    )
+    assert page_top >= surface_bottom + 8
+
+
+def test_main_window_responsive_toolbar_keeps_controls_visible_at_800_width(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    window = MainWindow(settings)
+    qtbot.addWidget(window)
+    window.resize(800, 600)
+    show_window(qtbot, window)
+
+    document_path = tmp_path / "responsive.pdf"
+    document_path.touch()
+    window.open_document(document_path)
+
+    for widget in (
+        window._toolbar_widget.open_button,
+        window._toolbar_widget.search_button,
+        window._toolbar_widget.previous_button,
+        window._toolbar_widget.page_field,
+        window._toolbar_widget.next_button,
+        window._toolbar_widget.zoom_out_button,
+        window._toolbar_widget.zoom_field,
+        window._toolbar_widget.zoom_in_button,
+        window._toolbar_widget.rotate_button,
+    ):
+        assert widget.geometry().width() > 0
+        assert widget.geometry().height() > 0
+        assert (
+            widget.mapTo(window._toolbar_widget, widget.rect().topRight()).x()
+            <= window._toolbar_widget.width()
+        )
+    assert window._main_toolbar is not None
+    assert window._main_toolbar.minimumSizeHint().width() <= 800
+    assert 56 <= window._toolbar_widget.page_field.width() <= 64
+    assert 90 <= window._toolbar_widget.zoom_field.width() <= 104
+
+
+def test_main_window_status_left_container_has_margin_and_valid_icon(
     monkeypatch: pytest.MonkeyPatch,
     qtbot: QtBot,
     tmp_path: Path,
@@ -298,14 +439,106 @@ def test_main_window_toolbar_search_button_opens_search_ui(
     qtbot.addWidget(window)
     show_window(qtbot, window)
 
-    document_path = tmp_path / "toolbar-search.pdf"
+    layout = window._status_left.layout()
+    assert isinstance(layout, QHBoxLayout)
+    assert 16 <= layout.contentsMargins().left() <= 18
+    assert not window._status_icon.pixmap().isNull()
+    assert window._status_message.geometry().left() > window._status_icon.geometry().right()
+    assert window.statusBar().currentMessage() == ""
+    assert window._status_message.text() == "準備完了"
+    assert len(window.findChildren(QLabel, "statusMessageLabel")) == 1
+
+    right_layout = window._status_right.layout()
+    assert isinstance(right_layout, QHBoxLayout)
+    assert 16 <= right_layout.contentsMargins().right() <= 18
+
+
+def test_main_window_status_message_uses_custom_label_and_resets_after_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    window = MainWindow(settings)
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    window._set_status_message("エラーです", error=True, timeout_ms=10)
+
+    assert window.statusBar().currentMessage() == ""
+    assert window._status_message.text() == "エラーです"
+    assert window._status_icon.property("error") is True
+    assert window._status_icon.geometry().right() < window._status_message.geometry().left()
+
+    qtbot.waitUntil(lambda: window._status_message.text() == "準備完了")
+    assert window.statusBar().currentMessage() == ""
+    assert window._status_icon.property("error") is False
+
+
+def test_main_window_uses_custom_tab_close_buttons(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    window = MainWindow(settings)
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    first = tmp_path / "first.pdf"
+    second = tmp_path / "second.pdf"
+    first.touch()
+    second.touch()
+    window.open_document(first)
+    window.open_document(second)
+
+    tab_bar = window._tabs.tabBar()
+    first_button = tab_bar.tabButton(0, QTabBar.ButtonPosition.RightSide)
+    second_button = tab_bar.tabButton(1, QTabBar.ButtonPosition.RightSide)
+    assert isinstance(first_button, QToolButton)
+    assert isinstance(second_button, QToolButton)
+    assert first_button.toolTip() == "閉じる"
+    assert first_button.accessibleName() == "タブを閉じる"
+    assert_button_icon_valid(first_button)
+    assert_button_icon_valid(second_button)
+
+    QTest.mouseClick(first_button, Qt.MouseButton.LeftButton)
+    assert window._tabs.count() == 1
+    assert window._documents[0].session.source_path == second.resolve()
+
+    remaining_button = tab_bar.tabButton(0, QTabBar.ButtonPosition.RightSide)
+    assert isinstance(remaining_button, QToolButton)
+    QTest.mouseClick(remaining_button, Qt.MouseButton.LeftButton)
+    assert window._tabs.count() == 0
+
+
+def test_main_window_refreshes_tab_close_button_icons_on_theme_change(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    window = MainWindow(settings)
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = tmp_path / "theme.pdf"
     document_path.touch()
     window.open_document(document_path)
+    button = window._tabs.tabBar().tabButton(0, QTabBar.ButtonPosition.RightSide)
+    assert isinstance(button, QToolButton)
+    assert_button_icon_valid(button)
 
-    assert window._toolbar_widget.search_button.isEnabled() is True
-    QTest.mouseClick(window._toolbar_widget.search_button, Qt.MouseButton.LeftButton)
-    qtbot.waitUntil(lambda: window._search_ui_is_ready())
-    assert_search_ui_ready(window)
+    from pdf_workbench.ui.theme import ColorScheme, apply_application_theme
+
+    app = QApplication.instance()
+    assert isinstance(app, QApplication)
+    apply_application_theme(app, ColorScheme.DARK)
+    window.refresh_theme_assets()
+    assert_button_icon_valid(button)
 
 
 def test_main_window_find_action_opens_search_ui(
@@ -486,6 +719,53 @@ def test_main_window_search_bar_enter_and_shift_enter_fire_once(
     assert previous_calls == 1
 
 
+def test_main_window_search_input_surface_tracks_focus_and_clear_button(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    window = MainWindow(settings)
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = create_blank_pdf(tmp_path / "search-focus.pdf", 1)
+    window.open_document(document_path)
+    assert window.open_search_bar() is True
+
+    search_bar = window._search_bar
+    assert "paintEvent" not in SearchBar.__dict__
+    assert "paintEvent" in SearchInputSurface.__dict__
+    assert search_bar.search_input_surface.height() == 40
+    assert search_bar.search_icon.height() == 18
+    assert search_bar.search_input.height() == 28
+    assert search_bar.clear_button.height() == 26
+    assert search_bar.search_input.actions() == []
+    assert search_bar.clear_button.isHidden()
+    assert search_bar.search_input_surface.property("focused") is True
+
+    search_bar.search_input.setText("Alpha")
+    qtbot.waitUntil(search_bar.clear_button.isVisible)
+    assert search_bar.search_input_surface.property("focused") is True
+
+    surface_center_y = search_bar.search_input_surface.geometry().center().y()
+    for widget in (
+        search_bar.search_icon,
+        search_bar.search_input,
+        search_bar.clear_button,
+    ):
+        assert abs(widget.geometry().center().y() - surface_center_y) <= 1
+        assert widget.geometry().top() >= 0
+        assert widget.geometry().bottom() <= search_bar.search_input_surface.height() - 1
+
+    QTest.mouseClick(search_bar.clear_button, Qt.MouseButton.LeftButton)
+    assert search_bar.search_input.text() == ""
+    assert search_bar.clear_button.isHidden()
+    window._toolbar_widget.page_field.setFocus(Qt.FocusReason.OtherFocusReason)
+    qtbot.waitUntil(lambda: window._search_bar.search_input_surface.property("focused") is False)
+
+
 def test_main_window_search_progress_text_uses_failed_page_count() -> None:
     from pdf_workbench.ui.pdf_view import PdfSearchState
 
@@ -560,7 +840,7 @@ def test_main_window_real_search_updates_after_index_completion(
     search_input = window._search_bar.search_input
     search_input.clear()
     search_input.setText("Alpha")
-    window._search_bar._emit_debounced_search()
+    window._search_bar.submit_current_query()
 
     qtbot.waitUntil(lambda: window._documents[0].view.search_state.query == "Alpha", timeout=8000)
     qtbot.waitUntil(lambda: window._documents[0].view.search_state.total_count == 2, timeout=8000)
@@ -570,7 +850,7 @@ def test_main_window_real_search_updates_after_index_completion(
     document = window._documents[0]
     assert document.view.search_state.failed_pages == 0
     assert window._search_bar.counter_label.text() == "1 / 2"
-    assert window._search_bar.progress_label.text() == "検索結果 2 件"
+    assert window._search_bar.progress_label.text() == ""
     assert len(document.view._canvas.pages[0]._current_match_boxes) == 1
     assert len(document.view._canvas.pages[0]._match_boxes) == 2
 
@@ -600,7 +880,7 @@ def test_main_window_real_search_supports_japanese_text(
     search_input = window._search_bar.search_input
     search_input.clear()
     search_input.setText("検索")
-    window._search_bar._emit_debounced_search()
+    window._search_bar.submit_current_query()
 
     qtbot.waitUntil(lambda: window._documents[0].view.search_state.query == "検索", timeout=8000)
     qtbot.waitUntil(lambda: window._documents[0].view.search_state.indexing_completed, timeout=8000)
@@ -609,7 +889,7 @@ def test_main_window_real_search_supports_japanese_text(
     document = window._documents[0]
     assert document.view.search_state.current_index == 1
     assert window._search_bar.counter_label.text() == "1 / 2"
-    assert window._search_bar.progress_label.text() == "検索結果 2 件"
+    assert window._search_bar.progress_label.text() == ""
     assert len(document.view._canvas.pages[0]._current_match_boxes) == 1
 
     document.view.close_document()
@@ -626,7 +906,7 @@ def test_main_window_real_search_reports_blank_pdf_without_text_layer(
     window.open_document(document_path)
     assert window.open_search_bar() is True
     window._search_bar.search_input.setText("Alpha")
-    window._search_bar._emit_debounced_search()
+    window._search_bar.submit_current_query()
 
     qtbot.waitUntil(lambda: window._documents[0].view.search_state.indexing_completed, timeout=8000)
 
@@ -648,7 +928,7 @@ def test_main_window_real_search_reports_image_pdf_needs_ocr(
     window.open_document(document_path)
     assert window.open_search_bar() is True
     window._search_bar.search_input.setText("scan")
-    window._search_bar._emit_debounced_search()
+    window._search_bar.submit_current_query()
 
     qtbot.waitUntil(lambda: window._documents[0].view.search_state.indexing_completed, timeout=8000)
 
@@ -823,3 +1103,42 @@ def test_main_window_keeps_open_when_render_service_shutdown_times_out(
     monkeypatch.undo()
     window._render_service._thread.quit()
     assert window._render_service._thread.wait(5000) is True
+
+
+def test_main_window_diagnostic_capture_stays_at_800_by_600(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    from pdf_workbench.__main__ import _apply_window_size, _build_ui_state
+
+    settings = create_settings(tmp_path)
+    window = MainWindow(settings)
+    qtbot.addWidget(window)
+
+    document_path = tmp_path / "diag.pdf"
+    document_path.touch()
+    _apply_window_size(window, "800x600")
+    window.show()
+    qtbot.waitUntil(window.isVisible)
+    window.open_document(document_path)
+    assert window.open_search_bar() is True
+    qtbot.waitUntil(lambda: window.width() == 800 and window.height() == 600)
+
+    screenshot_path = tmp_path / "window-800x600.png"
+    assert window.grab().save(str(screenshot_path))
+    image = QImage(str(screenshot_path))
+
+    payload = _build_ui_state(window, requested_window_size="800x600")
+
+    assert not image.isNull()
+    assert image.width() == 800
+    assert image.height() == 600
+    assert payload["actual_window_size"] == [800, 600]
+    assert payload["search_input_surface_size"] == [360, 40]
+    assert payload["search_input_surface_geometry"][3] == 40
+    assert payload["search_input_surface_border_geometry"][3] == 40
+    assert (
+        payload["search_input_surface_geometry"] == payload["search_input_surface_border_geometry"]
+    )

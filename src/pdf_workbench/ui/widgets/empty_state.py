@@ -3,7 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import QFrame, QLabel, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
+
+from pdf_workbench.ui.icon_provider import IconName, IconProvider
 
 
 class EmptyState(QWidget):
@@ -14,21 +16,27 @@ class EmptyState(QWidget):
         super().__init__(parent)
         self.setObjectName("emptyState")
         self.setAccessibleName("Empty state")
-        layout = QVBoxLayout(self)
-        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.setSpacing(12)
 
-        title = QLabel("PDF Workbench", self)
-        title.setObjectName("emptyStateTitle")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(40, 28, 40, 28)
+        root.setSpacing(24)
+        root.addStretch(1)
 
-        subtitle = QLabel(
-            "PDFをドラッグ&ドロップするか、下のボタンから開いてください。",
+        self._icon_label = QLabel(self)
+        self._icon_label.setObjectName("emptyStateIcon")
+        self._icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self._title_label = QLabel("PDFを開いて作業を始めましょう", self)
+        self._title_label.setObjectName("emptyStateTitle")
+        self._title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self._subtitle_label = QLabel(
+            "PDFを開くかドラッグ&ドロップして、検索や選択をすぐに利用できます。",
             self,
         )
-        subtitle.setObjectName("emptyStateSubtitle")
-        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        subtitle.setProperty("muted", True)
+        self._subtitle_label.setObjectName("emptyStateSubtitle")
+        self._subtitle_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._subtitle_label.setWordWrap(True)
 
         self.open_button = QPushButton("PDFを開く", self)
         self.open_button.setObjectName("openPdfButton")
@@ -37,23 +45,42 @@ class EmptyState(QWidget):
         self.open_button.setProperty("variant", "primary")
         self.open_button.clicked.connect(self.open_requested.emit)
 
-        self._recent_container = QVBoxLayout()
+        self._recent_hint = QLabel("最近使ったファイル", self)
+        self._recent_hint.setObjectName("emptyStateRecentHint")
+
         self._recent_message = QLabel("最近使ったファイルはありません", self)
         self._recent_message.setObjectName("emptyStateRecentMessage")
-        self._recent_message.setProperty("muted", True)
-        self._recent_message.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._recent_message.setVisible(True)
 
-        recent_frame = QFrame(self)
-        recent_layout = QVBoxLayout(recent_frame)
-        recent_layout.setSpacing(6)
+        self._recent_container = QVBoxLayout()
+        self._recent_container.setSpacing(8)
+
+        open_row = QHBoxLayout()
+        open_row.addStretch(1)
+        open_row.addWidget(self.open_button)
+        open_row.addStretch(1)
+
+        self._recent_block = QWidget(self)
+        self._recent_block.setObjectName("emptyStateRecentBlock")
+        recent_layout = QVBoxLayout(self._recent_block)
+        recent_layout.setContentsMargins(0, 0, 0, 0)
+        recent_layout.setSpacing(8)
+        recent_layout.addWidget(self._recent_hint)
         recent_layout.addWidget(self._recent_message)
         recent_layout.addLayout(self._recent_container)
 
-        layout.addWidget(title)
-        layout.addWidget(subtitle)
-        layout.addWidget(self.open_button, alignment=Qt.AlignmentFlag.AlignHCenter)
-        layout.addWidget(recent_frame)
+        root.addWidget(self._icon_label)
+        root.addWidget(self._title_label)
+        root.addWidget(self._subtitle_label)
+        root.addLayout(open_row)
+        root.addWidget(self._recent_block, alignment=Qt.AlignmentFlag.AlignHCenter)
+        root.addStretch(2)
+
+        self.refresh_theme_assets()
+
+    def refresh_theme_assets(self) -> None:
+        pixmap = IconProvider.icon(IconName.DOCUMENT, size=48).pixmap(48, 48)
+        self._icon_label.setPixmap(pixmap)
 
     def set_recent_files(self, paths: list[Path]) -> None:
         while self._recent_container.count():
@@ -63,14 +90,17 @@ class EmptyState(QWidget):
             widget = item.widget()
             if widget is not None:
                 widget.deleteLater()
+
         visible_paths = paths[:5]
         self._recent_message.setVisible(not visible_paths)
         for path in visible_paths:
             button = QPushButton(path.name, self)
+            button.setObjectName(f"recentFileButton_{path.name}")
             button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
             button.setToolTip(str(path))
             button.setAccessibleName(path.name)
-            button.setProperty("variant", "outline")
+            button.setProperty("variant", "recent")
+            button.setIcon(IconProvider.icon(IconName.HISTORY, size=16))
             button.clicked.connect(
                 lambda checked=False, file_path=path: self.recent_file_requested.emit(file_path)
             )
