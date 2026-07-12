@@ -2,19 +2,27 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QPoint, QTimer
-from PySide6.QtWidgets import QApplication, QWidget
+from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
 
 from pdf_workbench import __version__
 from pdf_workbench.core.app_paths import APP_AUTHOR, APP_NAME
 from pdf_workbench.core.logging_config import configure_logging
 from pdf_workbench.core.settings import configure_qsettings
+from pdf_workbench.services.pdf_document_validator import PdfDocumentValidator
+from pdf_workbench.services.pdf_save_service import PdfSaveService
+from pdf_workbench.services.session_recovery import RecoveryCandidate, SessionRecoveryService
+from pdf_workbench.services.session_workspace import SessionWorkspaceManager
+from pdf_workbench.ui.dialogs.recovery_dialog import RecoveryDialog, RecoveryDialogAction
 from pdf_workbench.ui.main_window import MainWindow
 from pdf_workbench.ui.theme import ColorScheme, ThemeController, apply_application_theme
+
+logger = logging.getLogger(__name__)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -61,6 +69,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Resize the main window to WIDTHxHEIGHT before startup actions",
     )
+    parser.add_argument(
+        "--skip-recovery-prompt",
+        action="store_true",
+        help="Skip interrupted-session recovery prompts during startup",
+    )
     parser.add_argument("--version", action="version", version=__version__)
     return parser
 
@@ -76,8 +89,16 @@ def main() -> int:
     theme_controller = ThemeController(app)
     theme_controller.start()
     settings = configure_qsettings()
-
-    window = MainWindow(settings)
+    validator = PdfDocumentValidator()
+    workspace_manager = SessionWorkspaceManager()
+    save_service = PdfSaveService(validator)
+    recovery_service = SessionRecoveryService(workspace_manager, validator=validator)
+    window = MainWindow(
+        settings,
+        workspace_manager=workspace_manager,
+        save_service=save_service,
+        recovery_service=recovery_service,
+    )
     if args.color_scheme is not None:
         apply_application_theme(app, ColorScheme(args.color_scheme))
         window.refresh_theme_assets()
@@ -85,8 +106,12 @@ def main() -> int:
         _apply_window_size(window, args.window_size)
     window.show()
 
-    if args.pdf is not None:
-        window.open_document(args.pdf)
+    _perform_initial_document_open(
+        window,
+        recovery_service=recovery_service,
+        cli_pdf=args.pdf,
+        skip_recovery_prompt=args.skip_recovery_prompt,
+    )
 
     def run_startup_actions() -> None:
         if args.window_size is not None:
@@ -124,6 +149,72 @@ def main() -> int:
         QTimer.singleShot(args.quit_after_ms, app.quit)
 
     return app.exec()
+
+
+def _handle_startup_recovery(
+    window: MainWindow,
+    recovery_service: SessionRecoveryService,
+) -> None:
+    scan_result = recovery_service.scan_candidates()
+    if not scan_result.candidates:
+        return
+    dialog = RecoveryDialog(scan_result.candidates, window)
+    dialog.show()
+    dialog.raise_()
+    dialog.activateWindow()
+    dialog.exec()
+    result = dialog.result_value
+
+    selected = set(id(candidate) for candidate in result.candidates)
+    for candidate in scan_result.candidates:
+        if result.action is RecoveryDialogAction.RECOVER and id(candidate) in selected:
+            _restore_candidate(window, recovery_service, candidate)
+            continue
+        if result.action is RecoveryDialogAction.DISCARD and id(candidate) in selected:
+            _discard_candidate(window, recovery_service, candidate)
+            continue
+        recovery_service.release_candidate(candidate)
+
+
+def _restore_candidate(
+    window: MainWindow,
+    recovery_service: SessionRecoveryService,
+    candidate: RecoveryCandidate,
+) -> None:
+    try:
+        session = recovery_service.restore_candidate(candidate)
+    except Exception as exc:
+        logger.exception("Failed to restore interrupted session: %s", candidate.workspace_directory)
+        QMessageBox.critical(window, "復旧に失敗しました", str(exc))
+        recovery_service.release_candidate(candidate)
+        return
+    if not window.restore_session(session):
+        return
+
+
+def _discard_candidate(
+    window: MainWindow,
+    recovery_service: SessionRecoveryService,
+    candidate: RecoveryCandidate,
+) -> None:
+    try:
+        recovery_service.discard_candidate(candidate)
+    except Exception as exc:
+        logger.exception("Failed to discard interrupted session: %s", candidate.workspace_directory)
+        QMessageBox.critical(window, "復旧候補を破棄できません", str(exc))
+
+
+def _perform_initial_document_open(
+    window: MainWindow,
+    *,
+    recovery_service: SessionRecoveryService,
+    cli_pdf: Path | None,
+    skip_recovery_prompt: bool,
+) -> None:
+    if not skip_recovery_prompt:
+        _handle_startup_recovery(window, recovery_service)
+    if cli_pdf is not None:
+        window.open_document(cli_pdf)
 
 
 def _build_ui_state(window: MainWindow, *, requested_window_size: str | None) -> dict[str, Any]:

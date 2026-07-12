@@ -30,7 +30,7 @@ from pdf_test_utils import (
     create_image_only_pdf,
     create_qt_text_pdf,
 )
-from pdf_workbench.domain.document_session import DocumentSession, FileFingerprint
+from pdf_workbench.domain.document_session import DocumentSession, FileFingerprint, SourceStatus
 from pdf_workbench.services.page_coordinates import PageMetadata
 from pdf_workbench.services.pdf_renderer import (
     DocumentMetadata,
@@ -40,6 +40,7 @@ from pdf_workbench.services.pdf_renderer import (
     PdfRenderService,
 )
 from pdf_workbench.services.pdf_save_service import PdfSaveError, PdfSaveService, SaveResult
+from pdf_workbench.services.session_recovery import RecoveryMetadataError, SessionRecoveryService
 from pdf_workbench.services.session_workspace import SessionWorkspaceManager
 from pdf_workbench.ui.main_window import DocumentTab, MainWindow
 from pdf_workbench.ui.pdf_view import PdfView
@@ -232,6 +233,17 @@ class FakeSaveService(PdfSaveService):
         )
 
 
+class FakeRecoveryService(SessionRecoveryService):
+    def __init__(self) -> None:
+        self.write_calls: list[str] = []
+        self.should_fail = False
+
+    def write_metadata(self, session: DocumentSession) -> None:
+        self.write_calls.append(session.session_id)
+        if self.should_fail:
+            raise RecoveryMetadataError("metadata failure")
+
+
 class TrackingWorkspaceManager(SessionWorkspaceManager):
     def __init__(self, sessions_root: Path) -> None:
         super().__init__(sessions_root)
@@ -391,6 +403,42 @@ def test_main_window_save_shortcut_clears_modified_marker(
     assert save_service.calls[0][0] == document_path.resolve()
 
 
+def test_main_window_save_shortcut_routes_recovered_session_to_save_as(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    save_service = FakeSaveService()
+    settings = create_settings(tmp_path)
+    window = MainWindow(
+        settings,
+        workspace_manager=create_workspace_manager(tmp_path),
+        save_service=save_service,
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = create_blank_pdf(tmp_path / "recovered-source.pdf", 1)
+    target_path = tmp_path / "recovered-saved.pdf"
+    window.open_document(document_path)
+    document = window._documents[0]
+    document.session.mark_recovered(SourceStatus.MISSING)
+    window._update_actions()
+
+    monkeypatch.setattr(
+        QFileDialog,
+        "getSaveFileName",
+        lambda *args, **kwargs: (str(target_path), "PDF files (*.pdf)"),
+    )
+
+    QTest.keySequence(window, QKeySequence.StandardKey.Save)
+
+    assert save_service.calls[0][0] == target_path.resolve()
+    assert document.session.source_path == target_path.resolve()
+    assert document.session.requires_save_as is False
+
+
 def test_main_window_save_as_updates_tab_title_and_recent_file(
     monkeypatch: pytest.MonkeyPatch,
     qtbot: QtBot,
@@ -424,6 +472,66 @@ def test_main_window_save_as_updates_tab_title_and_recent_file(
     assert document.session.source_path == target_path.resolve()
     assert window._tabs.tabText(0) == "saved-as.pdf"
     assert window._recent_files[0] == target_path.resolve()
+
+
+def test_main_window_open_document_cleans_workspace_when_metadata_write_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    workspace_manager = create_workspace_manager(tmp_path)
+    recovery_service = FakeRecoveryService()
+    recovery_service.should_fail = True
+    window = MainWindow(
+        settings,
+        workspace_manager=workspace_manager,
+        save_service=FakeSaveService(),
+        recovery_service=recovery_service,
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    monkeypatch.setattr(
+        QMessageBox,
+        "critical",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Ok,
+    )
+
+    document_path = create_blank_pdf(tmp_path / "metadata-fail.pdf", 1)
+    window.open_document(document_path)
+
+    assert window._tabs.count() == 0
+    assert list(workspace_manager.sessions_root.iterdir()) == []
+
+
+def test_main_window_debounces_recovery_metadata_for_navigation(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    recovery_service = FakeRecoveryService()
+    window = MainWindow(
+        settings,
+        workspace_manager=create_workspace_manager(tmp_path),
+        save_service=FakeSaveService(),
+        recovery_service=recovery_service,
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = create_blank_pdf(tmp_path / "debounce.pdf", 1)
+    window.open_document(document_path)
+    recovery_service.write_calls.clear()
+
+    window._next_page()
+    window._previous_page()
+    window._set_zoom_from_toolbar(1.25)
+
+    assert recovery_service.write_calls == []
+    qtbot.waitUntil(lambda: len(recovery_service.write_calls) == 1, timeout=2000)
 
 
 def test_main_window_save_as_shortcut_uses_selected_destination(

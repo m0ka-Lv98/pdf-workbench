@@ -40,6 +40,10 @@ from pdf_workbench.core.settings import configure_qsettings
 from pdf_workbench.domain.document_session import DocumentSession
 from pdf_workbench.services.pdf_renderer import PdfRenderService
 from pdf_workbench.services.pdf_save_service import PdfSaveError, PdfSaveService
+from pdf_workbench.services.session_recovery import (
+    RecoveryMetadataError,
+    SessionRecoveryService,
+)
 from pdf_workbench.services.session_workspace import (
     SessionWorkspaceManager,
     WorkspaceCreationError,
@@ -73,6 +77,7 @@ class MainWindow(QMainWindow):
         render_service: PdfRenderService | None = None,
         workspace_manager: SessionWorkspaceManager | None = None,
         save_service: PdfSaveService | None = None,
+        recovery_service: SessionRecoveryService | None = None,
     ) -> None:
         super().__init__()
         self._settings = settings if settings is not None else configure_qsettings()
@@ -83,7 +88,13 @@ class MainWindow(QMainWindow):
             workspace_manager if workspace_manager is not None else SessionWorkspaceManager()
         )
         self._save_service = save_service if save_service is not None else PdfSaveService()
+        self._recovery_service = (
+            recovery_service
+            if recovery_service is not None
+            else SessionRecoveryService(self._workspace_manager)
+        )
         self._documents: list[DocumentTab] = []
+        self._metadata_timers: dict[str, QTimer] = {}
         self._recent_files: list[Path] = self._load_recent_files()
         self._build_sha = os.environ.get("PDF_WORKBENCH_BUILD_SHA", "").strip()
         self._toolbar_widget = DocumentToolbar(self)
@@ -345,51 +356,39 @@ class MainWindow(QMainWindow):
             return
 
         session: DocumentSession | None = None
-        view: PdfView | None = None
         try:
             session = self._workspace_manager.create_session(normalized_path)
-            view = PdfView(self._render_service, self)
-            view.set_zoom(self._BASE_RENDER_SCALE * session.zoom_factor)
-            view.open_document(session.document_path)
+            self._persist_recovery_metadata(session, required=True)
+            self._attach_session(session, cleanup_on_failure=True)
         except WorkspaceCreationError as exc:
             logger.exception("Failed to create working copy: %s", path)
             self._report_error("PDFを開けません", str(exc))
             return
-        except Exception as exc:
-            if view is not None:
-                try:
-                    view.close_document()
-                except Exception:
-                    logger.exception("Failed to close view after open error: %s", path)
-                view.deleteLater()
+        except RecoveryMetadataError as exc:
             if session is not None:
                 self._workspace_manager.cleanup_session(session)
+            logger.exception("Failed to persist recovery metadata: %s", path)
+            self._report_error("PDFを開けません", str(exc))
+            return
+        except Exception as exc:
             logger.exception("Failed to open PDF: %s", path)
             self._report_error("PDFを開けません", str(exc))
             return
 
-        assert session is not None
-        assert view is not None
-        view.state_changed.connect(self._update_status)
-        view.search_state_changed.connect(lambda: self._on_view_search_state_changed(view))
-        view.selection_changed.connect(self._update_actions)
-        view.error_occurred.connect(lambda message: self._set_status_message(message, error=True))
-        document = DocumentTab(session=session, view=view)
-        self._documents.append(document)
-        tab_index = self._tabs.addTab(
-            view,
-            IconProvider.icon(IconName.DOCUMENT, tone=IconTone.MUTED, size=16),
-            self._tab_title(document),
-        )
-        self._install_tab_close_button(view)
-        self._tabs.setCurrentIndex(tab_index)
-        self._stack.setCurrentWidget(self._tabs)
-        self._remember_recent_file(session.source_path)
-        self._update_window_title()
-        self._update_actions()
-        self._update_status()
-        self._update_overlay_geometry()
-        self._apply_search_inset()
+    def restore_session(self, session: DocumentSession) -> bool:
+        existing_index = self._find_document_index(session.source_path)
+        if existing_index is not None:
+            self._tabs.setCurrentIndex(existing_index)
+            return True
+        try:
+            self._attach_session(session, cleanup_on_failure=False)
+        except Exception as exc:
+            self._cancel_metadata_timer(session.session_id)
+            self._workspace_manager.release_session_lock(session.session_id)
+            logger.exception("Failed to restore interrupted session: %s", session.session_id)
+            self._report_error("復旧に失敗しました", str(exc))
+            return False
+        return True
 
     def close_document_at(self, index: int) -> bool:
         if not 0 <= index < len(self._documents):
@@ -417,6 +416,7 @@ class MainWindow(QMainWindow):
                 return False
 
         widget = self._tabs.widget(index)
+        self._cancel_metadata_timer(document.session.session_id)
         self._tabs.removeTab(index)
         self._documents.pop(index)
         if widget is not None:
@@ -444,7 +444,11 @@ class MainWindow(QMainWindow):
         if document is None:
             return
         document.view.set_page(document.view.page_index - 1)
-        document.session.current_page_index = document.view.page_index
+        document.session.set_navigation_state(
+            page_index=document.view.page_index,
+            zoom_factor=document.session.zoom_factor,
+        )
+        self._schedule_recovery_metadata_persist(document.session)
         self._sync_toolbar(document)
         self._update_status()
 
@@ -453,7 +457,11 @@ class MainWindow(QMainWindow):
         if document is None:
             return
         document.view.set_page(document.view.page_index + 1)
-        document.session.current_page_index = document.view.page_index
+        document.session.set_navigation_state(
+            page_index=document.view.page_index,
+            zoom_factor=document.session.zoom_factor,
+        )
+        self._schedule_recovery_metadata_persist(document.session)
         self._sync_toolbar(document)
         self._update_status()
 
@@ -461,11 +469,15 @@ class MainWindow(QMainWindow):
         document = self._current_document()
         if document is None:
             return
-        document.session.zoom_factor = max(
-            0.25,
-            min(document.session.zoom_factor * multiplier, 5.0),
+        document.session.set_navigation_state(
+            page_index=document.session.current_page_index,
+            zoom_factor=max(
+                0.25,
+                min(document.session.zoom_factor * multiplier, 5.0),
+            ),
         )
         document.view.set_zoom(self._BASE_RENDER_SCALE * document.session.zoom_factor)
+        self._schedule_recovery_metadata_persist(document.session)
         self._sync_toolbar(document)
         self._update_status()
 
@@ -551,6 +563,12 @@ class MainWindow(QMainWindow):
         session = document.session
         if session.is_saving:
             return False
+        if target_path is None and session.requires_save_as:
+            self._set_status_message(
+                "元のPDFが見つからないか変更されているため、別名で保存してください。",
+                timeout_ms=5000,
+            )
+            return self._save_current_document_as()
         destination = (
             session.source_path if target_path is None else target_path.expanduser().resolve()
         )
@@ -595,9 +613,11 @@ class MainWindow(QMainWindow):
             self._update_status()
             return False
 
+        self._persist_recovery_metadata(session)
         index = self._find_document_index(session.source_path)
         if index is not None:
             self._tabs.setTabText(index, self._tab_title(document))
+            self._tabs.setTabToolTip(index, str(session.source_path))
         self._remember_recent_file(session.source_path)
         self._update_window_title()
         self._update_actions()
@@ -666,7 +686,11 @@ class MainWindow(QMainWindow):
         if document is None:
             return
         document.view.set_page(page_index)
-        document.session.current_page_index = document.view.page_index
+        document.session.set_navigation_state(
+            page_index=document.view.page_index,
+            zoom_factor=document.session.zoom_factor,
+        )
+        self._schedule_recovery_metadata_persist(document.session)
         self._sync_toolbar(document)
         self._update_status()
 
@@ -674,8 +698,12 @@ class MainWindow(QMainWindow):
         document = self._current_document()
         if document is None:
             return
-        document.session.zoom_factor = max(0.25, min(zoom_factor, 5.0))
+        document.session.set_navigation_state(
+            page_index=document.session.current_page_index,
+            zoom_factor=max(0.25, min(zoom_factor, 5.0)),
+        )
         document.view.set_zoom(self._BASE_RENDER_SCALE * document.session.zoom_factor)
+        self._schedule_recovery_metadata_persist(document.session)
         self._sync_toolbar(document)
         self._update_status()
 
@@ -703,6 +731,7 @@ class MainWindow(QMainWindow):
             self._set_status_message("PDFレンダラーの終了を待ち切れませんでした", error=True)
             event.ignore()
             return
+        self._workspace_manager.release_all_locks()
         self._save_window_state()
         event.accept()
 
@@ -732,8 +761,9 @@ class MainWindow(QMainWindow):
         return None
 
     def _tab_title(self, document: DocumentTab) -> str:
-        suffix = " *" if document.session.is_modified else ""
-        return f"{document.session.display_path.name}{suffix}"
+        recovered_suffix = " [復元]" if document.session.recovered_from_interrupted_session else ""
+        modified_suffix = " *" if document.session.is_modified else ""
+        return f"{document.session.display_path.name}{recovered_suffix}{modified_suffix}"
 
     def _update_window_title(self) -> None:
         suffix = ""
@@ -758,7 +788,11 @@ class MainWindow(QMainWindow):
         document_selection = bool(document and document.view.selected_text)
         self.close_action.setEnabled(has_document)
         self.save_action.setEnabled(
-            bool(document and document.session.is_modified and not document.session.is_saving)
+            bool(
+                document
+                and not document.session.is_saving
+                and (document.session.is_modified or document.session.requires_save_as)
+            )
         )
         self.save_as_action.setEnabled(bool(document and not document.session.is_saving))
         self.previous_action.setEnabled(has_document)
@@ -891,6 +925,124 @@ class MainWindow(QMainWindow):
             action.triggered.connect(
                 lambda checked=False, file_path=path: self.open_document(file_path)
             )
+
+    def _attach_session(
+        self,
+        session: DocumentSession,
+        *,
+        cleanup_on_failure: bool,
+    ) -> None:
+        view: PdfView | None = None
+        try:
+            view = PdfView(self._render_service, self)
+            view.set_zoom(self._BASE_RENDER_SCALE * session.zoom_factor)
+            view.open_document(session.document_path)
+            if session.current_page_index > 0:
+                view.set_page(session.current_page_index)
+        except Exception:
+            if view is not None:
+                try:
+                    view.close_document()
+                except Exception:
+                    logger.exception(
+                        "Failed to close view after session attach error: %s",
+                        session.session_id,
+                    )
+                view.deleteLater()
+            if cleanup_on_failure:
+                self._workspace_manager.cleanup_session(session)
+            else:
+                self._workspace_manager.release_session_lock(session.session_id)
+            raise
+
+        view.state_changed.connect(self._update_status)
+        view.search_state_changed.connect(lambda: self._on_view_search_state_changed(view))
+        view.selection_changed.connect(self._update_actions)
+        view.error_occurred.connect(lambda message: self._set_status_message(message, error=True))
+        document = DocumentTab(session=session, view=view)
+        self._documents.append(document)
+        tab_index = self._tabs.addTab(
+            view,
+            IconProvider.icon(IconName.DOCUMENT, tone=IconTone.MUTED, size=16),
+            self._tab_title(document),
+        )
+        tooltip = str(session.source_path)
+        if session.recovered_from_interrupted_session:
+            tooltip = f"{session.source_path}\n復旧されたセッション"
+        self._tabs.setTabToolTip(tab_index, tooltip)
+        self._install_tab_close_button(view)
+        self._tabs.setCurrentIndex(tab_index)
+        self._stack.setCurrentWidget(self._tabs)
+        self._remember_recent_file(session.source_path)
+        self._update_window_title()
+        self._update_actions()
+        self._update_status()
+        self._update_overlay_geometry()
+        self._apply_search_inset()
+
+    def _persist_recovery_metadata(
+        self,
+        session: DocumentSession,
+        *,
+        required: bool = False,
+    ) -> bool:
+        try:
+            self._recovery_service.write_metadata(session)
+        except RecoveryMetadataError as exc:
+            logger.warning(
+                "Failed to persist recovery metadata: session_id=%s error=%s",
+                session.session_id,
+                exc,
+            )
+            if required:
+                raise
+            return False
+        return True
+
+    def _schedule_recovery_metadata_persist(self, session: DocumentSession) -> None:
+        timer = self._metadata_timers.get(session.session_id)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(500)
+            timer.timeout.connect(
+                lambda session_id=session.session_id: self._flush_session_metadata(session_id)
+            )
+            self._metadata_timers[session.session_id] = timer
+        timer.start()
+
+    def _flush_session_metadata(self, session_id: str) -> None:
+        session = next(
+            (
+                document.session
+                for document in self._documents
+                if document.session.session_id == session_id
+            ),
+            None,
+        )
+        if session is None:
+            return
+        self._persist_recovery_metadata(session)
+
+    def _cancel_metadata_timer(self, session_id: str) -> None:
+        timer = self._metadata_timers.pop(session_id, None)
+        if timer is None:
+            return
+        timer.stop()
+        timer.deleteLater()
+
+    def _mark_document_modified(
+        self,
+        document: DocumentTab,
+        description: str,
+    ) -> None:
+        document.session.mark_modified(description)
+        self._persist_recovery_metadata(document.session, required=True)
+        index = self._find_document_index(document.session.source_path)
+        if index is not None:
+            self._tabs.setTabText(index, self._tab_title(document))
+        self._update_actions()
+        self._update_window_title()
 
     def _save_window_state(self) -> None:
         self._settings.setValue(self._GEOMETRY_KEY, self.saveGeometry())
