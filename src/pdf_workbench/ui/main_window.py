@@ -39,6 +39,11 @@ from PySide6.QtWidgets import (
 from pdf_workbench.core.settings import configure_qsettings
 from pdf_workbench.domain.document_session import DocumentSession
 from pdf_workbench.services.pdf_renderer import PdfRenderService
+from pdf_workbench.services.pdf_save_service import PdfSaveError, PdfSaveService
+from pdf_workbench.services.session_workspace import (
+    SessionWorkspaceManager,
+    WorkspaceCreationError,
+)
 from pdf_workbench.ui.icon_provider import IconName, IconProvider, IconTone
 from pdf_workbench.ui.pdf_view import PdfView
 from pdf_workbench.ui.widgets.document_toolbar import DocumentToolbar, ToolbarState
@@ -66,12 +71,18 @@ class MainWindow(QMainWindow):
         settings: QSettings | None = None,
         *,
         render_service: PdfRenderService | None = None,
+        workspace_manager: SessionWorkspaceManager | None = None,
+        save_service: PdfSaveService | None = None,
     ) -> None:
         super().__init__()
         self._settings = settings if settings is not None else configure_qsettings()
         self._render_service = (
             render_service if render_service is not None else PdfRenderService(self)
         )
+        self._workspace_manager = (
+            workspace_manager if workspace_manager is not None else SessionWorkspaceManager()
+        )
+        self._save_service = save_service if save_service is not None else PdfSaveService()
         self._documents: list[DocumentTab] = []
         self._recent_files: list[Path] = self._load_recent_files()
         self._build_sha = os.environ.get("PDF_WORKBENCH_BUILD_SHA", "").strip()
@@ -220,12 +231,24 @@ class MainWindow(QMainWindow):
         self.find_previous_action.setShortcut(QKeySequence("Shift+F3"))
         self.find_previous_action.triggered.connect(self._previous_match)
 
+        self.save_action = QAction("保存", self)
+        self.save_action.setShortcut(QKeySequence.StandardKey.Save)
+        self.save_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+        self.save_action.triggered.connect(self._save_current_document)
+
+        self.save_as_action = QAction("名前を付けて保存", self)
+        self.save_as_action.setShortcut(QKeySequence.StandardKey.SaveAs)
+        self.save_as_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+        self.save_as_action.triggered.connect(self._save_current_document_as)
+
         self.copy_action = QAction("コピー", self)
         self.copy_action.setShortcut(QKeySequence.StandardKey.Copy)
         self.copy_action.triggered.connect(self._copy_selection)
 
         for action in (
             self.open_action,
+            self.save_action,
+            self.save_as_action,
             self.close_action,
             self.exit_action,
             self.previous_action,
@@ -242,6 +265,9 @@ class MainWindow(QMainWindow):
     def _create_menu(self) -> None:
         file_menu = self.menuBar().addMenu("ファイル")
         file_menu.addAction(self.open_action)
+        file_menu.addAction(self.save_action)
+        file_menu.addAction(self.save_as_action)
+        file_menu.addSeparator()
         file_menu.addAction(self.close_action)
         self.recent_files_menu = file_menu.addMenu("最近使ったファイル")
         file_menu.addSeparator()
@@ -319,10 +345,14 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            session = DocumentSession(normalized_path)
+            session = self._workspace_manager.create_session(normalized_path)
             view = PdfView(self._render_service, self)
             view.set_zoom(self._BASE_RENDER_SCALE * session.zoom_factor)
-            view.open_document(session.source_path)
+            view.open_document(session.document_path)
+        except WorkspaceCreationError as exc:
+            logger.exception("Failed to create working copy: %s", path)
+            self._report_error("PDFを開けません", str(exc))
+            return
         except Exception as exc:
             logger.exception("Failed to open PDF: %s", path)
             self._report_error("PDFを開けません", str(exc))
@@ -358,11 +388,20 @@ class MainWindow(QMainWindow):
             result = QMessageBox.question(
                 self,
                 "未保存の変更",
-                f"{document.session.source_path.name} には未保存の変更があります。閉じますか？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
+                f"{document.session.display_path.name} には未保存の変更があります。",
+                QMessageBox.StandardButton.Save
+                | QMessageBox.StandardButton.Discard
+                | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Save,
             )
-            if result != QMessageBox.StandardButton.Yes:
+            if result == QMessageBox.StandardButton.Cancel:
+                return False
+            if result == QMessageBox.StandardButton.Save and not self._save_document(document):
+                return False
+            if result not in (
+                QMessageBox.StandardButton.Save,
+                QMessageBox.StandardButton.Discard,
+            ):
                 return False
 
         widget = self._tabs.widget(index)
@@ -372,6 +411,7 @@ class MainWindow(QMainWindow):
             if isinstance(widget, PdfView):
                 widget.close_document()
             widget.deleteLater()
+        self._workspace_manager.cleanup_session(document.session)
         if not self._documents:
             self._stack.setCurrentWidget(self._empty_state)
             if self._search_toolbar is not None:
@@ -475,6 +515,116 @@ class MainWindow(QMainWindow):
         if not document.view.copy_selected_text():
             self._set_status_message("コピーするテキストが選択されていません", timeout_ms=3000)
 
+    def _save_current_document(self) -> bool:
+        document = self._current_document()
+        if document is None:
+            return False
+        return self._save_document(document)
+
+    def _save_current_document_as(self) -> bool:
+        document = self._current_document()
+        if document is None:
+            return False
+        target_path = self._choose_save_as_path(document)
+        if target_path is None:
+            return False
+        return self._save_document(document, target_path=target_path)
+
+    def _save_document(
+        self,
+        document: DocumentTab,
+        *,
+        target_path: Path | None = None,
+    ) -> bool:
+        session = document.session
+        if session.is_saving:
+            return False
+        destination = (
+            session.source_path if target_path is None else target_path.expanduser().resolve()
+        )
+        if destination.suffix.lower() != ".pdf":
+            destination = destination.with_suffix(".pdf")
+        if self._find_save_conflict(destination, session) is not None:
+            self._report_error(
+                "保存できません",
+                "保存先が別のタブで開かれています。元のPDFは変更されていません。",
+            )
+            return False
+
+        session.is_saving = True
+        self._set_status_message("保存しています…")
+        self._update_actions()
+        QApplication.processEvents()
+        saved = False
+        try:
+            self._save_service.save_atomic(
+                session,
+                destination,
+                expected_page_count=document.view.page_count,
+            )
+            saved = True
+        except PdfSaveError as exc:
+            logger.exception("Failed to save PDF: %s", destination)
+            self._report_error(
+                "保存に失敗しました",
+                f"{exc}\n\n元のPDFは変更されていません。",
+            )
+        finally:
+            session.is_saving = False
+
+        if not saved:
+            self._update_actions()
+            self._update_status()
+            return False
+
+        index = self._find_document_index(session.source_path)
+        if index is not None:
+            self._tabs.setTabText(index, self._tab_title(document))
+        self._remember_recent_file(session.source_path)
+        self._update_window_title()
+        self._update_actions()
+        self._update_status()
+        self._set_status_message("保存しました", timeout_ms=3000)
+        return True
+
+    def _choose_save_as_path(self, document: DocumentTab) -> Path | None:
+        initial_path = document.session.display_path
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            "名前を付けて保存",
+            str(initial_path),
+            "PDF files (*.pdf)",
+        )
+        if not filename:
+            return None
+        target_path = Path(filename).expanduser().resolve()
+        if target_path.suffix.lower() != ".pdf":
+            target_path = target_path.with_suffix(".pdf")
+        if target_path.exists() and target_path != document.session.source_path:
+            result = QMessageBox.question(
+                self,
+                "上書き確認",
+                f"{target_path.name} を上書きしますか？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if result != QMessageBox.StandardButton.Yes:
+                return None
+        return target_path
+
+    def _find_save_conflict(
+        self,
+        target_path: Path,
+        current_session: DocumentSession,
+    ) -> DocumentTab | None:
+        resolved_target = target_path.expanduser().resolve()
+        for document in self._documents:
+            if document.session is current_session:
+                continue
+            if document.session.source_path == resolved_target:
+                return document
+        return None
+
     def _search_text_changed(self, query: str) -> None:
         document = self._current_document()
         if document is None:
@@ -535,6 +685,7 @@ class MainWindow(QMainWindow):
             self._set_status_message("PDFレンダラーの終了を待ち切れませんでした", error=True)
             event.ignore()
             return
+        self._workspace_manager.cleanup_sessions([document.session for document in self._documents])
         self._save_window_state()
         event.accept()
 
@@ -565,7 +716,7 @@ class MainWindow(QMainWindow):
 
     def _tab_title(self, document: DocumentTab) -> str:
         suffix = " *" if document.session.is_modified else ""
-        return f"{document.session.source_path.name}{suffix}"
+        return f"{document.session.display_path.name}{suffix}"
 
     def _update_window_title(self) -> None:
         suffix = ""
@@ -589,6 +740,10 @@ class MainWindow(QMainWindow):
         document = self._current_document()
         document_selection = bool(document and document.view.selected_text)
         self.close_action.setEnabled(has_document)
+        self.save_action.setEnabled(
+            bool(document and document.session.is_modified and not document.session.is_saving)
+        )
+        self.save_as_action.setEnabled(bool(document and not document.session.is_saving))
         self.previous_action.setEnabled(has_document)
         self.next_action.setEnabled(has_document)
         self.zoom_in_action.setEnabled(has_document)
@@ -628,13 +783,27 @@ class MainWindow(QMainWindow):
         )
         return bool(event.modifiers() & expected_modifier)
 
+    def _shortcut_action_for_event(self, event: QKeyEvent) -> QAction | None:
+        if event.matches(QKeySequence.StandardKey.Save):
+            return self.save_action
+        if event.matches(QKeySequence.StandardKey.SaveAs):
+            return self.save_as_action
+        if self._is_find_shortcut_event(event):
+            return self.find_action
+        return None
+
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
-        if (
-            isinstance(watched, QWidget)
-            and isinstance(event, QKeyEvent)
-            and event.type() in (QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress)
-            and self._is_find_shortcut_event(event)
+        if not isinstance(watched, QWidget) or not isinstance(event, QKeyEvent):
+            return super().eventFilter(watched, event)
+
+        action = self._shortcut_action_for_event(event)
+        if action is None or event.type() not in (
+            QEvent.Type.ShortcutOverride,
+            QEvent.Type.KeyPress,
         ):
+            return super().eventFilter(watched, event)
+
+        if action is self.find_action:
             focus_widget = QApplication.focusWidget()
             if (
                 focus_widget is not None
@@ -642,10 +811,20 @@ class MainWindow(QMainWindow):
                 and isinstance(focus_widget, QLineEdit)
             ):
                 return super().eventFilter(watched, event)
-            if self._current_document() is not None and self.isAncestorOf(watched):
-                self.find_action.trigger()
-                return True
-        return super().eventFilter(watched, event)
+
+        if (
+            self._current_document() is None
+            or not self.isAncestorOf(watched)
+            or not action.isEnabled()
+        ):
+            return super().eventFilter(watched, event)
+
+        if event.type() == QEvent.Type.ShortcutOverride:
+            event.accept()
+            return True
+
+        action.trigger()
+        return True
 
     def _on_view_search_state_changed(self, view: PdfView) -> None:
         document = self._current_document()

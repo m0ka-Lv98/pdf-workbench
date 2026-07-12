@@ -2,16 +2,33 @@ from __future__ import annotations
 
 import sys
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
+import pikepdf
+import pypdfium2 as pdfium  # type: ignore[import-untyped]
 import pytest
 from PySide6.QtCore import QMimeData, QPoint, QPointF, QRect, QSettings, Qt, QUrl
 from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent, QImage, QKeySequence
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QHBoxLayout, QLabel, QMessageBox, QTabBar, QToolButton
+from PySide6.QtWidgets import (
+    QApplication,
+    QFileDialog,
+    QHBoxLayout,
+    QLabel,
+    QMessageBox,
+    QTabBar,
+    QToolButton,
+)
 from pytestqt.qtbot import QtBot
 
-from pdf_test_utils import copy_pdf_fixture, create_blank_pdf, create_image_only_pdf
+from pdf_test_utils import (
+    copy_pdf_fixture,
+    create_blank_pdf,
+    create_image_only_pdf,
+    create_qt_text_pdf,
+)
+from pdf_workbench.domain.document_session import DocumentSession, FileFingerprint
 from pdf_workbench.services.page_coordinates import PageMetadata
 from pdf_workbench.services.pdf_renderer import (
     DocumentMetadata,
@@ -19,6 +36,8 @@ from pdf_workbench.services.pdf_renderer import (
     PdfiumDocumentBackend,
     PdfRenderService,
 )
+from pdf_workbench.services.pdf_save_service import PdfSaveError, PdfSaveService, SaveResult
+from pdf_workbench.services.session_workspace import SessionWorkspaceManager
 from pdf_workbench.ui.main_window import MainWindow
 from pdf_workbench.ui.pdf_view import PdfView
 from pdf_workbench.ui.widgets.search_bar import SearchBar, SearchInputSurface
@@ -39,6 +58,10 @@ def patch_pdf_open(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def create_settings(tmp_path: Path) -> QSettings:
     return QSettings(str(tmp_path / "app.ini"), QSettings.Format.IniFormat)
+
+
+def create_workspace_manager(tmp_path: Path) -> SessionWorkspaceManager:
+    return SessionWorkspaceManager(tmp_path / "sessions")
 
 
 def show_window(qtbot: QtBot, window: MainWindow) -> None:
@@ -159,11 +182,42 @@ def create_real_main_window(
         return PdfiumDocumentBackend(path)
 
     service = PdfRenderService(backend_factory=backend_factory)
-    window = MainWindow(settings, render_service=service)
+    window = MainWindow(
+        settings,
+        render_service=service,
+        workspace_manager=create_workspace_manager(tmp_path),
+        save_service=PdfSaveService(),
+    )
     qtbot.addWidget(window)
     window.show()
     qtbot.waitUntil(window.isVisible)
     return window
+
+
+class FakeSaveService(PdfSaveService):
+    def __init__(self, *, should_fail: bool = False) -> None:
+        self.should_fail = should_fail
+        self.calls: list[tuple[Path, int]] = []
+
+    def save_atomic(
+        self,
+        session: DocumentSession,
+        target_path: Path,
+        expected_page_count: int,
+    ) -> SaveResult:
+        self.calls.append((target_path.expanduser().resolve(), expected_page_count))
+        if self.should_fail:
+            raise PdfSaveError("保存テスト失敗")
+        resolved_target = target_path.expanduser().resolve()
+        resolved_target.write_bytes(session.document_path.read_bytes())
+        fingerprint = FileFingerprint.from_path(resolved_target)
+        saved_at = datetime.now(UTC)
+        session.mark_saved(resolved_target, fingerprint, saved_at)
+        return SaveResult(
+            target_path=resolved_target,
+            fingerprint=fingerprint,
+            saved_at=saved_at,
+        )
 
 
 def test_main_window_opens_and_closes_multiple_documents(
@@ -215,22 +269,25 @@ def test_main_window_requires_confirmation_for_modified_document(
 ) -> None:
     patch_pdf_open(monkeypatch)
     settings = create_settings(tmp_path)
-    window = MainWindow(settings)
+    window = MainWindow(
+        settings,
+        workspace_manager=create_workspace_manager(tmp_path),
+        save_service=FakeSaveService(),
+    )
     qtbot.addWidget(window)
     show_window(qtbot, window)
     show_window(qtbot, window)
     show_window(qtbot, window)
     show_window(qtbot, window)
 
-    document_path = tmp_path / "modified.pdf"
-    document_path.touch()
+    document_path = create_blank_pdf(tmp_path / "modified.pdf", 1)
     window.open_document(document_path)
     window._documents[0].session.mark_modified("test change")
 
     monkeypatch.setattr(
         QMessageBox,
         "question",
-        lambda *args, **kwargs: QMessageBox.StandardButton.No,
+        lambda *args, **kwargs: QMessageBox.StandardButton.Cancel,
     )
     assert window.close_current_document() is False
     assert window._tabs.count() == 1
@@ -238,10 +295,333 @@ def test_main_window_requires_confirmation_for_modified_document(
     monkeypatch.setattr(
         QMessageBox,
         "question",
-        lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
     )
     assert window.close_current_document() is True
     assert window._tabs.count() == 0
+
+
+def test_main_window_save_actions_follow_modified_state(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    window = MainWindow(
+        settings,
+        workspace_manager=create_workspace_manager(tmp_path),
+        save_service=FakeSaveService(),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = create_blank_pdf(tmp_path / "save-state.pdf", 1)
+    window.open_document(document_path)
+
+    assert window.save_action.isEnabled() is False
+    assert window.save_as_action.isEnabled() is True
+
+    document = window._documents[0]
+    document.session.mark_modified("page operation")
+    window._update_actions()
+
+    assert window.save_action.isEnabled() is True
+    assert window.save_as_action.isEnabled() is True
+
+    document.view.set_rotation(90)
+    assert document.session.is_modified is True
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    assert window.close_current_document() is True
+
+
+def test_main_window_save_shortcut_clears_modified_marker(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    save_service = FakeSaveService()
+    settings = create_settings(tmp_path)
+    window = MainWindow(
+        settings,
+        workspace_manager=create_workspace_manager(tmp_path),
+        save_service=save_service,
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = create_blank_pdf(tmp_path / "shortcut-save.pdf", 1)
+    window.open_document(document_path)
+    document = window._documents[0]
+    document.session.mark_modified("edit")
+    window._update_actions()
+
+    QTest.keySequence(window, QKeySequence.StandardKey.Save)
+
+    assert document.session.is_modified is False
+    assert not window._tab_title(document).endswith("*")
+    assert window.save_action.isEnabled() is False
+    assert save_service.calls[0][0] == document_path.resolve()
+
+
+def test_main_window_save_as_updates_tab_title_and_recent_file(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    save_service = FakeSaveService()
+    settings = create_settings(tmp_path)
+    window = MainWindow(
+        settings,
+        workspace_manager=create_workspace_manager(tmp_path),
+        save_service=save_service,
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = create_blank_pdf(tmp_path / "source.pdf", 1)
+    window.open_document(document_path)
+    document = window._documents[0]
+    document.session.mark_modified("edit")
+
+    target_path = tmp_path / "saved-as.pdf"
+    monkeypatch.setattr(
+        QFileDialog,
+        "getSaveFileName",
+        lambda *args, **kwargs: (str(target_path), "PDF files (*.pdf)"),
+    )
+
+    assert window._save_current_document_as() is True
+
+    assert document.session.source_path == target_path.resolve()
+    assert window._tabs.tabText(0) == "saved-as.pdf"
+    assert window._recent_files[0] == target_path.resolve()
+
+
+def test_main_window_save_as_shortcut_uses_selected_destination(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    save_service = FakeSaveService()
+    settings = create_settings(tmp_path)
+    window = MainWindow(
+        settings,
+        workspace_manager=create_workspace_manager(tmp_path),
+        save_service=save_service,
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = create_blank_pdf(tmp_path / "shortcut-save-as-source.pdf", 1)
+    target_path = tmp_path / "shortcut-save-as-target.pdf"
+    window.open_document(document_path)
+    monkeypatch.setattr(
+        QFileDialog,
+        "getSaveFileName",
+        lambda *args, **kwargs: (str(target_path), "PDF files (*.pdf)"),
+    )
+
+    QTest.keySequence(window, QKeySequence.StandardKey.SaveAs)
+
+    assert save_service.calls[0][0] == target_path.resolve()
+    assert window._documents[0].session.source_path == target_path.resolve()
+
+
+def test_main_window_save_as_rejects_target_open_in_another_tab(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    save_service = FakeSaveService()
+    settings = create_settings(tmp_path)
+    window = MainWindow(
+        settings,
+        workspace_manager=create_workspace_manager(tmp_path),
+        save_service=save_service,
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    first = create_blank_pdf(tmp_path / "first.pdf", 1)
+    second = create_blank_pdf(tmp_path / "second.pdf", 1)
+    window.open_document(first)
+    window.open_document(second)
+    document = window._documents[1]
+    document.session.mark_modified("edit")
+
+    monkeypatch.setattr(
+        QFileDialog,
+        "getSaveFileName",
+        lambda *args, **kwargs: (str(first), "PDF files (*.pdf)"),
+    )
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
+    )
+    monkeypatch.setattr(
+        QMessageBox,
+        "critical",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Ok,
+    )
+
+    assert window._save_current_document_as() is False
+    assert document.session.is_modified is True
+    assert save_service.calls == []
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    assert window.close_current_document() is True
+
+
+def test_main_window_close_modified_document_save_failure_keeps_tab_open(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    window = MainWindow(
+        settings,
+        workspace_manager=create_workspace_manager(tmp_path),
+        save_service=FakeSaveService(should_fail=True),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = create_blank_pdf(tmp_path / "save-fail.pdf", 1)
+    window.open_document(document_path)
+    document = window._documents[0]
+    document.session.mark_modified("edit")
+
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Save,
+    )
+    monkeypatch.setattr(
+        QMessageBox,
+        "critical",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Ok,
+    )
+
+    assert window.close_current_document() is False
+    assert window._tabs.count() == 1
+    assert document.session.is_modified is True
+    assert document.session.workspace_directory.exists()
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    assert window.close_current_document() is True
+
+
+def test_main_window_close_modified_document_discard_cleans_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    window = MainWindow(
+        settings,
+        workspace_manager=create_workspace_manager(tmp_path),
+        save_service=FakeSaveService(),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = create_blank_pdf(tmp_path / "discard.pdf", 1)
+    window.open_document(document_path)
+    document = window._documents[0]
+    document.session.mark_modified("edit")
+    workspace_directory = document.session.workspace_directory
+
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+
+    assert window.close_current_document() is True
+    assert not workspace_directory.exists()
+
+
+def test_main_window_close_modified_document_cancel_keeps_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    window = MainWindow(
+        settings,
+        workspace_manager=create_workspace_manager(tmp_path),
+        save_service=FakeSaveService(),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = create_blank_pdf(tmp_path / "cancel.pdf", 1)
+    window.open_document(document_path)
+    document = window._documents[0]
+    document.session.mark_modified("edit")
+    workspace_directory = document.session.workspace_directory
+
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Cancel,
+    )
+
+    assert window.close_current_document() is False
+    assert workspace_directory.exists()
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    assert window.close_current_document() is True
+
+
+def test_main_window_close_event_cleans_all_session_workspaces(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    window = MainWindow(
+        settings,
+        workspace_manager=create_workspace_manager(tmp_path),
+        save_service=FakeSaveService(),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    first = create_blank_pdf(tmp_path / "first-close.pdf", 1)
+    second = create_blank_pdf(tmp_path / "second-close.pdf", 1)
+    window.open_document(first)
+    window.open_document(second)
+    workspaces = [document.session.workspace_directory for document in window._documents]
+
+    event = QCloseEvent()
+    window.closeEvent(event)
+
+    assert event.isAccepted() is True
+    assert all(not workspace.exists() for workspace in workspaces)
 
 
 def test_main_window_persists_recent_files_and_geometry(
@@ -1060,6 +1440,60 @@ def test_main_window_opens_real_pdf_document(
     assert window._tabs.count() == 1
     assert window._documents[0].session.source_path == document_path.resolve()
     assert window._documents[0].view.page_count == 1
+
+
+def test_main_window_save_as_integration_preserves_source_and_cleans_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    source_path = create_qt_text_pdf(
+        tmp_path / "integration-source.pdf",
+        ["Alpha Search Alpha", "Second page"],
+    )
+    source_bytes = source_path.read_bytes()
+    target_path = tmp_path / "integration-output.pdf"
+    window = create_real_main_window(qtbot, tmp_path)
+
+    window.open_document(source_path)
+    qtbot.waitUntil(lambda: window._documents[0].view.page_count == 2, timeout=8000)
+
+    document = window._documents[0]
+    workspace_directory = document.session.workspace_directory
+    assert document.session.document_path == workspace_directory / "working.pdf"
+    assert document.session.document_path.read_bytes() == source_bytes
+
+    document.session.mark_modified("simulated page operation")
+    window._update_actions()
+    monkeypatch.setattr(
+        QFileDialog,
+        "getSaveFileName",
+        lambda *args, **kwargs: (str(target_path), "PDF files (*.pdf)"),
+    )
+
+    assert window._save_current_document_as() is True
+    assert document.session.source_path == target_path.resolve()
+    assert document.session.is_modified is False
+    assert source_path.read_bytes() == source_bytes
+
+    with pikepdf.open(target_path) as saved_pdf:
+        assert len(saved_pdf.pages) == 2
+
+    rendered_document = pdfium.PdfDocument(str(target_path))
+    try:
+        assert len(rendered_document) == 2
+        page = rendered_document[0]
+        try:
+            bitmap = page.render(scale=0.2)
+            assert bitmap.width > 0
+            assert bitmap.height > 0
+        finally:
+            page.close()
+    finally:
+        rendered_document.close()
+
+    assert window.close_current_document() is True
+    assert not workspace_directory.exists()
 
 
 def test_main_window_shares_one_render_service_across_tabs(
