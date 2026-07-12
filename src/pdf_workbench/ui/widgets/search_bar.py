@@ -80,13 +80,32 @@ class SearchInputSurface(QWidget):
         style = self.style()
         style.unpolish(self)
         style.polish(self)
-        parent = self.parentWidget()
-        if parent is not None:
-            parent.repaint()
         self.repaint()
 
     def paintEvent(self, event: QPaintEvent) -> None:
         super().paintEvent(event)
+        app = QApplication.instance()
+        scheme = str(app.property("colorScheme") if app is not None else "light")
+        is_dark = scheme == "dark"
+
+        focused = bool(self.property("focused"))
+        border = QColor(
+            "#60a5fa"
+            if is_dark and focused
+            else "#2563eb"
+            if focused
+            else "#3a3f47"
+            if is_dark
+            else "#d9dde3"
+        )
+        background = QColor("#292c32" if is_dark else "#ffffff")
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setBrush(background)
+        painter.setPen(QPen(border, 1))
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        painter.drawRoundedRect(rect, 7, 7)
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         if watched is self.search_input:
@@ -176,7 +195,7 @@ class SearchBar(QWidget):
 
         self.search_input.installEventFilter(self)
         self.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
-        self.setFixedHeight(42)
+        self.setFixedHeight(40)
         self.refresh_theme_assets()
 
     def set_state(self, state: SearchBarState) -> None:
@@ -191,6 +210,7 @@ class SearchBar(QWidget):
     def focus_search(self) -> None:
         self.show()
         self.activateWindow()
+        self.search_input_surface.set_focused(True)
         self.search_input.setFocus(Qt.FocusReason.ShortcutFocusReason)
 
     def refresh_theme_assets(self) -> None:
@@ -202,24 +222,6 @@ class SearchBar(QWidget):
         self.previous_button.setIcon(IconProvider.icon(IconName.CHEVRON_LEFT, size=16))
         self.next_button.setIcon(IconProvider.icon(IconName.CHEVRON_RIGHT, size=16))
         self.close_button.setIcon(IconProvider.icon(IconName.CLOSE, size=16))
-        self.update()
-
-    def paintEvent(self, event: QPaintEvent) -> None:
-        super().paintEvent(event)
-        app = QApplication.instance()
-        scheme = str(app.property("colorScheme") if app is not None else "light")
-        is_dark = scheme == "dark"
-        border = QColor("#60a5fa" if is_dark else "#2563eb")
-        if not bool(self.search_input_surface.property("focused")):
-            border = QColor("#3a3f47" if is_dark else "#d9dde3")
-        background = QColor("#292c32" if is_dark else "#ffffff")
-        rect = self.search_input_surface.geometry()
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.setBrush(background)
-        painter.setPen(QPen(border, 1))
-        surface_rect = QRectF(rect.adjusted(0, 0, 0, -6)).adjusted(0.5, 0.5, -0.5, -0.5)
-        painter.drawRoundedRect(surface_rect, 7, 7)
 
     def cancel_pending_search(self) -> None:
         self._search_timer.stop()

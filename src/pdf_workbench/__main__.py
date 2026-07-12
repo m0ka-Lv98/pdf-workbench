@@ -159,7 +159,7 @@ def _build_ui_state(window: MainWindow, *, requested_window_size: str | None) ->
             window,
             window._search_bar.search_input_surface,
         ),
-        "search_input_surface_border_geometry": _search_input_surface_geometry(
+        "search_input_surface_border_geometry": _window_geometry(
             window,
             window._search_bar.search_input_surface,
         ),
@@ -204,14 +204,6 @@ def _window_geometry(window: MainWindow, widget: QWidget | None) -> list[int]:
     top_left = widget.mapTo(window, QPoint(0, 0))
     geometry = widget.geometry()
     return [top_left.x(), top_left.y(), geometry.width(), geometry.height()]
-
-
-def _search_input_surface_geometry(window: MainWindow, widget: QWidget | None) -> list[int]:
-    geometry = _window_geometry(window, widget)
-    if geometry[3] <= 6:
-        return geometry
-    geometry[3] -= 6
-    return geometry
 
 
 def _parse_window_size(size: str | None) -> list[int] | None:

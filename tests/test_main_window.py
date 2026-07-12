@@ -21,6 +21,7 @@ from pdf_workbench.services.pdf_renderer import (
 )
 from pdf_workbench.ui.main_window import MainWindow
 from pdf_workbench.ui.pdf_view import PdfView
+from pdf_workbench.ui.widgets.search_bar import SearchBar, SearchInputSurface
 
 
 def patch_pdf_open(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -734,16 +735,19 @@ def test_main_window_search_input_surface_tracks_focus_and_clear_button(
     assert window.open_search_bar() is True
 
     search_bar = window._search_bar
+    assert "paintEvent" not in SearchBar.__dict__
+    assert "paintEvent" in SearchInputSurface.__dict__
     assert search_bar.search_input_surface.height() == 40
     assert search_bar.search_icon.height() == 18
     assert search_bar.search_input.height() == 28
     assert search_bar.clear_button.height() == 26
+    assert search_bar.search_input.actions() == []
     assert search_bar.clear_button.isHidden()
+    assert search_bar.search_input_surface.property("focused") is True
 
     search_bar.search_input.setText("Alpha")
     qtbot.waitUntil(search_bar.clear_button.isVisible)
-    if QApplication.platformName() != "offscreen":
-        assert search_bar.search_input_surface.property("focused") is True
+    assert search_bar.search_input_surface.property("focused") is True
 
     surface_center_y = search_bar.search_input_surface.geometry().center().y()
     for widget in (
@@ -758,6 +762,8 @@ def test_main_window_search_input_surface_tracks_focus_and_clear_button(
     QTest.mouseClick(search_bar.clear_button, Qt.MouseButton.LeftButton)
     assert search_bar.search_input.text() == ""
     assert search_bar.clear_button.isHidden()
+    window._toolbar_widget.page_field.setFocus(Qt.FocusReason.OtherFocusReason)
+    qtbot.waitUntil(lambda: window._search_bar.search_input_surface.property("focused") is False)
 
 
 def test_main_window_search_progress_text_uses_failed_page_count() -> None:
@@ -1117,6 +1123,7 @@ def test_main_window_diagnostic_capture_stays_at_800_by_600(
     window.show()
     qtbot.waitUntil(window.isVisible)
     window.open_document(document_path)
+    assert window.open_search_bar() is True
     qtbot.waitUntil(lambda: window.width() == 800 and window.height() == 600)
 
     screenshot_path = tmp_path / "window-800x600.png"
@@ -1129,3 +1136,9 @@ def test_main_window_diagnostic_capture_stays_at_800_by_600(
     assert image.width() == 800
     assert image.height() == 600
     assert payload["actual_window_size"] == [800, 600]
+    assert payload["search_input_surface_size"] == [360, 40]
+    assert payload["search_input_surface_geometry"][3] == 40
+    assert payload["search_input_surface_border_geometry"][3] == 40
+    assert (
+        payload["search_input_surface_geometry"] == payload["search_input_surface_border_geometry"]
+    )

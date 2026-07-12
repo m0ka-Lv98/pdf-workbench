@@ -281,7 +281,7 @@ class MainWindow(QMainWindow):
             QSizePolicy.Policy.Fixed,
         )
         layout = QHBoxLayout(self._search_toolbar)
-        layout.setContentsMargins(24, 16, 24, 0)
+        layout.setContentsMargins(24, 12, 24, 0)
         layout.setSpacing(0)
         layout.addStretch(1)
         self._search_surface = QWidget(self._search_toolbar)
@@ -295,6 +295,7 @@ class MainWindow(QMainWindow):
         surface_layout.setContentsMargins(0, 0, 0, 0)
         surface_layout.setSpacing(0)
         surface_layout.addWidget(self._search_bar)
+        self._search_surface.setFixedHeight(40)
         layout.addWidget(self._search_surface)
         self._central_layout.addWidget(self._stack, 1)
         self._search_toolbar.hide()
@@ -843,9 +844,7 @@ class MainWindow(QMainWindow):
         if self._search_surface is not None:
             max_surface_width = min(620, max(420, host.width() - 72))
             self._search_surface.setMaximumWidth(max_surface_width)
-            self._search_surface.setFixedHeight(
-                max(44, self._search_bar.sizeHint().height() + 2),
-            )
+            self._search_surface.setFixedHeight(40)
         self._search_toolbar.raise_()
 
     def _search_widgets_fit_surface(self) -> bool:
