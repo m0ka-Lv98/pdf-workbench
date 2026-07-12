@@ -51,17 +51,21 @@ def assert_search_ui_ready(window: MainWindow) -> None:
     assert window._search_toolbar.isVisible()
     assert window._search_surface.isVisible()
     assert window._search_bar.isVisible()
+    assert window._search_bar.search_input_surface.isVisible()
     assert window._search_bar.search_input.isVisible()
     if QApplication.platformName() != "offscreen":
         assert window._search_bar.search_input.hasFocus()
+        assert window._search_bar.search_input_surface.property("focused") is True
     assert window._search_toolbar.geometry().width() > 0
     assert window._search_toolbar.geometry().height() > 0
     assert window._search_surface.geometry().width() > 0
     assert window._search_surface.geometry().height() > 0
     assert window._search_bar.geometry().width() > 0
     assert window._search_bar.geometry().height() > 0
+    assert window._search_bar.search_input_surface.geometry().width() > 0
+    assert window._search_bar.search_input_surface.geometry().height() == 40
     assert window._search_bar.search_input.geometry().width() > 0
-    assert window._search_bar.search_input.geometry().height() > 0
+    assert window._search_bar.search_input.geometry().height() == 28
     assert window._search_toolbar.geometry().height() >= window._search_bar.geometry().height()
     assert (
         window._search_bar.geometry().height()
@@ -87,12 +91,17 @@ def assert_search_ui_ready(window: MainWindow) -> None:
     toolbar_right = window._search_toolbar.rect().right()
     surface_right = window._search_surface.geometry().right()
     assert toolbar_right - surface_right < 40
-    assert (
-        window._search_bar.search_input.geometry().bottom()
-        <= window._search_surface.rect().bottom()
+    input_surface_rect = window._search_bar.search_input_surface.rect()
+    child_widgets = (
+        window._search_bar.search_icon,
+        window._search_bar.search_input,
+        window._search_bar.previous_button,
+        window._search_bar.next_button,
+        window._search_bar.close_button,
+        window._search_bar.counter_label,
     )
     for widget in (
-        window._search_bar.search_input,
+        window._search_bar.search_input_surface,
         window._search_bar.previous_button,
         window._search_bar.next_button,
         window._search_bar.close_button,
@@ -102,6 +111,20 @@ def assert_search_ui_ready(window: MainWindow) -> None:
         bottom_right = widget.mapTo(window._search_surface, widget.rect().bottomRight())
         child_rect = QRect(top_left, bottom_right)
         assert window._search_surface.rect().contains(child_rect)
+    for widget in child_widgets[:2]:
+        top_left = widget.mapTo(window._search_bar.search_input_surface, widget.rect().topLeft())
+        bottom_right = widget.mapTo(
+            window._search_bar.search_input_surface,
+            widget.rect().bottomRight(),
+        )
+        child_rect = QRect(top_left, bottom_right)
+        assert input_surface_rect.contains(child_rect)
+    surface_center_y = window._search_bar.search_input_surface.geometry().center().y()
+    for widget in (
+        window._search_bar.search_icon,
+        window._search_bar.search_input,
+    ):
+        assert abs(widget.geometry().center().y() - surface_center_y) <= 1
 
 
 def assert_button_icon_valid(button: QToolButton) -> None:
@@ -693,6 +716,48 @@ def test_main_window_search_bar_enter_and_shift_enter_fire_once(
 
     assert next_calls == 1
     assert previous_calls == 1
+
+
+def test_main_window_search_input_surface_tracks_focus_and_clear_button(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    window = MainWindow(settings)
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = create_blank_pdf(tmp_path / "search-focus.pdf", 1)
+    window.open_document(document_path)
+    assert window.open_search_bar() is True
+
+    search_bar = window._search_bar
+    assert search_bar.search_input_surface.height() == 40
+    assert search_bar.search_icon.height() == 18
+    assert search_bar.search_input.height() == 28
+    assert search_bar.clear_button.height() == 26
+    assert search_bar.clear_button.isHidden()
+
+    search_bar.search_input.setText("Alpha")
+    qtbot.waitUntil(search_bar.clear_button.isVisible)
+    if QApplication.platformName() != "offscreen":
+        assert search_bar.search_input_surface.property("focused") is True
+
+    surface_center_y = search_bar.search_input_surface.geometry().center().y()
+    for widget in (
+        search_bar.search_icon,
+        search_bar.search_input,
+        search_bar.clear_button,
+    ):
+        assert abs(widget.geometry().center().y() - surface_center_y) <= 1
+        assert widget.geometry().top() >= 0
+        assert widget.geometry().bottom() <= search_bar.search_input_surface.height() - 1
+
+    QTest.mouseClick(search_bar.clear_button, Qt.MouseButton.LeftButton)
+    assert search_bar.search_input.text() == ""
+    assert search_bar.clear_button.isHidden()
 
 
 def test_main_window_search_progress_text_uses_failed_page_count() -> None:

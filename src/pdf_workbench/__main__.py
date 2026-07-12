@@ -155,6 +155,21 @@ def _build_ui_state(window: MainWindow, *, requested_window_size: str | None) ->
         "zoom_control_geometry": _geometry(window._toolbar_widget.zoom_field),
         "pdf_canvas_geometry": _geometry(pdf_canvas_target),
         "search_surface_window_geometry": _window_geometry(window, window._search_surface),
+        "search_input_surface_geometry": _window_geometry(
+            window,
+            window._search_bar.search_input_surface,
+        ),
+        "search_input_surface_border_geometry": _search_input_surface_geometry(
+            window,
+            window._search_bar.search_input_surface,
+        ),
+        "search_input_surface_size": [
+            window._search_bar.search_input_surface.width(),
+            window._search_bar.search_input_surface.height(),
+        ],
+        "search_icon_geometry": _window_geometry(window, window._search_bar.search_icon),
+        "search_line_edit_geometry": _window_geometry(window, window._search_bar.search_input),
+        "search_clear_button_geometry": _window_geometry(window, window._search_bar.clear_button),
         "first_page_window_geometry": _window_geometry(window, first_page),
         "active_theme": active_theme,
         "search_query": window._search_bar.search_input.text(),
@@ -189,6 +204,14 @@ def _window_geometry(window: MainWindow, widget: QWidget | None) -> list[int]:
     top_left = widget.mapTo(window, QPoint(0, 0))
     geometry = widget.geometry()
     return [top_left.x(), top_left.y(), geometry.width(), geometry.height()]
+
+
+def _search_input_surface_geometry(window: MainWindow, widget: QWidget | None) -> list[int]:
+    geometry = _window_geometry(window, widget)
+    if geometry[3] <= 6:
+        return geometry
+    geometry[3] -= 6
+    return geometry
 
 
 def _parse_window_size(size: str | None) -> list[int] | None:

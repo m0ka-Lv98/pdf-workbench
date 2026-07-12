@@ -844,7 +844,7 @@ class MainWindow(QMainWindow):
             max_surface_width = min(620, max(420, host.width() - 72))
             self._search_surface.setMaximumWidth(max_surface_width)
             self._search_surface.setFixedHeight(
-                max(40, self._search_bar.sizeHint().height()),
+                max(44, self._search_bar.sizeHint().height() + 2),
             )
         self._search_toolbar.raise_()
 
@@ -855,7 +855,7 @@ class MainWindow(QMainWindow):
         if not surface_rect.contains(self._search_bar.geometry()):
             return False
         child_widgets = (
-            self._search_bar.search_input,
+            self._search_bar.search_input_surface,
             self._search_bar.previous_button,
             self._search_bar.next_button,
             self._search_bar.close_button,

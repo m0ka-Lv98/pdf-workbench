@@ -173,15 +173,23 @@ jobs:
             tests/fixtures/real-search-english.pdf \
             --window-size 800x600 \
             --color-scheme light
+
+          capture_ui "light-search-800x600" \
+            tests/fixtures/real-search-english.pdf \
+            --window-size 800x600 \
+            --color-scheme light \
+            --open-search \
+            --search-query Alpha
       - name: Verify UI review screenshots
         shell: bash
         run: |
           set -euo pipefail
           python - <<'PY'
           import json
+          import math
           from pathlib import Path
 
-          from PySide6.QtGui import QImage
+          from PySide6.QtGui import QColor, QImage
 
           review_dir = Path("ui-review")
           expected_sizes = {
@@ -191,13 +199,58 @@ jobs:
               "dark-document-1100x800": [1100, 800],
               "dark-search-1100x800": [1100, 800],
               "light-document-800x600": [800, 600],
+              "light-search-800x600": [800, 600],
           }
 
+          def center_y(rect: list[int]) -> int:
+              return rect[1] + rect[3] // 2
+
+          def contains_rect(outer: list[int], inner: list[int]) -> bool:
+              return (
+                  inner[0] >= outer[0]
+                  and inner[1] >= outer[1]
+                  and inner[0] + inner[2] <= outer[0] + outer[2]
+                  and inner[1] + inner[3] <= outer[1] + outer[3]
+              )
+
+          def color_distance(color: QColor, expected: tuple[int, int, int]) -> float:
+              return math.sqrt(
+                  (color.red() - expected[0]) ** 2
+                  + (color.green() - expected[1]) ** 2
+                  + (color.blue() - expected[2]) ** 2
+              )
+
+          def assert_edge_has_accent(
+              image: QImage,
+              rect: list[int],
+              expected: tuple[int, int, int],
+          ) -> None:
+              x, y, width, height = rect
+              samples = {
+                  "top": [(x + width // 2 + dx, y + 1) for dx in (-2, -1, 0, 1, 2)],
+                  "bottom": [
+                      (x + width // 2 + dx, y + height - 2) for dx in (-2, -1, 0, 1, 2)
+                  ],
+                  "left": [(x + 1, y + height // 2 + dy) for dy in (-2, -1, 0, 1, 2)],
+                  "right": [
+                      (x + width - 2, y + height // 2 + dy) for dy in (-2, -1, 0, 1, 2)
+                  ],
+              }
+              for side, points in samples.items():
+                  assert any(
+                      0 <= px < image.width()
+                      and 0 <= py < image.height()
+                      and color_distance(image.pixelColor(px, py), expected) <= 28
+                      for px, py in points
+                  ), side
+
           payloads: dict[str, dict[str, object]] = {}
+          images: dict[str, QImage] = {}
           for stem, expected_size in expected_sizes.items():
               image = QImage(str(review_dir / f"{stem}.png"))
               assert not image.isNull(), stem
               assert [image.width(), image.height()] == expected_size, stem
+              images[stem] = image
               payload = json.loads((review_dir / f"{stem}.json").read_text(encoding="utf-8"))
               payloads[stem] = payload
               assert payload["requested_window_size"] == expected_size, stem
@@ -213,10 +266,31 @@ jobs:
           for stem in ("light-search-1100x800", "dark-search-1100x800"):
               payload = payloads[stem]
               search_surface = payload["search_surface_window_geometry"]
+              input_surface = payload["search_input_surface_geometry"]
+              input_surface_border = payload["search_input_surface_border_geometry"]
+              input_surface_size = payload["search_input_surface_size"]
               first_page = payload["first_page_window_geometry"]
               assert search_surface[2] > 0 and search_surface[3] > 0
+              assert input_surface[2] > 0 and input_surface[3] == 40
+              assert input_surface_border[2] > 0 and input_surface_border[3] == 34
+              assert input_surface_size == [360, 40]
               assert first_page[2] > 0 and first_page[3] > 0
               assert first_page[1] >= search_surface[1] + search_surface[3] + 8
+              assert contains_rect(search_surface, input_surface)
+
+              icon = payload["search_icon_geometry"]
+              line_edit = payload["search_line_edit_geometry"]
+              clear_button = payload["search_clear_button_geometry"]
+              assert icon[3] <= 18
+              assert line_edit[3] <= 28
+              assert clear_button[3] <= 26
+              assert abs(center_y(icon) - center_y(input_surface)) <= 1
+              assert abs(center_y(line_edit) - center_y(input_surface)) <= 1
+              assert abs(center_y(clear_button) - center_y(input_surface)) <= 1
+              assert abs(center_y(icon) - center_y(line_edit)) <= 1
+              assert contains_rect(input_surface, icon)
+              assert contains_rect(input_surface, line_edit)
+              assert contains_rect(input_surface, clear_button)
 
           light_search = payloads["light-search-1100x800"]
           assert light_search["search_query"] == "Alpha"
@@ -228,6 +302,28 @@ jobs:
           assert (
               light_search["status_message_geometry"][0]
               > light_search["status_icon_geometry"][0] + light_search["status_icon_geometry"][2]
+          )
+
+          compact_search = payloads["light-search-800x600"]
+          assert compact_search["search_query"] == "Alpha"
+          assert compact_search["search_counter"] == "1 / 2"
+          assert compact_search["search_input_surface_geometry"][3] == 40
+          assert compact_search["search_input_surface_border_geometry"][3] == 34
+          assert compact_search["search_input_surface_size"] == [360, 40]
+          assert contains_rect(
+              compact_search["search_surface_window_geometry"],
+              compact_search["search_input_surface_geometry"],
+          )
+
+          assert_edge_has_accent(
+              images["light-search-1100x800"],
+              light_search["search_input_surface_border_geometry"],
+              (37, 99, 235),
+          )
+          assert_edge_has_accent(
+              images["dark-search-1100x800"],
+              payloads["dark-search-1100x800"]["search_input_surface_border_geometry"],
+              (96, 165, 250),
           )
           PY
       - name: Package app bundle
@@ -266,4 +362,6 @@ jobs:
             ui-review/dark-search-1100x800.json
             ui-review/light-document-800x600.png
             ui-review/light-document-800x600.json
+            ui-review/light-search-800x600.png
+            ui-review/light-search-800x600.json
           if-no-files-found: error

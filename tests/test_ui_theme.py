@@ -46,6 +46,7 @@ def test_load_stylesheet_returns_workbench_theme_styles() -> None:
     dark = load_stylesheet(ColorScheme.DARK)
 
     assert "QWidget#searchSurface" in light
+    assert "QWidget#searchInputSurface" in light
     assert "QWidget#mainToolbar" in light
     assert "QWidget#toolbarSeparator" in light
     assert "QWidget#documentToolbar QPushButton#openPdfButton" in light

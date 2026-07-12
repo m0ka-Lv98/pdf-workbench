@@ -2,9 +2,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from PySide6.QtCore import QEvent, QObject, QSignalBlocker, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QKeyEvent
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QLineEdit, QSizePolicy, QToolButton, QWidget
+from PySide6.QtCore import QEvent, QObject, QRectF, QSignalBlocker, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QKeyEvent, QPainter, QPaintEvent, QPen
+from PySide6.QtWidgets import (
+    QApplication,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QSizePolicy,
+    QToolButton,
+    QWidget,
+)
 
 from pdf_workbench.ui.icon_provider import IconName, IconProvider, IconTone
 
@@ -15,6 +23,81 @@ class SearchBarState:
     current_index: int
     total_count: int
     progress_text: str
+
+
+class SearchInputSurface(QWidget):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("searchInputSurface")
+        self.setFixedWidth(360)
+        self.setFixedHeight(40)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.setProperty("focused", False)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(11, 0, 6, 0)
+        layout.setSpacing(8)
+        layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+
+        self.search_icon = QLabel(self)
+        self.search_icon.setObjectName("searchIcon")
+        self.search_icon.setFixedSize(18, 18)
+        self.search_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.search_icon.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+
+        self.search_input = QLineEdit(self)
+        self.search_input.setObjectName("searchInput")
+        self.search_input.setPlaceholderText("検索")
+        self.search_input.setAccessibleName("Search input")
+        self.search_input.setToolTip("検索語句を入力します")
+        self.search_input.setFrame(False)
+        self.search_input.setFixedHeight(28)
+        self.search_input.setTextMargins(0, 0, 0, 0)
+        self.search_input.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+
+        self.clear_button = QToolButton(self)
+        self.clear_button.setObjectName("clearSearchInputButton")
+        self.clear_button.setAccessibleName("Clear search input")
+        self.clear_button.setToolTip("検索語句をクリア")
+        self.clear_button.setAutoRaise(True)
+        self.clear_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self.clear_button.setFixedSize(26, 26)
+        self.clear_button.hide()
+
+        layout.addWidget(self.search_icon)
+        layout.addWidget(self.search_input, 1)
+        layout.addWidget(self.clear_button, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        self.search_input.installEventFilter(self)
+
+    def set_focused(self, focused: bool) -> None:
+        if self.property("focused") == focused:
+            return
+        self.setProperty("focused", focused)
+        style = self.style()
+        style.unpolish(self)
+        style.polish(self)
+        parent = self.parentWidget()
+        if parent is not None:
+            parent.repaint()
+        self.repaint()
+
+    def paintEvent(self, event: QPaintEvent) -> None:
+        super().paintEvent(event)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if watched is self.search_input:
+            if event.type() == QEvent.Type.FocusIn:
+                self.set_focused(True)
+            elif event.type() == QEvent.Type.FocusOut:
+                self.set_focused(False)
+        return super().eventFilter(watched, event)
+
+    def refresh_theme_assets(self) -> None:
+        self.repaint()
 
 
 class SearchBar(QWidget):
@@ -39,30 +122,12 @@ class SearchBar(QWidget):
         layout.setSpacing(8)
         layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
-        self.search_input = QLineEdit(self)
-        self.search_input.setObjectName("searchInput")
-        self.search_input.setPlaceholderText("検索")
-        self.search_input.setAccessibleName("Search input")
-        self.search_input.setToolTip("検索語句を入力します")
-        self.search_input.setMinimumWidth(320)
-        self.search_input.setMaximumWidth(360)
-        self.search_input.setFixedHeight(38)
-        self.search_input.setSizePolicy(
-            QSizePolicy.Policy.Fixed,
-            QSizePolicy.Policy.Fixed,
-        )
+        self.search_input_surface = SearchInputSurface(self)
+        self.search_icon = self.search_input_surface.search_icon
+        self.search_input = self.search_input_surface.search_input
+        self.clear_button = self.search_input_surface.clear_button
         self.search_input.textChanged.connect(self._on_text_changed)
-        self._search_icon_action = QAction(self)
-        self._clear_icon_action = QAction(self)
-        self._clear_icon_action.triggered.connect(self._clear_query)
-        self.search_input.addAction(
-            self._search_icon_action,
-            QLineEdit.ActionPosition.LeadingPosition,
-        )
-        self.search_input.addAction(
-            self._clear_icon_action,
-            QLineEdit.ActionPosition.TrailingPosition,
-        )
+        self.clear_button.clicked.connect(self._clear_query)
 
         self.previous_button = QToolButton(self)
         self.previous_button.setObjectName("previousSearchResultButton")
@@ -102,7 +167,7 @@ class SearchBar(QWidget):
         self.close_button.setFixedSize(34, 34)
         self.close_button.clicked.connect(self.close_requested.emit)
 
-        layout.addWidget(self.search_input, 1)
+        layout.addWidget(self.search_input_surface)
         layout.addWidget(self.previous_button)
         layout.addWidget(self.counter_label)
         layout.addWidget(self.next_button)
@@ -111,13 +176,14 @@ class SearchBar(QWidget):
 
         self.search_input.installEventFilter(self)
         self.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
-        self.setFixedHeight(40)
+        self.setFixedHeight(42)
         self.refresh_theme_assets()
 
     def set_state(self, state: SearchBarState) -> None:
         blocker = QSignalBlocker(self.search_input)
         self.search_input.setText(state.query)
         del blocker
+        self._sync_clear_button_visibility()
         self.counter_label.setText(f"{state.current_index} / {state.total_count}")
         self.progress_label.setText(state.progress_text)
         self.progress_label.setVisible(bool(state.progress_text))
@@ -128,15 +194,32 @@ class SearchBar(QWidget):
         self.search_input.setFocus(Qt.FocusReason.ShortcutFocusReason)
 
     def refresh_theme_assets(self) -> None:
-        self._search_icon_action.setIcon(
-            IconProvider.icon(IconName.SEARCH, tone=IconTone.MUTED, size=16)
+        self.search_input_surface.refresh_theme_assets()
+        self.search_icon.setPixmap(
+            IconProvider.icon(IconName.SEARCH, tone=IconTone.MUTED, size=16).pixmap(16, 16)
         )
-        self._clear_icon_action.setIcon(
-            IconProvider.icon(IconName.CLOSE, tone=IconTone.MUTED, size=14)
-        )
+        self.clear_button.setIcon(IconProvider.icon(IconName.CLOSE, tone=IconTone.MUTED, size=14))
         self.previous_button.setIcon(IconProvider.icon(IconName.CHEVRON_LEFT, size=16))
         self.next_button.setIcon(IconProvider.icon(IconName.CHEVRON_RIGHT, size=16))
         self.close_button.setIcon(IconProvider.icon(IconName.CLOSE, size=16))
+        self.update()
+
+    def paintEvent(self, event: QPaintEvent) -> None:
+        super().paintEvent(event)
+        app = QApplication.instance()
+        scheme = str(app.property("colorScheme") if app is not None else "light")
+        is_dark = scheme == "dark"
+        border = QColor("#60a5fa" if is_dark else "#2563eb")
+        if not bool(self.search_input_surface.property("focused")):
+            border = QColor("#3a3f47" if is_dark else "#d9dde3")
+        background = QColor("#292c32" if is_dark else "#ffffff")
+        rect = self.search_input_surface.geometry()
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setBrush(background)
+        painter.setPen(QPen(border, 1))
+        surface_rect = QRectF(rect.adjusted(0, 0, 0, -6)).adjusted(0.5, 0.5, -0.5, -0.5)
+        painter.drawRoundedRect(surface_rect, 7, 7)
 
     def cancel_pending_search(self) -> None:
         self._search_timer.stop()
@@ -146,6 +229,7 @@ class SearchBar(QWidget):
         self.search_requested.emit(self.search_input.text())
 
     def _on_text_changed(self, _text: str) -> None:
+        self._sync_clear_button_visibility()
         self._search_timer.start()
 
     def _emit_debounced_search(self) -> None:
@@ -154,7 +238,11 @@ class SearchBar(QWidget):
     def _clear_query(self) -> None:
         self.cancel_pending_search()
         self.search_input.clear()
+        self._sync_clear_button_visibility()
         self.search_requested.emit("")
+
+    def _sync_clear_button_visibility(self) -> None:
+        self.clear_button.setVisible(bool(self.search_input.text()))
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         if watched is self.search_input and event.type() == QEvent.Type.KeyPress:
