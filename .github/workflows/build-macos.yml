@@ -72,6 +72,7 @@ jobs:
           command = [
               "dist/PDF Workbench.app/Contents/MacOS/PDF Workbench",
               os.path.join(os.getcwd(), "tests/fixtures/real-search-english.pdf"),
+              "--skip-recovery-prompt",
               "--window-size",
               "1100x800",
               "--color-scheme",
@@ -136,6 +137,7 @@ jobs:
             local stem="$1"
             shift
             python -m pdf_workbench "$@" \
+              --skip-recovery-prompt \
               --screenshot-path "$review_dir/$stem.png" \
               --ui-state-path "$review_dir/$stem.json" \
               --quit-after-ms 1800
@@ -180,6 +182,21 @@ jobs:
             --color-scheme light \
             --open-search \
             --search-query Alpha
+
+          capture_recovery_dialog() {
+            local stem="$1"
+            local size="$2"
+            local scheme="$3"
+            python scripts/capture_recovery_dialog.py \
+              --window-size "$size" \
+              --color-scheme "$scheme" \
+              --output-png "$review_dir/$stem.png" \
+              --output-json "$review_dir/$stem.json"
+          }
+
+          capture_recovery_dialog "light-recovery-dialog-1100x800" "1100x800" "light"
+          capture_recovery_dialog "dark-recovery-dialog-1100x800" "1100x800" "dark"
+          capture_recovery_dialog "light-recovery-dialog-800x600" "800x600" "light"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -199,6 +216,12 @@ jobs:
             ui-review/light-document-800x600.json
             ui-review/light-search-800x600.png
             ui-review/light-search-800x600.json
+            ui-review/light-recovery-dialog-1100x800.png
+            ui-review/light-recovery-dialog-1100x800.json
+            ui-review/dark-recovery-dialog-1100x800.png
+            ui-review/dark-recovery-dialog-1100x800.json
+            ui-review/light-recovery-dialog-800x600.png
+            ui-review/light-recovery-dialog-800x600.json
           if-no-files-found: error
       - name: Verify UI review screenshots
         shell: bash
@@ -206,6 +229,7 @@ jobs:
           set -euo pipefail
           python - <<'PY'
           import json
+          import hashlib
           import math
           from pathlib import Path
 
@@ -220,6 +244,9 @@ jobs:
               "dark-search-1100x800": [1100, 800],
               "light-document-800x600": [800, 600],
               "light-search-800x600": [800, 600],
+              "light-recovery-dialog-1100x800": [1100, 800],
+              "dark-recovery-dialog-1100x800": [1100, 800],
+              "light-recovery-dialog-800x600": [800, 600],
           }
 
           def center_y(rect: list[int]) -> int:
@@ -239,6 +266,27 @@ jobs:
                   + (color.green() - expected[1]) ** 2
                   + (color.blue() - expected[2]) ** 2
               )
+
+          def unique_colors(image: QImage, limit: int = 256) -> int:
+              colors: set[tuple[int, int, int, int]] = set()
+              for y in range(image.height()):
+                  for x in range(image.width()):
+                      color = image.pixelColor(x, y)
+                      colors.add((color.red(), color.green(), color.blue(), color.alpha()))
+                      if len(colors) >= limit:
+                          return len(colors)
+              return len(colors)
+
+          def brightness(image: QImage, rect: list[int]) -> float:
+              x, y, width, height = rect
+              total = 0.0
+              samples = 0
+              for yy in range(y, y + height):
+                  for xx in range(x, x + width):
+                      color = image.pixelColor(xx, yy)
+                      total += (color.red() + color.green() + color.blue()) / 3.0
+                      samples += 1
+              return 0.0 if samples == 0 else total / samples
 
           def assert_edge_has_accent(
               stem: str,
@@ -291,6 +339,7 @@ jobs:
               image = QImage(str(review_dir / f"{stem}.png"))
               assert not image.isNull(), stem
               assert [image.width(), image.height()] == expected_size, stem
+              assert unique_colors(image) > 32, stem
               images[stem] = image
               payload = json.loads((review_dir / f"{stem}.json").read_text(encoding="utf-8"))
               payloads[stem] = payload
@@ -355,6 +404,80 @@ jobs:
           assert contains_rect(
               compact_search["search_surface_window_geometry"],
               compact_search["search_input_surface_geometry"],
+          )
+
+          for stem in (
+              "light-recovery-dialog-1100x800",
+              "dark-recovery-dialog-1100x800",
+              "light-recovery-dialog-800x600",
+          ):
+              payload = payloads[stem]
+              assert payload["candidate_count"] == 3
+              assert payload["recoverable_count"] == 1
+              assert payload["discardable_count"] == 2
+              assert payload["recover_enabled"] is False
+              assert payload["discard_enabled"] is True
+              assert payload["later_visible"] is True
+              assert payload["fits_in_review_viewport"] is True
+              assert payload["tree_geometry"][2] > 0 and payload["tree_geometry"][3] > 0
+              assert (
+                  payload["button_row_geometry"][2] > 0
+                  and payload["button_row_geometry"][3] > 0
+              )
+              assert payload["unique_color_count"] > 32
+              assert (
+                  payload["dialog_geometry_in_viewport"][2] > 0
+                  and payload["dialog_geometry_in_viewport"][3] > 0
+              )
+
+          compact_recovery = payloads["light-recovery-dialog-800x600"]
+          assert compact_recovery["dialog_geometry_in_viewport"][2] <= 800
+          assert compact_recovery["dialog_geometry_in_viewport"][3] <= 600
+          assert compact_recovery["visible_columns"] == ["対象", "ファイル", "元の場所", "状態"]
+          assert compact_recovery["hidden_columns"] == ["最終更新", "サイズ"]
+          assert compact_recovery["horizontal_scrollbar_visible"] is False
+          assert compact_recovery["horizontal_scrollbar_maximum"] == 0
+
+          light_recovery = payloads["light-recovery-dialog-1100x800"]
+          dark_recovery = payloads["dark-recovery-dialog-1100x800"]
+          assert light_recovery["visible_columns"] == [
+              "対象",
+              "ファイル",
+              "元の場所",
+              "最終更新",
+              "状態",
+              "サイズ",
+          ]
+          assert light_recovery["hidden_columns"] == []
+          assert light_recovery["horizontal_scrollbar_maximum"] == 0
+          assert dark_recovery["visible_columns"] == [
+              "対象",
+              "ファイル",
+              "元の場所",
+              "最終更新",
+              "状態",
+              "サイズ",
+          ]
+          assert dark_recovery["hidden_columns"] == []
+          assert dark_recovery["horizontal_scrollbar_maximum"] == 0
+          assert (
+              light_recovery["canvas_digest"]
+              != dark_recovery["canvas_digest"]
+          )
+          assert (
+              light_recovery["dialog_digest"]
+              != dark_recovery["dialog_digest"]
+          )
+          assert (
+              dark_recovery["dialog_brightness"]
+              < light_recovery["dialog_brightness"]
+          )
+          assert (
+              abs(light_recovery["tree_brightness"] - light_recovery["dialog_brightness"]) > 1.0
+          )
+          assert (
+              abs(light_recovery["button_row_brightness"] - light_recovery["dialog_brightness"])
+              > 1.0
           )
 
           assert_edge_has_accent(

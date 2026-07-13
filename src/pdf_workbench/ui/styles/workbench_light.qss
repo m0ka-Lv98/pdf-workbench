@@ -316,6 +316,81 @@ QWidget#statusRightContainer {
   background: transparent;
 }
 
+QDialog#recoveryDialog {
+  background: #ffffff;
+  color: #20242a;
+  border: 1px solid #d9dde3;
+  border-radius: 12px;
+}
+
+QDialog#recoveryDialog QLabel {
+  color: #20242a;
+  background: transparent;
+}
+
+QDialog#recoveryDialog QTreeWidget {
+  background: #ffffff;
+  color: #20242a;
+  border: 1px solid #d9dde3;
+  border-radius: 10px;
+  alternate-background-color: #f8f9fb;
+}
+
+QDialog#recoveryDialog QTreeWidget::item {
+  min-height: 28px;
+}
+
+QDialog#recoveryDialog QTreeWidget::item:selected {
+  background: #f1f3f6;
+  color: #20242a;
+}
+
+QDialog#recoveryDialog QHeaderView::section {
+  background: #f3f5f8;
+  color: #4b5565;
+  border: none;
+  border-right: 1px solid #e3e7ed;
+  border-bottom: 1px solid #d9dde3;
+  padding: 8px 10px;
+  font-weight: 600;
+}
+
+QDialog#recoveryDialog QPushButton {
+  min-height: 34px;
+  border: 1px solid #d9dde3;
+  border-radius: 8px;
+  background: #ffffff;
+  color: #20242a;
+  padding: 0 14px;
+}
+
+QDialog#recoveryDialog QPushButton:hover {
+  background: #f1f3f6;
+}
+
+QDialog#recoveryDialog QPushButton:pressed {
+  background: #e5e9ef;
+}
+
+QDialog#recoveryDialog QPushButton:disabled {
+  color: #a4aab4;
+  background: #f3f5f8;
+  border-color: #e3e7ed;
+}
+
+QDialog#recoveryDialog QTreeWidget::indicator {
+  width: 16px;
+  height: 16px;
+  border: 1px solid #69707d;
+  border-radius: 4px;
+  background: #ffffff;
+}
+
+QDialog#recoveryDialog QTreeWidget::indicator:checked {
+  border-color: #2563eb;
+  background: #2563eb;
+}
+
 QTabWidget#documentTabs {
   background: #f7f8fa;
 }
