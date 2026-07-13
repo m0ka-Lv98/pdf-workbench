@@ -53,6 +53,10 @@ class DocumentSession:
     recovered_from_interrupted_session: bool = False
     requires_save_as: bool = False
     recovery_source_status: SourceStatus | None = None
+    source_status: SourceStatus = SourceStatus.UNCHANGED
+    source_status_checked_at: datetime | None = None
+    source_change_detected_at: datetime | None = None
+    source_status_revision: int = 0
 
     def __post_init__(self) -> None:
         self.source_path = self.source_path.expanduser().resolve()
@@ -99,6 +103,9 @@ class DocumentSession:
         self.recovered_from_interrupted_session = False
         self.requires_save_as = False
         self.recovery_source_status = None
+        self.source_status = SourceStatus.UNCHANGED
+        self.source_status_checked_at = saved_at
+        self.source_change_detected_at = None
 
     def set_navigation_state(self, *, page_index: int, zoom_factor: float) -> None:
         if page_index < 0:
@@ -114,9 +121,53 @@ class DocumentSession:
     def mark_recovered(self, source_status: SourceStatus) -> None:
         self.recovered_from_interrupted_session = True
         self.recovery_source_status = source_status
+        self.source_status = source_status
+        now = datetime.now(UTC)
+        self.source_status_checked_at = now
+        self.source_change_detected_at = None if source_status is SourceStatus.UNCHANGED else now
         self.requires_save_as = source_status is not SourceStatus.UNCHANGED
+        if source_status is not SourceStatus.UNCHANGED:
+            self.source_status_revision += 1
 
     def clear_recovery_state(self) -> None:
         self.recovered_from_interrupted_session = False
-        self.requires_save_as = False
         self.recovery_source_status = None
+        self.requires_save_as = self.source_status is not SourceStatus.UNCHANGED
+
+    def apply_source_check(self, result: object) -> bool:
+        from pdf_workbench.services.source_change_monitor import SourceCheckResult
+
+        if not isinstance(result, SourceCheckResult):
+            raise TypeError("result must be SourceCheckResult")
+
+        fingerprint_changed = result.current_fingerprint != self.source_fingerprint
+        status_changed = result.status is not self.source_status
+        previous_status = self.source_status
+        previous_checked_at = self.source_status_checked_at
+        previous_requires_save_as = self.requires_save_as
+
+        self.source_status = result.status
+        self.source_status_checked_at = result.checked_at
+        if result.status is SourceStatus.UNCHANGED:
+            self.source_change_detected_at = None
+        elif self.source_change_detected_at is None or previous_status is SourceStatus.UNCHANGED:
+            self.source_change_detected_at = result.checked_at
+
+        self.requires_save_as = bool(
+            result.status is not SourceStatus.UNCHANGED
+            or (
+                self.recovered_from_interrupted_session
+                and self.recovery_source_status is not None
+                and self.recovery_source_status is not SourceStatus.UNCHANGED
+            )
+        )
+
+        if status_changed or fingerprint_changed:
+            self.source_status_revision += 1
+
+        return bool(
+            status_changed
+            or fingerprint_changed
+            or previous_requires_save_as != self.requires_save_as
+            or previous_checked_at is None
+        )

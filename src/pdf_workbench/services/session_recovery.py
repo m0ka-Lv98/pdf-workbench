@@ -26,6 +26,7 @@ from pdf_workbench.services.session_workspace import (
     WorkspaceLockActiveError,
     WorkspaceLockError,
 )
+from pdf_workbench.services.source_change_monitor import SourceFileInspector
 
 logger = logging.getLogger(__name__)
 
@@ -84,9 +85,13 @@ class SessionRecoveryService:
         workspace_manager: SessionWorkspaceManager,
         *,
         validator: PdfDocumentValidator | None = None,
+        source_file_inspector: SourceFileInspector | None = None,
     ) -> None:
         self._workspace_manager = workspace_manager
         self._validator = validator if validator is not None else PdfDocumentValidator()
+        self._source_file_inspector = (
+            source_file_inspector if source_file_inspector is not None else SourceFileInspector()
+        )
 
     def write_metadata(self, session: DocumentSession) -> None:
         metadata_path = session.workspace_directory / self._workspace_manager.METADATA_NAME
@@ -564,17 +569,8 @@ class SessionRecoveryService:
         finally:
             os.close(directory_handle)
 
-    @staticmethod
-    def _detect_source_status(metadata: RecoveryMetadata) -> SourceStatus:
-        try:
-            stat_result = metadata.source_path.stat()
-        except FileNotFoundError:
-            return SourceStatus.MISSING
-        except OSError:
-            return SourceStatus.UNREADABLE
-        if (
-            stat_result.st_size == metadata.source_fingerprint.size_bytes
-            and stat_result.st_mtime_ns == metadata.source_fingerprint.modified_time_ns
-        ):
-            return SourceStatus.UNCHANGED
-        return SourceStatus.MODIFIED
+    def _detect_source_status(self, metadata: RecoveryMetadata) -> SourceStatus:
+        return self._source_file_inspector.inspect(
+            metadata.source_path,
+            metadata.source_fingerprint,
+        ).status
