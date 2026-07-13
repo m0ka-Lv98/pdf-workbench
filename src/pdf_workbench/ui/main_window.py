@@ -616,11 +616,6 @@ class MainWindow(QMainWindow):
         source_check_result: SourceCheckResult | None = None
         if intent is SaveIntent.SAVE:
             source_check_result = self._source_change_monitor.check_session_now(session)
-            if (
-                source_check_result.status is not SourceStatus.UNCHANGED
-                and session.source_status is SourceStatus.UNCHANGED
-            ):
-                self._apply_source_check_result(session, source_check_result, notify=False)
         if (
             intent is SaveIntent.SAVE
             and source_check_result is not None
@@ -636,6 +631,12 @@ class MainWindow(QMainWindow):
         )
         if destination.suffix.lower() != ".pdf":
             destination = destination.with_suffix(".pdf")
+        if intent is SaveIntent.SAVE_AS and destination == session.source_path:
+            source_check_result = self._source_change_monitor.check_session_now(session)
+        if source_check_result is not None and not self._source_check_is_applied(
+            session, source_check_result
+        ):
+            self._apply_source_check_result(session, source_check_result, notify=False)
         if self._workspace_manager.contains_managed_path(destination):
             self._report_error(
                 "保存できません",
@@ -715,8 +716,6 @@ class MainWindow(QMainWindow):
         target_path = Path(filename).expanduser().resolve()
         if target_path.suffix.lower() != ".pdf":
             target_path = target_path.with_suffix(".pdf")
-        if not self._confirm_save_as_target(document, target_path):
-            return None
         return target_path
 
     def _find_save_conflict(
@@ -995,8 +994,6 @@ class MainWindow(QMainWindow):
         self._update_actions()
         self._update_window_title()
         self._refresh_source_change_banner()
-        if self._current_document() is document:
-            self._show_source_status_message(document.session.source_status)
 
     def _apply_source_check_result(
         self,
@@ -1013,6 +1010,17 @@ class MainWindow(QMainWindow):
         if notify and changed and session.source_status is not previous_status:
             self._show_source_status_message(session.source_status)
         return changed
+
+    @staticmethod
+    def _source_check_is_applied(
+        session: DocumentSession,
+        result: SourceCheckResult,
+    ) -> bool:
+        return (
+            session.source_status is result.status
+            and session.last_observed_source_fingerprint == result.current_fingerprint
+            and session.last_source_error_message == result.error_message
+        )
 
     def _show_source_status_message(self, status: SourceStatus) -> None:
         if status is SourceStatus.MODIFIED:
@@ -1351,7 +1359,19 @@ class MainWindow(QMainWindow):
             return TargetSnapshot(exists=True, fingerprint=session.source_fingerprint)
 
         if destination == session.source_path:
-            if session.source_status is SourceStatus.MODIFIED:
+            if source_check_result is None:
+                raise ValueError(
+                    "source_check_result is required when Save As targets the current source path"
+                )
+            if source_check_result.status is SourceStatus.UNCHANGED:
+                return TargetSnapshot(exists=True, fingerprint=session.source_fingerprint)
+            if source_check_result.status is SourceStatus.MODIFIED:
+                if source_check_result.current_fingerprint is None:
+                    self._report_error(
+                        "保存できません",
+                        "元のPDFの最新状態を確認できなかったため、この場所への上書きは中止しました。別の保存先を選択してください。",
+                    )
+                    return None
                 result = QMessageBox.warning(
                     self,
                     "外部変更を上書きしますか",
@@ -1361,7 +1381,11 @@ class MainWindow(QMainWindow):
                 )
                 if result != QMessageBox.StandardButton.Ok:
                     return None
-            elif session.source_status is SourceStatus.MISSING:
+                return TargetSnapshot(
+                    exists=True,
+                    fingerprint=source_check_result.current_fingerprint,
+                )
+            if source_check_result.status is SourceStatus.MISSING:
                 result = QMessageBox.warning(
                     self,
                     "元のPDFを再作成しますか",
@@ -1372,7 +1396,7 @@ class MainWindow(QMainWindow):
                 if result != QMessageBox.StandardButton.Ok:
                     return None
                 return TargetSnapshot(exists=False, fingerprint=None)
-            elif session.source_status is SourceStatus.UNREADABLE:
+            if source_check_result.status is SourceStatus.UNREADABLE:
                 self._report_error(
                     "保存できません",
                     "元のPDFの状態を確認できないため、この場所への上書きはできません。別の保存先を選択してください。",
@@ -1393,9 +1417,6 @@ class MainWindow(QMainWindow):
         except OSError as exc:
             self._report_error("保存できません", f"保存先の状態を確認できませんでした。\n\n{exc}")
             return None
-
-    def _confirm_save_as_target(self, document: DocumentTab, target_path: Path) -> bool:
-        return True
 
     def _handle_target_changed_during_save(
         self,
