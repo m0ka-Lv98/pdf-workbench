@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import tempfile
 from pathlib import Path
 from shutil import copy2
 
 from PySide6.QtWidgets import QApplication
 
-from pdf_test_utils import create_blank_pdf
 from pdf_workbench.__main__ import _apply_window_size, _build_ui_state, _flush_layout
 from pdf_workbench.core.settings import configure_qsettings
 from pdf_workbench.services.pdf_save_service import PdfSaveService
@@ -32,6 +32,15 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _create_blank_pdf(path: Path, page_count: int) -> None:
+    tests_dir = Path(__file__).resolve().parents[1] / "tests"
+    if str(tests_dir) not in sys.path:
+        sys.path.insert(0, str(tests_dir))
+    from pdf_test_utils import create_blank_pdf
+
+    create_blank_pdf(path, page_count)
+
+
 def main() -> int:
     args = build_parser().parse_args()
     app = QApplication.instance()
@@ -43,7 +52,7 @@ def main() -> int:
         source_path = temp_root / "source.pdf"
         replacement_path = temp_root / "replacement.pdf"
         copy2(args.fixture_pdf, source_path)
-        create_blank_pdf(replacement_path, 2)
+        _create_blank_pdf(replacement_path, 2)
         settings = configure_qsettings()
         monitor = SourceChangeMonitor(parent=app, poll_interval_ms=2000, debounce_interval_ms=50)
         window = MainWindow(
