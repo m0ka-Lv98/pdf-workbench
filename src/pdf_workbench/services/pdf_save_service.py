@@ -31,6 +31,34 @@ class AtomicReplaceError(PdfSaveError):
     """Raised when a validated candidate cannot replace the target path."""
 
 
+class TargetChangedError(PdfSaveError):
+    """Raised when the save target changed while a save was in progress."""
+
+
+@dataclass(frozen=True, slots=True)
+class TargetSnapshot:
+    exists: bool
+    fingerprint: FileFingerprint | None
+
+    @classmethod
+    def capture(cls, path: Path) -> TargetSnapshot:
+        try:
+            stat_result = path.stat()
+        except FileNotFoundError:
+            return cls(exists=False, fingerprint=None)
+        except OSError:
+            raise
+        if not path.is_file():
+            raise OSError("target path is not a file")
+        return cls(
+            exists=True,
+            fingerprint=FileFingerprint(
+                size_bytes=stat_result.st_size,
+                modified_time_ns=stat_result.st_mtime_ns,
+            ),
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class SaveResult:
     target_path: Path
@@ -47,6 +75,7 @@ class PdfSaveService:
         session: DocumentSession,
         target_path: Path,
         expected_page_count: int,
+        target_snapshot: TargetSnapshot,
     ) -> SaveResult:
         resolved_target = target_path.expanduser().resolve()
         saved_at = datetime.now(UTC)
@@ -71,7 +100,9 @@ class PdfSaveService:
             self._validate_saved_pdf(temp_path, expected_page_count)
             logger.info("Validation succeeded: temp=%s", temp_path)
             fingerprint = self._build_fingerprint(temp_path)
+            self._ensure_target_snapshot_matches(resolved_target, target_snapshot)
             self._apply_existing_target_mode(temp_path, resolved_target)
+            self._ensure_target_snapshot_matches(resolved_target, target_snapshot)
             self._replace_atomically(temp_path, resolved_target)
             self._fsync_parent_directory(resolved_target.parent)
             logger.info("Atomic replace succeeded: target=%s", resolved_target)
@@ -151,6 +182,22 @@ class PdfSaveService:
             return FileFingerprint.from_path(path)
         except OSError as exc:
             raise PdfSaveError("保存候補PDFのメタデータ取得に失敗しました") from exc
+
+    def _ensure_target_snapshot_matches(
+        self,
+        target_path: Path,
+        target_snapshot: TargetSnapshot,
+    ) -> None:
+        try:
+            current_snapshot = TargetSnapshot.capture(target_path)
+        except OSError as exc:
+            raise TargetChangedError(
+                "保存先の状態を再確認できなかったため、上書きを中止しました"
+            ) from exc
+        if current_snapshot != target_snapshot:
+            raise TargetChangedError(
+                "保存中に保存先が別のプロセスで変更されたため、上書きを中止しました"
+            )
 
     def _apply_existing_target_mode(self, temp_path: Path, target_path: Path) -> None:
         if not target_path.exists() or os.name == "nt":
