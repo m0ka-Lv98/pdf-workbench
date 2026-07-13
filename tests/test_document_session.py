@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from pdf_workbench.domain.document_session import DocumentSession, FileFingerprint, SourceStatus
+from pdf_workbench.services.source_change_monitor import SourceCheckResult
 
 
 def create_session(tmp_path: Path) -> DocumentSession:
@@ -109,3 +110,124 @@ def test_mark_modified_limits_operation_history(tmp_path: Path) -> None:
     assert len(session.operation_history) == DocumentSession.MAX_OPERATION_HISTORY
     assert session.operation_history[0] == "op-50"
     assert session.operation_history[-1] == "op-149"
+
+
+def test_apply_source_check_updates_requires_save_as_without_marking_dirty(tmp_path: Path) -> None:
+    session = create_session(tmp_path)
+    checked_at = datetime.now(UTC)
+
+    changed = session.apply_source_check(
+        SourceCheckResult(
+            path=session.source_path,
+            status=SourceStatus.MODIFIED,
+            expected_fingerprint=session.source_fingerprint,
+            current_fingerprint=FileFingerprint(size_bytes=999, modified_time_ns=999),
+            checked_at=checked_at,
+            error_message="modified",
+        )
+    )
+
+    assert changed is True
+    assert session.source_status is SourceStatus.MODIFIED
+    assert session.requires_save_as is True
+    assert session.is_modified is False
+    assert session.source_change_detected_at == checked_at
+
+
+def test_apply_source_check_returns_to_unchanged_after_non_recovery_transition(
+    tmp_path: Path,
+) -> None:
+    session = create_session(tmp_path)
+    session.apply_source_check(
+        SourceCheckResult(
+            path=session.source_path,
+            status=SourceStatus.MODIFIED,
+            expected_fingerprint=session.source_fingerprint,
+            current_fingerprint=FileFingerprint(size_bytes=999, modified_time_ns=999),
+            checked_at=datetime.now(UTC),
+            error_message="modified",
+        )
+    )
+
+    session.apply_source_check(
+        SourceCheckResult(
+            path=session.source_path,
+            status=SourceStatus.UNCHANGED,
+            expected_fingerprint=session.source_fingerprint,
+            current_fingerprint=session.source_fingerprint,
+            checked_at=datetime.now(UTC),
+            error_message=None,
+        )
+    )
+
+    assert session.source_status is SourceStatus.UNCHANGED
+    assert session.requires_save_as is False
+    assert session.source_change_detected_at is None
+
+
+def test_apply_source_check_does_not_increment_revision_for_identical_modified_result(
+    tmp_path: Path,
+) -> None:
+    session = create_session(tmp_path)
+    result = SourceCheckResult(
+        path=session.source_path,
+        status=SourceStatus.MODIFIED,
+        expected_fingerprint=session.source_fingerprint,
+        current_fingerprint=FileFingerprint(size_bytes=999, modified_time_ns=999),
+        checked_at=datetime.now(UTC),
+        error_message="modified",
+    )
+
+    assert session.apply_source_check(result) is True
+    first_revision = session.source_status_revision
+
+    assert session.apply_source_check(result) is False
+    assert session.source_status_revision == first_revision
+
+
+def test_apply_source_check_increments_revision_for_new_modified_fingerprint(
+    tmp_path: Path,
+) -> None:
+    session = create_session(tmp_path)
+    first_result = SourceCheckResult(
+        path=session.source_path,
+        status=SourceStatus.MODIFIED,
+        expected_fingerprint=session.source_fingerprint,
+        current_fingerprint=FileFingerprint(size_bytes=999, modified_time_ns=999),
+        checked_at=datetime.now(UTC),
+        error_message="modified",
+    )
+    second_result = SourceCheckResult(
+        path=session.source_path,
+        status=SourceStatus.MODIFIED,
+        expected_fingerprint=session.source_fingerprint,
+        current_fingerprint=FileFingerprint(size_bytes=1001, modified_time_ns=1001),
+        checked_at=datetime.now(UTC),
+        error_message="modified",
+    )
+
+    session.apply_source_check(first_result)
+    first_revision = session.source_status_revision
+
+    assert session.apply_source_check(second_result) is True
+    assert session.source_status_revision == first_revision + 1
+
+
+def test_apply_source_check_does_not_increment_revision_for_identical_missing_result(
+    tmp_path: Path,
+) -> None:
+    session = create_session(tmp_path)
+    result = SourceCheckResult(
+        path=session.source_path,
+        status=SourceStatus.MISSING,
+        expected_fingerprint=session.source_fingerprint,
+        current_fingerprint=None,
+        checked_at=datetime.now(UTC),
+        error_message="missing",
+    )
+
+    assert session.apply_source_check(result) is True
+    first_revision = session.source_status_revision
+
+    assert session.apply_source_check(result) is False
+    assert session.source_status_revision == first_revision

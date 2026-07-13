@@ -43,7 +43,11 @@ PDFを開くタブUI、連続ページ表示、検索、選択表示に加えて
 - metadata が壊れている候補や working PDF を検証できない候補も自動削除せず、復元不可候補として扱う
 - 通常終了またはタブクローズ時はセッションごとの作業ディレクトリを削除する
 - packaged smoke や診断用途では `--skip-recovery-prompt` を付けることで復旧ダイアログを抑止できる
-- 元PDFの常時監視やリアルタイム外部変更検知は未実装で、Issue #6 の残件として継続する
+- `QFileSystemWatcher`、2秒のpolling fallback、アプリ再アクティブ時の再確認で、元PDFの変更・削除・再作成・読取不能を検知する
+- 外部変更が見つかったタブは `[外部変更]` を表示し、persistent banner と `Save As` 強制で黙った上書きを防ぐ
+- 保存時は `TargetSnapshot` を使って保存開始前と `os.replace()` 直前に保存先を再確認し、別プロセスの変更が見つかった場合は置換を中止する
+- own save / save as 直後は監視baselineを更新し、アプリ自身の保存を false positive として扱わない
+- network filesystem や watcher event が欠落する環境でも polling fallback で再確認するが、size と mtime を完全に偽装した変更や filesystem API レベルの完全な conditional replace までは保証しない
 
 ## 開発環境
 

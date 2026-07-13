@@ -495,6 +495,7 @@ def test_scan_hides_workspace_while_discard_is_in_progress(tmp_path: Path) -> No
     manager.release_session_lock(session.session_id)
 
     workspace_directory = session.workspace_directory
+    ready_path = tmp_path / "discard-ready.txt"
     source_root = Path(__file__).resolve().parents[1] / "src"
     command = [
         sys.executable,
@@ -506,19 +507,26 @@ def test_scan_hides_workspace_while_discard_is_in_progress(tmp_path: Path) -> No
             "from pdf_workbench.services.session_workspace import SessionWorkspaceManager; "
             "from pdf_workbench.services.session_recovery import SessionRecoveryService; "
             "workspace = Path(sys.argv[2]); "
+            "ready = Path(sys.argv[3]); "
             "manager = SessionWorkspaceManager(workspace.parent); "
             "lease = manager.acquire_workspace_lock(workspace.name, workspace); "
             "marker = workspace / SessionRecoveryService.DISCARDING_MARKER_NAME; "
             "marker.write_text('discarding\\n', encoding='utf-8'); "
+            "ready.write_text('ready\\n', encoding='utf-8'); "
             "time.sleep(3); "
             "lease.release()"
         ),
         str(source_root),
         str(workspace_directory),
+        str(ready_path),
     ]
     process = subprocess.Popen(command)
     try:
-        time.sleep(0.5)
+        for _ in range(50):
+            if ready_path.exists():
+                break
+            time.sleep(0.1)
+        assert ready_path.exists()
         concurrent_recovery = SessionRecoveryService(
             SessionWorkspaceManager(tmp_path / "sessions"),
             validator=PdfDocumentValidator(),

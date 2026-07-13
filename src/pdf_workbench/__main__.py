@@ -14,10 +14,12 @@ from pdf_workbench import __version__
 from pdf_workbench.core.app_paths import APP_AUTHOR, APP_NAME
 from pdf_workbench.core.logging_config import configure_logging
 from pdf_workbench.core.settings import configure_qsettings
+from pdf_workbench.domain.document_session import SourceStatus
 from pdf_workbench.services.pdf_document_validator import PdfDocumentValidator
 from pdf_workbench.services.pdf_save_service import PdfSaveService
 from pdf_workbench.services.session_recovery import RecoveryCandidate, SessionRecoveryService
 from pdf_workbench.services.session_workspace import SessionWorkspaceManager
+from pdf_workbench.services.source_change_monitor import SourceChangeMonitor
 from pdf_workbench.ui.dialogs.recovery_dialog import RecoveryDialog, RecoveryDialogAction
 from pdf_workbench.ui.main_window import MainWindow, RestoreSessionResult
 from pdf_workbench.ui.theme import ColorScheme, ThemeController, apply_application_theme
@@ -93,11 +95,13 @@ def main() -> int:
     workspace_manager = SessionWorkspaceManager()
     save_service = PdfSaveService(validator)
     recovery_service = SessionRecoveryService(workspace_manager, validator=validator)
+    source_change_monitor = SourceChangeMonitor(parent=app)
     window = MainWindow(
         settings,
         workspace_manager=workspace_manager,
         save_service=save_service,
         recovery_service=recovery_service,
+        source_change_monitor=source_change_monitor,
     )
     if args.color_scheme is not None:
         apply_application_theme(app, ColorScheme(args.color_scheme))
@@ -246,6 +250,11 @@ def _build_ui_state(window: MainWindow, *, requested_window_size: str | None) ->
         "tab_bar_geometry": _geometry(window._tabs.tabBar()),
         "search_row_geometry": _geometry(window._search_toolbar),
         "search_surface_geometry": _geometry(window._search_surface),
+        "source_change_banner_geometry": _geometry(window._source_change_banner),
+        "source_change_message_geometry": _geometry(window._source_change_banner.message_label),
+        "source_change_save_as_geometry": _geometry(window._source_change_banner.save_as_button),
+        "source_change_recheck_geometry": _geometry(window._source_change_banner.recheck_button),
+        "source_change_later_geometry": _geometry(window._source_change_banner.later_button),
         "status_bar_geometry": _geometry(window.statusBar()),
         "status_left_geometry": _geometry(window._status_left),
         "status_icon_geometry": _geometry(window._status_icon),
@@ -276,6 +285,31 @@ def _build_ui_state(window: MainWindow, *, requested_window_size: str | None) ->
         "search_query": window._search_bar.search_input.text(),
         "search_counter": window._search_bar.counter_label.text(),
         "search_progress_text": window._search_bar.progress_label.text(),
+        "tab_title": "" if current_document is None else window._tab_title(current_document),
+        "source_status": (
+            SourceStatus.UNCHANGED.value
+            if current_document is None
+            else current_document.session.source_status.value
+        ),
+        "save_action_enabled": window.save_action.isEnabled(),
+        "save_as_action_enabled": window.save_as_action.isEnabled(),
+        "source_change_banner_visible": window._source_change_banner.isVisible(),
+        "source_change_button_clipping": (
+            not (
+                window._source_change_banner.rect().contains(
+                    window._source_change_banner.save_as_button.geometry()
+                )
+                and window._source_change_banner.rect().contains(
+                    window._source_change_banner.recheck_button.geometry()
+                )
+                and window._source_change_banner.rect().contains(
+                    window._source_change_banner.later_button.geometry()
+                )
+            )
+        ),
+        "source_change_horizontal_overflow": (
+            window._source_change_banner.sizeHint().width() > window.width()
+        ),
         "visible_controls": {
             "open": window._toolbar_widget.open_button.isVisible(),
             "search": window._toolbar_widget.search_button.isVisible(),
@@ -287,6 +321,7 @@ def _build_ui_state(window: MainWindow, *, requested_window_size: str | None) ->
             "search_surface": (
                 window._search_surface is not None and window._search_surface.isVisible()
             ),
+            "source_change_banner": window._source_change_banner.isVisible(),
         },
     }
 

@@ -39,9 +39,16 @@ from pdf_workbench.services.pdf_renderer import (
     PdfiumDocumentBackend,
     PdfRenderService,
 )
-from pdf_workbench.services.pdf_save_service import PdfSaveError, PdfSaveService, SaveResult
+from pdf_workbench.services.pdf_save_service import (
+    PdfSaveError,
+    PdfSaveService,
+    SaveResult,
+    TargetChangedError,
+    TargetSnapshot,
+)
 from pdf_workbench.services.session_recovery import RecoveryMetadataError, SessionRecoveryService
 from pdf_workbench.services.session_workspace import SessionWorkspaceManager
+from pdf_workbench.services.source_change_monitor import SourceChangeMonitor, SourceCheckResult
 from pdf_workbench.ui.main_window import DocumentTab, MainWindow, RestoreSessionResult
 from pdf_workbench.ui.pdf_view import PdfView
 from pdf_workbench.ui.widgets.search_bar import SearchBar, SearchInputSurface
@@ -217,6 +224,7 @@ class FakeSaveService(PdfSaveService):
         session: DocumentSession,
         target_path: Path,
         expected_page_count: int,
+        target_snapshot: object,
     ) -> SaveResult:
         self.calls.append((target_path.expanduser().resolve(), expected_page_count))
         if self.should_fail:
@@ -231,6 +239,72 @@ class FakeSaveService(PdfSaveService):
             fingerprint=fingerprint,
             saved_at=saved_at,
         )
+
+
+class SnapshotRecordingSaveService(PdfSaveService):
+    def __init__(self, replacement_pdf: Path | None = None) -> None:
+        super().__init__()
+        self._replacement_pdf = replacement_pdf
+        self.snapshots: list[TargetSnapshot] = []
+        self.calls: list[Path] = []
+
+    def save_atomic(
+        self,
+        session: DocumentSession,
+        target_path: Path,
+        expected_page_count: int,
+        target_snapshot: object,
+    ) -> SaveResult:
+        assert isinstance(target_snapshot, TargetSnapshot)
+        self.snapshots.append(target_snapshot)
+        self.calls.append(target_path.expanduser().resolve())
+        if self._replacement_pdf is not None:
+            target_path.write_bytes(self._replacement_pdf.read_bytes())
+        return super().save_atomic(
+            session,
+            target_path,
+            expected_page_count,
+            target_snapshot,
+        )
+
+
+class TargetChangedSaveService(PdfSaveService):
+    def save_atomic(
+        self,
+        session: DocumentSession,
+        target_path: Path,
+        expected_page_count: int,
+        target_snapshot: object,
+    ) -> SaveResult:
+        raise TargetChangedError("changed elsewhere")
+
+
+class RaceTargetChangedSaveService(PdfSaveService):
+    def __init__(self, replacement_pdf: Path) -> None:
+        super().__init__()
+        self._replacement_pdf = replacement_pdf
+
+    def save_atomic(
+        self,
+        session: DocumentSession,
+        target_path: Path,
+        expected_page_count: int,
+        target_snapshot: object,
+    ) -> SaveResult:
+        assert isinstance(target_snapshot, TargetSnapshot)
+        assert target_snapshot.fingerprint == session.source_fingerprint
+        target_path.write_bytes(self._replacement_pdf.read_bytes())
+        return super().save_atomic(
+            session,
+            target_path,
+            expected_page_count,
+            target_snapshot,
+        )
+
+
+class FailingSourceChangeMonitor(SourceChangeMonitor):
+    def register_session(self, session: DocumentSession) -> None:
+        raise RuntimeError(f"monitor failure: {session.session_id}")
 
 
 class FakeRecoveryService(SessionRecoveryService):
@@ -2129,3 +2203,590 @@ def test_main_window_diagnostic_capture_stays_at_800_by_600(
     assert (
         payload["search_input_surface_geometry"] == payload["search_input_surface_border_geometry"]
     )
+
+
+def test_main_window_shows_source_change_banner_and_tab_suffix(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    window = MainWindow(settings)
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = tmp_path / "source.pdf"
+    document_path.touch()
+    window.open_document(document_path)
+    document = window._current_document()
+    assert document is not None
+
+    result = SourceCheckResult(
+        path=document.session.source_path,
+        status=SourceStatus.MODIFIED,
+        expected_fingerprint=document.session.source_fingerprint,
+        current_fingerprint=FileFingerprint(size_bytes=999, modified_time_ns=999),
+        checked_at=datetime.now(UTC),
+        error_message="modified",
+    )
+    window._on_source_status_changed(document.session.session_id, result)
+
+    assert window._source_change_banner.isVisible() is True
+    assert "[外部変更]" in window._tab_title(document)
+    assert "外部で変更" in window._tabs.tabToolTip(window._tabs.currentIndex())
+    assert window.save_action.isEnabled() is True
+
+
+def test_main_window_dismissed_banner_reappears_after_new_revision(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    window = MainWindow(settings)
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = tmp_path / "source.pdf"
+    document_path.touch()
+    window.open_document(document_path)
+    document = window._current_document()
+    assert document is not None
+
+    first_result = SourceCheckResult(
+        path=document.session.source_path,
+        status=SourceStatus.MODIFIED,
+        expected_fingerprint=document.session.source_fingerprint,
+        current_fingerprint=FileFingerprint(size_bytes=999, modified_time_ns=999),
+        checked_at=datetime.now(UTC),
+        error_message="modified",
+    )
+    window._on_source_status_changed(document.session.session_id, first_result)
+    window._dismiss_current_source_banner()
+    assert window._source_change_banner.isVisible() is False
+
+    second_result = SourceCheckResult(
+        path=document.session.source_path,
+        status=SourceStatus.MISSING,
+        expected_fingerprint=document.session.source_fingerprint,
+        current_fingerprint=None,
+        checked_at=datetime.now(UTC),
+        error_message="missing",
+    )
+    window._on_source_status_changed(document.session.session_id, second_result)
+
+    assert window._source_change_banner.isVisible() is True
+    assert "削除または移動" in window._source_change_banner.message_label.text()
+
+
+def test_main_window_dismissed_banner_stays_hidden_for_identical_result(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    window = MainWindow(settings)
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = tmp_path / "source.pdf"
+    document_path.touch()
+    window.open_document(document_path)
+    document = window._current_document()
+    assert document is not None
+
+    result = SourceCheckResult(
+        path=document.session.source_path,
+        status=SourceStatus.MODIFIED,
+        expected_fingerprint=document.session.source_fingerprint,
+        current_fingerprint=FileFingerprint(size_bytes=999, modified_time_ns=999),
+        checked_at=datetime.now(UTC),
+        error_message="modified",
+    )
+    window._on_source_status_changed(document.session.session_id, result)
+    window._dismiss_current_source_banner()
+
+    window._on_source_status_changed(document.session.session_id, result)
+
+    assert window._source_change_banner.isVisible() is False
+
+
+def test_main_window_save_routes_to_save_as_when_source_is_modified(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    window = MainWindow(settings)
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = tmp_path / "source.pdf"
+    document_path.touch()
+    window.open_document(document_path)
+    document = window._current_document()
+    assert document is not None
+    document.session.mark_modified("edit")
+    modified_result = SourceCheckResult(
+        path=document.session.source_path,
+        status=SourceStatus.MODIFIED,
+        expected_fingerprint=document.session.source_fingerprint,
+        current_fingerprint=FileFingerprint(size_bytes=999, modified_time_ns=999),
+        checked_at=datetime.now(UTC),
+        error_message="modified",
+    )
+    monkeypatch.setattr(
+        window._source_change_monitor,
+        "check_session_now",
+        lambda _session: modified_result,
+    )
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Discard,
+    )
+    routed: list[bool] = []
+    monkeypatch.setattr(window, "_save_current_document_as", lambda: routed.append(True) or True)
+
+    assert window._save_current_document() is True
+    assert routed == [True]
+
+
+def test_main_window_target_changed_error_keeps_session_dirty(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    window = MainWindow(settings, save_service=TargetChangedSaveService())
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = tmp_path / "source.pdf"
+    document_path.touch()
+    window.open_document(document_path)
+    document = window._current_document()
+    assert document is not None
+    document.session.mark_modified("edit")
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Discard,
+    )
+    reported: list[str] = []
+    monkeypatch.setattr(window, "_report_error", lambda _title, message: reported.append(message))
+
+    assert window._save_current_document() is False
+    assert document.session.is_modified is True
+    assert "上書きを中止しました" in reported[0]
+
+
+def test_main_window_normal_save_race_does_not_adopt_new_source_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    replacement_pdf = create_blank_pdf(tmp_path / "changed-by-other-process.pdf", 3)
+    settings = create_settings(tmp_path)
+    window = MainWindow(
+        settings,
+        save_service=RaceTargetChangedSaveService(replacement_pdf),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = create_blank_pdf(tmp_path / "source.pdf", 1)
+    window.open_document(document_path)
+    document = window._current_document()
+    assert document is not None
+
+    baseline_fingerprint = document.session.source_fingerprint
+    baseline_source_bytes = document.session.source_path.read_bytes()
+    working_copy_bytes = document.session.document_path.read_bytes()
+    document.session.mark_modified("edit")
+
+    reported: list[str] = []
+    monkeypatch.setattr(window, "_report_error", lambda _title, message: reported.append(message))
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Discard,
+    )
+
+    assert window._save_current_document() is False
+    assert document.session.is_modified is True
+    assert document.session.source_fingerprint == baseline_fingerprint
+    assert document.session.document_path.read_bytes() == working_copy_bytes
+    assert document.session.source_path.read_bytes() != baseline_source_bytes
+    assert document.session.source_path.read_bytes() == replacement_pdf.read_bytes()
+    assert document.session.source_status is SourceStatus.MODIFIED
+    assert document.session.requires_save_as is True
+    assert window._source_change_banner.isVisible() is True
+    assert "上書きを中止しました" in reported[0]
+
+
+def test_main_window_save_as_modified_source_confirms_once(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    save_service = FakeSaveService()
+    window = MainWindow(settings, save_service=save_service)
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = create_blank_pdf(tmp_path / "source.pdf", 1)
+    changed_pdf = create_blank_pdf(tmp_path / "changed.pdf", 2)
+    window.open_document(document_path)
+    document = window._current_document()
+    assert document is not None
+    document.session.mark_modified("edit")
+    document.session.source_path.write_bytes(changed_pdf.read_bytes())
+
+    warning_calls: list[str] = []
+
+    def confirm_once(*_args: object, **_kwargs: object) -> QMessageBox.StandardButton:
+        warning_calls.append("warning")
+        return QMessageBox.StandardButton.Ok
+
+    monkeypatch.setattr(QMessageBox, "warning", confirm_once)
+
+    assert window._save_document(document, target_path=document.session.source_path) is True
+    assert warning_calls == ["warning"]
+    assert len(save_service.calls) == 1
+
+
+def test_main_window_save_as_current_source_rechecks_undetected_modified_file(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    save_service = FakeSaveService()
+    window = MainWindow(settings, save_service=save_service)
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = create_blank_pdf(tmp_path / "source.pdf", 1)
+    changed_pdf = create_blank_pdf(tmp_path / "changed.pdf", 2)
+    window.open_document(document_path)
+    document = window._current_document()
+    assert document is not None
+    document.session.mark_modified("edit")
+    baseline_bytes = document.session.source_path.read_bytes()
+    changed_bytes = changed_pdf.read_bytes()
+    document.session.source_path.write_bytes(changed_bytes)
+    assert document.session.source_status is SourceStatus.UNCHANGED
+
+    warning_calls: list[str] = []
+
+    def choose_source_path(_document: DocumentTab) -> Path:
+        return document.session.source_path
+
+    def cancel_modified_warning(*_args: object, **_kwargs: object) -> QMessageBox.StandardButton:
+        warning_calls.append("warning")
+        return QMessageBox.StandardButton.Cancel
+
+    monkeypatch.setattr(window, "_choose_save_as_path", choose_source_path)
+    monkeypatch.setattr(QMessageBox, "warning", cancel_modified_warning)
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Discard,
+    )
+
+    assert window._save_current_document_as() is False
+    assert warning_calls == ["warning"]
+    assert save_service.calls == []
+    assert document.session.source_path.read_bytes() == changed_bytes
+    assert document.session.source_path.read_bytes() != baseline_bytes
+    assert document.session.source_status is SourceStatus.MODIFIED
+    assert document.session.requires_save_as is True
+    assert window._source_change_banner.isVisible() is True
+
+
+def test_main_window_save_as_current_source_uses_baseline_snapshot_when_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    save_service = SnapshotRecordingSaveService()
+    window = MainWindow(settings, save_service=save_service)
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = create_blank_pdf(tmp_path / "source.pdf", 1)
+    window.open_document(document_path)
+    document = window._current_document()
+    assert document is not None
+    document.session.mark_modified("edit")
+    baseline_fingerprint = document.session.source_fingerprint
+
+    monkeypatch.setattr(
+        window, "_choose_save_as_path", lambda _document: document.session.source_path
+    )
+
+    assert window._save_current_document_as() is True
+    assert save_service.calls == [document.session.source_path]
+    assert save_service.snapshots == [TargetSnapshot(exists=True, fingerprint=baseline_fingerprint)]
+
+
+def test_main_window_save_as_modified_source_rechecks_then_rejects_post_confirmation_change(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    changed_pdf = create_blank_pdf(tmp_path / "changed.pdf", 2)
+    changed_again_pdf = create_blank_pdf(tmp_path / "changed-again.pdf", 3)
+    save_service = SnapshotRecordingSaveService(changed_again_pdf)
+    window = MainWindow(settings, save_service=save_service)
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = create_blank_pdf(tmp_path / "source.pdf", 1)
+    window.open_document(document_path)
+    document = window._current_document()
+    assert document is not None
+    document.session.mark_modified("edit")
+    baseline_fingerprint = document.session.source_fingerprint
+    document.session.source_path.write_bytes(changed_pdf.read_bytes())
+    changed_fingerprint = FileFingerprint.from_path(document.session.source_path)
+
+    warning_calls: list[str] = []
+    reported: list[str] = []
+    monkeypatch.setattr(
+        window, "_choose_save_as_path", lambda _document: document.session.source_path
+    )
+    monkeypatch.setattr(window, "_report_error", lambda _title, message: reported.append(message))
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Discard,
+    )
+
+    def accept_modified_warning(*_args: object, **_kwargs: object) -> QMessageBox.StandardButton:
+        warning_calls.append("warning")
+        return QMessageBox.StandardButton.Ok
+
+    monkeypatch.setattr(QMessageBox, "warning", accept_modified_warning)
+
+    assert window._save_current_document_as() is False
+    assert warning_calls == ["warning"]
+    assert save_service.snapshots == [TargetSnapshot(exists=True, fingerprint=changed_fingerprint)]
+    assert document.session.source_path.read_bytes() == changed_again_pdf.read_bytes()
+    assert document.session.is_modified is True
+    assert document.session.source_fingerprint == baseline_fingerprint
+    assert "上書きを中止しました" in reported[0]
+
+
+def test_main_window_save_as_current_source_rechecks_undetected_missing_file(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    save_service = FakeSaveService()
+    window = MainWindow(settings, save_service=save_service)
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = create_blank_pdf(tmp_path / "source.pdf", 1)
+    window.open_document(document_path)
+    document = window._current_document()
+    assert document is not None
+    document.session.mark_modified("edit")
+    document.session.source_path.unlink()
+    missing_result = SourceCheckResult(
+        path=document.session.source_path,
+        status=SourceStatus.MISSING,
+        expected_fingerprint=document.session.source_fingerprint,
+        current_fingerprint=None,
+        checked_at=datetime.now(UTC),
+        error_message="missing",
+    )
+    assert document.session.source_status is SourceStatus.UNCHANGED
+
+    warning_calls: list[str] = []
+    monkeypatch.setattr(
+        window, "_choose_save_as_path", lambda _document: document.session.source_path
+    )
+    monkeypatch.setattr(
+        window._source_change_monitor,
+        "check_session_now",
+        lambda _session: missing_result,
+    )
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Discard,
+    )
+
+    def cancel_missing_warning(*_args: object, **_kwargs: object) -> QMessageBox.StandardButton:
+        warning_calls.append("warning")
+        return QMessageBox.StandardButton.Cancel
+
+    monkeypatch.setattr(QMessageBox, "warning", cancel_missing_warning)
+
+    assert window._save_current_document_as() is False
+    assert warning_calls == ["warning"]
+    assert save_service.calls == []
+    assert document.session.source_status is SourceStatus.MISSING
+    assert document.session.requires_save_as is True
+
+
+def test_main_window_save_as_missing_source_rejects_recreation_race(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    recreated_pdf = create_blank_pdf(tmp_path / "recreated.pdf", 4)
+    save_service = SnapshotRecordingSaveService(recreated_pdf)
+    window = MainWindow(settings, save_service=save_service)
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = create_blank_pdf(tmp_path / "source.pdf", 1)
+    window.open_document(document_path)
+    document = window._current_document()
+    assert document is not None
+    document.session.mark_modified("edit")
+    baseline_fingerprint = document.session.source_fingerprint
+    document.session.source_path.unlink()
+    missing_result = SourceCheckResult(
+        path=document.session.source_path,
+        status=SourceStatus.MISSING,
+        expected_fingerprint=document.session.source_fingerprint,
+        current_fingerprint=None,
+        checked_at=datetime.now(UTC),
+        error_message="missing",
+    )
+
+    warning_calls: list[str] = []
+    reported: list[str] = []
+    monkeypatch.setattr(
+        window, "_choose_save_as_path", lambda _document: document.session.source_path
+    )
+    monkeypatch.setattr(
+        window._source_change_monitor,
+        "check_session_now",
+        lambda _session: missing_result,
+    )
+    monkeypatch.setattr(window, "_report_error", lambda _title, message: reported.append(message))
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Discard,
+    )
+
+    def accept_missing_warning(*_args: object, **_kwargs: object) -> QMessageBox.StandardButton:
+        warning_calls.append("warning")
+        return QMessageBox.StandardButton.Ok
+
+    monkeypatch.setattr(QMessageBox, "warning", accept_missing_warning)
+
+    assert window._save_current_document_as() is False
+    assert warning_calls == ["warning"]
+    assert save_service.snapshots == [TargetSnapshot(exists=False, fingerprint=None)]
+    assert document.session.source_path.read_bytes() == recreated_pdf.read_bytes()
+    assert document.session.is_modified is True
+    assert document.session.source_fingerprint == baseline_fingerprint
+    assert "上書きを中止しました" in reported[0]
+
+
+def test_main_window_save_as_current_source_rejects_unreadable_source(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    save_service = FakeSaveService()
+    window = MainWindow(settings, save_service=save_service)
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = create_blank_pdf(tmp_path / "source.pdf", 1)
+    window.open_document(document_path)
+    document = window._current_document()
+    assert document is not None
+    document.session.mark_modified("edit")
+    reported: list[tuple[str, str]] = []
+    unreadable_result = SourceCheckResult(
+        path=document.session.source_path,
+        status=SourceStatus.UNREADABLE,
+        expected_fingerprint=document.session.source_fingerprint,
+        current_fingerprint=None,
+        checked_at=datetime.now(UTC),
+        error_message="unreadable",
+    )
+
+    monkeypatch.setattr(
+        window, "_choose_save_as_path", lambda _document: document.session.source_path
+    )
+    monkeypatch.setattr(
+        window._source_change_monitor,
+        "check_session_now",
+        lambda _session: unreadable_result,
+    )
+    monkeypatch.setattr(
+        window, "_report_error", lambda title, message: reported.append((title, message))
+    )
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Discard,
+    )
+
+    assert window._save_current_document_as() is False
+    assert save_service.calls == []
+    assert document.session.source_status is SourceStatus.UNREADABLE
+    assert reported == [
+        (
+            "保存できません",
+            "元のPDFの状態を確認できないため、この場所への上書きはできません。別の保存先を選択してください。",
+        )
+    ]
+
+
+def test_main_window_open_document_rolls_back_when_monitor_registration_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    settings = create_settings(tmp_path)
+    workspace_manager = TrackingWorkspaceManager(tmp_path / "sessions")
+    window = MainWindow(
+        settings,
+        workspace_manager=workspace_manager,
+        source_change_monitor=FailingSourceChangeMonitor(),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = create_blank_pdf(tmp_path / "source.pdf", 1)
+    reported: list[str] = []
+    monkeypatch.setattr(window, "_report_error", lambda _title, message: reported.append(message))
+
+    window.open_document(document_path)
+
+    assert window._tabs.count() == 0
+    assert window._documents == []
+    assert workspace_manager.cleaned_sessions
+    assert "monitor failure" in reported[0]
