@@ -157,10 +157,22 @@ class SessionRecoveryService:
     def discard_candidate(self, candidate: RecoveryCandidate) -> None:
         if not candidate.discardable:
             raise RecoveryMetadataError("この候補は安全に破棄できません")
-        resolved_workspace = self._validate_workspace_directory(candidate.workspace_directory)
+        resolved_workspace = self._validate_workspace_identity(candidate.workspace_directory)
         lease = candidate.lease
         if lease is None:
-            raise RecoveryMetadataError("破棄候補のロックが保持されていません")
+            session_id = resolved_workspace.name
+            try:
+                lease = self._workspace_manager.acquire_workspace_lock(
+                    session_id,
+                    resolved_workspace,
+                )
+            except WorkspaceLockActiveError as exc:
+                raise RecoveryMetadataError(
+                    "別のプロセスがこの候補を使用中のため破棄できません",
+                ) from exc
+            except WorkspaceLockError as exc:
+                raise RecoveryMetadataError("復旧候補のロックを取得できませんでした") from exc
+            candidate.lease = lease
         marker_path = resolved_workspace / self.DISCARDING_MARKER_NAME
         try:
             self._create_discarding_marker(marker_path)
@@ -191,7 +203,7 @@ class SessionRecoveryService:
             self._resume_discarding_workspace(workspace_directory)
             return None
         try:
-            resolved_workspace = self._validate_workspace_directory(workspace_directory)
+            resolved_workspace = self._validate_workspace_identity(workspace_directory)
         except RecoveryMetadataError as exc:
             logger.warning("Found invalid workspace candidate: %s (%s)", workspace_directory, exc)
             return self._invalid_candidate(
@@ -209,12 +221,10 @@ class SessionRecoveryService:
             return None
 
         try:
-            metadata = self._read_metadata(resolved_workspace, session_id)
-            working_copy_path = resolved_workspace / self._workspace_manager.WORKING_COPY_NAME
-            working_copy_size = working_copy_path.stat().st_size
-            if working_copy_size <= 0:
-                raise RecoveryMetadataError("working PDFが空です")
-            self._validator.validate(str(working_copy_path))
+            metadata, working_copy_path, working_copy_size = self._validate_workspace_contents(
+                resolved_workspace,
+                session_id,
+            )
             source_status = self._detect_source_status(metadata)
             return RecoveryCandidate(
                 workspace_directory=resolved_workspace,
@@ -245,7 +255,7 @@ class SessionRecoveryService:
                 ),
             )
 
-    def _validate_workspace_directory(self, workspace_directory: Path) -> Path:
+    def _validate_workspace_identity(self, workspace_directory: Path) -> Path:
         if workspace_directory.is_symlink():
             raise RecoveryMetadataError("workspaceがsymlinkです")
         resolved_workspace = workspace_directory.expanduser().resolve()
@@ -257,8 +267,20 @@ class SessionRecoveryService:
             character in "0123456789abcdef" for character in resolved_workspace.name
         ):
             raise RecoveryMetadataError("session ID形式が不正です")
-        working_copy_path = resolved_workspace / self._workspace_manager.WORKING_COPY_NAME
-        metadata_path = resolved_workspace / self._workspace_manager.METADATA_NAME
+        lock_path = resolved_workspace / self._workspace_manager.LOCK_NAME
+        if not lock_path.exists() or not lock_path.is_file():
+            raise RecoveryMetadataError("session lockが見つかりません")
+        if lock_path.is_symlink():
+            raise RecoveryMetadataError("session lockがsymlinkです")
+        return resolved_workspace
+
+    def _validate_workspace_contents(
+        self,
+        workspace_directory: Path,
+        session_id: str,
+    ) -> tuple[RecoveryMetadata, Path, int]:
+        working_copy_path = workspace_directory / self._workspace_manager.WORKING_COPY_NAME
+        metadata_path = workspace_directory / self._workspace_manager.METADATA_NAME
         if not working_copy_path.exists() or not working_copy_path.is_file():
             raise RecoveryMetadataError("working PDFが見つかりません")
         if working_copy_path.is_symlink():
@@ -267,12 +289,12 @@ class SessionRecoveryService:
             raise RecoveryMetadataError("metadataが見つかりません")
         if metadata_path.is_symlink():
             raise RecoveryMetadataError("metadataがsymlinkです")
-        lock_path = resolved_workspace / self._workspace_manager.LOCK_NAME
-        if not lock_path.exists() or not lock_path.is_file():
-            raise RecoveryMetadataError("session lockが見つかりません")
-        if lock_path.is_symlink():
-            raise RecoveryMetadataError("session lockがsymlinkです")
-        return resolved_workspace
+        metadata = self._read_metadata(workspace_directory, session_id)
+        working_copy_size = working_copy_path.stat().st_size
+        if working_copy_size <= 0:
+            raise RecoveryMetadataError("working PDFが空です")
+        self._validator.validate(str(working_copy_path))
+        return metadata, working_copy_path, working_copy_size
 
     def _invalid_candidate(
         self,
@@ -437,15 +459,11 @@ class SessionRecoveryService:
             return 0
 
     def _workspace_is_discardable(self, workspace_directory: Path) -> bool:
-        if workspace_directory.is_symlink():
+        try:
+            self._validate_workspace_identity(workspace_directory)
+        except RecoveryMetadataError:
             return False
-        resolved_workspace = workspace_directory.expanduser().resolve(strict=False)
-        if resolved_workspace.parent != self._workspace_manager.sessions_root:
-            return False
-        if not resolved_workspace.is_dir():
-            return False
-        lock_path = resolved_workspace / self._workspace_manager.LOCK_NAME
-        return lock_path.exists() and lock_path.is_file() and not lock_path.is_symlink()
+        return True
 
     @staticmethod
     def _create_discarding_marker(marker_path: Path) -> None:
@@ -475,11 +493,20 @@ class SessionRecoveryService:
         marker_path: Path,
     ) -> None:
         lock_path = workspace_directory / self._workspace_manager.LOCK_NAME
-        if marker_path.exists():
-            marker_path.unlink()
-        if lock_path.exists():
-            lock_path.unlink()
-        workspace_directory.rmdir()
+        try:
+            if marker_path.exists():
+                marker_path.unlink()
+        except FileNotFoundError:
+            pass
+        try:
+            if lock_path.exists():
+                lock_path.unlink()
+        except FileNotFoundError:
+            pass
+        try:
+            workspace_directory.rmdir()
+        except FileNotFoundError:
+            return
 
     def _resume_discarding_workspace(self, workspace_directory: Path) -> None:
         if not self._workspace_is_discardable(workspace_directory):
@@ -512,6 +539,8 @@ class SessionRecoveryService:
                 lease.release()
         try:
             self._remove_discarding_lock_and_directory(resolved_workspace, marker_path)
+        except FileNotFoundError:
+            return
         except OSError:
             logger.exception("Failed to finalize stale workspace discard: %s", resolved_workspace)
 

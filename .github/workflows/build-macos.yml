@@ -229,6 +229,7 @@ jobs:
           set -euo pipefail
           python - <<'PY'
           import json
+          import hashlib
           import math
           from pathlib import Path
 
@@ -265,6 +266,27 @@ jobs:
                   + (color.green() - expected[1]) ** 2
                   + (color.blue() - expected[2]) ** 2
               )
+
+          def unique_colors(image: QImage, limit: int = 256) -> int:
+              colors: set[tuple[int, int, int, int]] = set()
+              for y in range(image.height()):
+                  for x in range(image.width()):
+                      color = image.pixelColor(x, y)
+                      colors.add((color.red(), color.green(), color.blue(), color.alpha()))
+                      if len(colors) >= limit:
+                          return len(colors)
+              return len(colors)
+
+          def brightness(image: QImage, rect: list[int]) -> float:
+              x, y, width, height = rect
+              total = 0.0
+              samples = 0
+              for yy in range(y, y + height):
+                  for xx in range(x, x + width):
+                      color = image.pixelColor(xx, yy)
+                      total += (color.red() + color.green() + color.blue()) / 3.0
+                      samples += 1
+              return 0.0 if samples == 0 else total / samples
 
           def assert_edge_has_accent(
               stem: str,
@@ -317,6 +339,7 @@ jobs:
               image = QImage(str(review_dir / f"{stem}.png"))
               assert not image.isNull(), stem
               assert [image.width(), image.height()] == expected_size, stem
+              assert unique_colors(image) > 32, stem
               images[stem] = image
               payload = json.loads((review_dir / f"{stem}.json").read_text(encoding="utf-8"))
               payloads[stem] = payload
@@ -395,16 +418,43 @@ jobs:
               assert payload["recover_enabled"] is False
               assert payload["discard_enabled"] is True
               assert payload["later_visible"] is True
-              assert payload["fits_in_screen"] is True
+              assert payload["fits_in_review_viewport"] is True
               assert payload["tree_geometry"][2] > 0 and payload["tree_geometry"][3] > 0
               assert (
                   payload["button_row_geometry"][2] > 0
                   and payload["button_row_geometry"][3] > 0
               )
+              assert payload["unique_color_count"] > 32
+              assert (
+                  payload["dialog_geometry_in_viewport"][2] > 0
+                  and payload["dialog_geometry_in_viewport"][3] > 0
+              )
 
           compact_recovery = payloads["light-recovery-dialog-800x600"]
-          assert compact_recovery["dialog_geometry"][2] <= 800
-          assert compact_recovery["dialog_geometry"][3] <= 600
+          assert compact_recovery["dialog_geometry_in_viewport"][2] <= 800
+          assert compact_recovery["dialog_geometry_in_viewport"][3] <= 600
+
+          light_recovery = payloads["light-recovery-dialog-1100x800"]
+          dark_recovery = payloads["dark-recovery-dialog-1100x800"]
+          assert (
+              light_recovery["canvas_digest"]
+              != dark_recovery["canvas_digest"]
+          )
+          assert (
+              light_recovery["dialog_digest"]
+              != dark_recovery["dialog_digest"]
+          )
+          assert (
+              dark_recovery["dialog_brightness"]
+              < light_recovery["dialog_brightness"]
+          )
+          assert (
+              abs(light_recovery["tree_brightness"] - light_recovery["dialog_brightness"]) > 1.0
+          )
+          assert (
+              abs(light_recovery["button_row_brightness"] - light_recovery["dialog_brightness"])
+              > 1.0
+          )
 
           assert_edge_has_accent(
               "light-search-1100x800",

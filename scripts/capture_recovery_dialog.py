@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QPoint, Qt
+from PySide6.QtGui import QColor, QImage, QPainter
 from PySide6.QtWidgets import QApplication, QWidget
 
 from pdf_workbench.domain.document_session import FileFingerprint, SourceStatus
@@ -44,6 +46,35 @@ def _geometry(widget: QWidget | None) -> list[int]:
         return [0, 0, 0, 0]
     rect = widget.geometry()
     return [rect.x(), rect.y(), rect.width(), rect.height()]
+
+
+def _relative_geometry(widget: QWidget, origin: QPoint) -> list[int]:
+    top_left = widget.mapToGlobal(widget.rect().topLeft()) - origin
+    rect = widget.geometry()
+    return [top_left.x(), top_left.y(), rect.width(), rect.height()]
+
+
+def _unique_color_count(image: QImage) -> int:
+    colors: set[tuple[int, int, int, int]] = set()
+    for y in range(image.height()):
+        for x in range(image.width()):
+            color = image.pixelColor(x, y)
+            colors.add((color.red(), color.green(), color.blue(), color.alpha()))
+            if len(colors) >= 128:
+                return len(colors)
+    return len(colors)
+
+
+def _brightness(image: QImage, rect: list[int]) -> float:
+    x, y, width, height = rect
+    total = 0.0
+    samples = 0
+    for yy in range(y, y + height):
+        for xx in range(x, x + width):
+            color = image.pixelColor(xx, yy)
+            total += (color.red() + color.green() + color.blue()) / 3.0
+            samples += 1
+    return 0.0 if samples == 0 else total / samples
 
 
 def _build_candidates(root: Path) -> list[RecoveryCandidate]:
@@ -103,12 +134,20 @@ def _build_candidates(root: Path) -> list[RecoveryCandidate]:
     ]
 
 
+def _background_color(scheme: ColorScheme) -> QColor:
+    if scheme is ColorScheme.DARK:
+        return QColor("#16181d")
+    return QColor("#f3f5f8")
+
+
 def main() -> int:
     args = build_parser().parse_args()
     width, height = _parse_size(args.window_size)
+    color_scheme = ColorScheme(args.color_scheme)
 
-    app = QApplication.instance() or QApplication([])
-    apply_application_theme(app, ColorScheme(args.color_scheme))
+    existing_app = QApplication.instance()
+    app = existing_app if isinstance(existing_app, QApplication) else QApplication([])
+    apply_application_theme(app, color_scheme)
 
     host = QWidget()
     host.setWindowTitle("Recovery Dialog Review")
@@ -122,51 +161,77 @@ def main() -> int:
         dialog.show()
         dialog.activateWindow()
 
-        for _ in range(4):
+        for _ in range(6):
             app.processEvents()
 
-        dialog.move(
-            max(0, (host.width() - dialog.width()) // 2),
-            max(0, (host.height() - dialog.height()) // 2),
-        )
+        dialog_x = max(0, (width - dialog.width()) // 2)
+        dialog_y = max(0, (height - dialog.height()) // 2)
+        dialog.move(dialog_x, dialog_y)
+
         invalid_discardable_item = dialog._tree.topLevelItem(1)
+        if invalid_discardable_item is None:
+            raise RuntimeError("invalid discardable recovery candidate is missing")
         invalid_discardable_item.setCheckState(0, Qt.CheckState.Checked)
 
-        for _ in range(4):
+        for _ in range(6):
             app.processEvents()
+
+        dialog_pixmap = dialog.grab()
+        canvas = QImage(width, height, QImage.Format.Format_ARGB32)
+        canvas.fill(_background_color(color_scheme))
+        painter = QPainter(canvas)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.drawPixmap(dialog_x, dialog_y, dialog_pixmap)
+        painter.end()
 
         args.output_png.parent.mkdir(parents=True, exist_ok=True)
         args.output_json.parent.mkdir(parents=True, exist_ok=True)
-        host.grab().save(str(args.output_png))
+        canvas.save(str(args.output_png))
 
         screen = dialog.screen() or QApplication.primaryScreen()
         available = None if screen is None else screen.availableGeometry()
-        dialog_geometry = _geometry(dialog)
-        available_geometry = (
+        global_origin = dialog.mapToGlobal(dialog.rect().topLeft())
+        dialog_geometry = [dialog_x, dialog_y, dialog.width(), dialog.height()]
+        tree_geometry = _relative_geometry(dialog._tree, global_origin)
+        button_row_geometry = (
+            [0, 0, 0, 0]
+            if dialog._button_row_widget is None
+            else _relative_geometry(dialog._button_row_widget, global_origin)
+        )
+        actual_screen_geometry = (
             [0, 0, 0, 0]
             if available is None
             else [available.x(), available.y(), available.width(), available.height()]
         )
-        fits_in_screen = (
-            available is not None
-            and dialog_geometry[0] >= available.x()
-            and dialog_geometry[1] >= available.y()
-            and dialog_geometry[0] + dialog_geometry[2] <= available.x() + available.width()
-            and dialog_geometry[1] + dialog_geometry[3] <= available.y() + available.height()
+        fits_in_viewport = (
+            dialog_x >= 0
+            and dialog_y >= 0
+            and dialog_x + dialog.width() <= width
+            and dialog_y + dialog.height() <= height
         )
         payload = {
             "requested_window_size": [width, height],
-            "dialog_geometry": dialog_geometry,
-            "available_screen_geometry": available_geometry,
-            "tree_geometry": _geometry(dialog._tree),
-            "button_row_geometry": _geometry(dialog._button_row_widget),
+            "actual_window_size": [width, height],
+            "review_viewport_geometry": [0, 0, width, height],
+            "actual_qt_screen_geometry": actual_screen_geometry,
+            "dialog_geometry_in_viewport": dialog_geometry,
+            "tree_geometry": tree_geometry,
+            "button_row_geometry": button_row_geometry,
             "candidate_count": len(candidates),
             "recoverable_count": sum(1 for candidate in candidates if candidate.recoverable),
             "discardable_count": sum(1 for candidate in candidates if candidate.discardable),
             "recover_enabled": dialog._recover_button.isEnabled(),
             "discard_enabled": dialog._discard_button.isEnabled(),
             "later_visible": dialog._later_button.isVisible(),
-            "fits_in_screen": fits_in_screen,
+            "fits_in_review_viewport": fits_in_viewport,
+            "unique_color_count": _unique_color_count(canvas),
+            "dialog_digest": hashlib.sha256(
+                dialog_pixmap.toImage().bits().tobytes(),  # type: ignore[union-attr]
+            ).hexdigest(),
+            "canvas_digest": hashlib.sha256(canvas.bits().tobytes()).hexdigest(),  # type: ignore[union-attr]
+            "dialog_brightness": _brightness(canvas, dialog_geometry),
+            "tree_brightness": _brightness(canvas, tree_geometry),
+            "button_row_brightness": _brightness(canvas, button_row_geometry),
         }
         args.output_json.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2) + "\n",

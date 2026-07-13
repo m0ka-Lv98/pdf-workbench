@@ -34,6 +34,12 @@ class RecoveryDialogResult:
 
 
 class RecoveryDialog(QDialog):
+    @staticmethod
+    def compute_dialog_size(available_width: int, available_height: int) -> tuple[int, int]:
+        width = min(920, max(640, available_width - 80))
+        height = min(520, max(420, available_height - 80))
+        return width, height
+
     def __init__(
         self,
         candidates: list[RecoveryCandidate],
@@ -49,11 +55,14 @@ class RecoveryDialog(QDialog):
         screen = self.screen() or QApplication.primaryScreen()
         if screen is not None:
             available = screen.availableGeometry()
-            width = min(920, max(640, available.width() - 80))
-            height = min(520, max(420, available.height() - 80))
+            width, height = self.compute_dialog_size(
+                available.width(),
+                available.height(),
+            )
             self.resize(width, height)
         else:
-            self.resize(800, 520)
+            width, height = self.compute_dialog_size(800, 600)
+            self.resize(width, height)
         self.setMinimumSize(640, 420)
 
         layout = QVBoxLayout(self)

@@ -155,3 +155,9 @@ def test_recovery_dialog_fits_within_800x600(qtbot: QtBot, tmp_path: Path) -> No
     assert dialog._button_row_widget is not None
     assert dialog._button_row_widget.geometry().width() > 0
     assert dialog._button_row_widget.geometry().height() > 0
+
+
+def test_recovery_dialog_compute_dialog_size_is_screen_safe() -> None:
+    assert RecoveryDialog.compute_dialog_size(1100, 800) == (920, 520)
+    assert RecoveryDialog.compute_dialog_size(800, 600) == (720, 520)
+    assert RecoveryDialog.compute_dialog_size(640, 480) == (640, 420)

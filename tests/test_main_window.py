@@ -1230,6 +1230,55 @@ def test_main_window_clamps_restored_page_after_async_document_load(
     assert window._documents[0].session.current_page_index == 2
 
 
+def test_main_window_restores_page_only_once_for_synchronous_load(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    settings = create_settings(tmp_path)
+    workspace_manager = create_workspace_manager(tmp_path)
+    window = MainWindow(settings, workspace_manager=workspace_manager)
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = create_blank_pdf(tmp_path / "restore-once.pdf", 3)
+    session = workspace_manager.create_session(document_path)
+    session.set_navigation_state(page_index=2, zoom_factor=1.0)
+
+    page_apply_calls: list[int] = []
+    metadata_persist_calls: list[int] = []
+
+    def fake_open_document(self: PdfView, path: Path) -> None:
+        self._path = path
+        self._metadata = DocumentMetadata(
+            revision=DocumentRevision.from_path(path),
+            pages=(
+                PageMetadata.from_size(144.0, 144.0),
+                PageMetadata.from_size(144.0, 144.0),
+                PageMetadata.from_size(144.0, 144.0),
+            ),
+        )
+        self.document_loaded.emit()
+
+    def tracking_set_page(self: PdfView, page_index: int) -> None:
+        page_apply_calls.append(page_index)
+        self._current_page_index = page_index
+
+    monkeypatch.setattr(PdfView, "open_document", fake_open_document)
+    monkeypatch.setattr(PdfView, "set_page", tracking_set_page)
+    monkeypatch.setattr(
+        window,
+        "_schedule_recovery_metadata_persist",
+        lambda _session: metadata_persist_calls.append(_session.current_page_index),
+    )
+
+    result = window.restore_session(session)
+
+    assert result is RestoreSessionResult.ATTACHED
+    assert page_apply_calls == [2]
+    assert metadata_persist_calls == [2]
+
+
 def test_main_window_toolbar_search_button_opens_search_ui(
     qtbot: QtBot,
     tmp_path: Path,

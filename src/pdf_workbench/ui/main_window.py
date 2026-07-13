@@ -949,10 +949,15 @@ class MainWindow(QMainWindow):
             view = PdfView(self._render_service, self)
             view.set_zoom(self._BASE_RENDER_SCALE * session.zoom_factor)
             restored_page_index = session.current_page_index
+            page_restored = False
 
             def apply_restored_page() -> None:
+                nonlocal page_restored
+                if page_restored:
+                    return
                 if view is None or view.page_count <= 0:
                     return
+                page_restored = True
                 target_page_index = min(restored_page_index, view.page_count - 1)
                 view.set_page(target_page_index)
                 session.set_navigation_state(

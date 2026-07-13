@@ -181,6 +181,57 @@ def test_discard_invalid_metadata_candidate_removes_workspace(tmp_path: Path) ->
     assert not session.workspace_directory.exists()
 
 
+@pytest.mark.parametrize(
+    ("mutator", "expected_error"),
+    [
+        (
+            lambda session, manager: (session.workspace_directory / manager.METADATA_NAME).unlink(),
+            "metadataが見つかりません",
+        ),
+        (
+            lambda session, manager: (
+                session.workspace_directory / manager.WORKING_COPY_NAME
+            ).unlink(),
+            "working PDFが見つかりません",
+        ),
+        (
+            lambda session, manager: (
+                session.workspace_directory / manager.WORKING_COPY_NAME
+            ).write_bytes(b"not-a-pdf"),
+            None,
+        ),
+        (
+            lambda session, manager: (
+                session.workspace_directory / manager.WORKING_COPY_NAME
+            ).write_bytes(b""),
+            "working PDFが空です",
+        ),
+    ],
+)
+def test_discard_invalid_candidate_variants_remove_workspace(
+    tmp_path: Path,
+    mutator,
+    expected_error: str | None,
+) -> None:
+    source_path = create_blank_pdf(tmp_path / "source.pdf", 1)
+    manager, recovery = create_session_environment(tmp_path)
+    session = manager.create_session(source_path)
+    recovery.write_metadata(session)
+    manager.release_session_lock(session.session_id)
+    mutator(session, manager)
+
+    candidate = recovery.scan_candidates().candidates[0]
+
+    assert candidate.recoverable is False
+    assert candidate.discardable is True
+    if expected_error is not None:
+        assert candidate.error_message == expected_error
+    recovery.discard_candidate(candidate)
+
+    assert not session.workspace_directory.exists()
+    assert recovery.scan_candidates().candidates == []
+
+
 def test_discard_rejects_unsafe_candidate(tmp_path: Path) -> None:
     manager, recovery = create_session_environment(tmp_path)
     source_path = create_blank_pdf(tmp_path / "source.pdf", 1)
@@ -197,6 +248,28 @@ def test_discard_rejects_unsafe_candidate(tmp_path: Path) -> None:
 
     with pytest.raises(RecoveryMetadataError, match="安全に破棄できません"):
         recovery.discard_candidate(candidate)
+
+
+def test_discard_active_workspace_without_lease_is_rejected(tmp_path: Path) -> None:
+    source_path = create_blank_pdf(tmp_path / "source.pdf", 1)
+    manager, recovery = create_session_environment(tmp_path)
+    session = manager.create_session(source_path)
+    recovery.write_metadata(session)
+    manager.release_session_lock(session.session_id)
+    candidate = recovery.scan_candidates().candidates[0]
+    assert candidate.lease is not None
+    candidate.lease.release()
+    candidate.lease = None
+
+    competing_lease = manager.acquire_workspace_lock(
+        session.session_id,
+        session.workspace_directory,
+    )
+    try:
+        with pytest.raises(RecoveryMetadataError, match="使用中"):
+            recovery.discard_candidate(candidate)
+    finally:
+        competing_lease.release()
 
 
 def test_scan_marks_modified_source_status(tmp_path: Path) -> None:
