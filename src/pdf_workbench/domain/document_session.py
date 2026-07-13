@@ -85,11 +85,21 @@ class DocumentSession:
     def document_path(self) -> Path:
         return self.working_copy_path
 
-    def mark_modified(self, description: str) -> None:
-        self.is_modified = True
-        self.updated_at = datetime.now(UTC)
+    def touch_updated_at(self, when: datetime | None = None) -> None:
+        self.updated_at = when if when is not None else datetime.now(UTC)
+
+    def set_modified(self, modified: bool) -> None:
+        self.is_modified = modified
+        self.touch_updated_at()
+
+    def record_operation(self, description: str) -> None:
         self.operation_history.append(description)
         self.operation_history = self.operation_history[-self.MAX_OPERATION_HISTORY :]
+        self.touch_updated_at()
+
+    def mark_modified(self, description: str) -> None:
+        self.is_modified = True
+        self.record_operation(description)
 
     def mark_saved(
         self,
