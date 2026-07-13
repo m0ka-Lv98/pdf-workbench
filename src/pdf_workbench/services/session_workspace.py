@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import shutil
@@ -158,24 +159,38 @@ class SessionWorkspaceManager:
     ) -> SessionWorkspaceLease:
         resolved_workspace = workspace_directory.expanduser().resolve()
         lock_path = resolved_workspace / self.LOCK_NAME
+        handle: BufferedRandom | None = None
         try:
             lock_path.touch(exist_ok=True)
+        except OSError as exc:
+            raise WorkspaceLockError("セッションロックを取得できませんでした") from exc
+
+        try:
             handle = lock_path.open("a+b")
+        except OSError as exc:
+            raise WorkspaceLockError("セッションロックを取得できませんでした") from exc
+
+        try:
             if os.name == "nt":
                 handle.seek(0)
                 if lock_path.stat().st_size == 0:
                     handle.write(b"0")
                     handle.flush()
                 handle.seek(0)
+            else:
+                handle.seek(0)
+        except OSError as exc:
+            handle.close()
+            raise WorkspaceLockError("セッションロックを取得できませんでした") from exc
+
+        try:
+            if os.name == "nt":
                 _lock_windows_handle(handle)
             else:
                 _lock_posix_handle(handle)
         except OSError as exc:
-            if "handle" in locals():
-                handle.close()
-            if os.name == "nt" and getattr(exc, "winerror", None) in {33, 36}:
-                raise WorkspaceLockActiveError("別のプロセスがセッションを使用中です") from exc
-            if os.name != "nt" and exc.errno in {11, 35}:
+            handle.close()
+            if _is_lock_contention_error(exc):
                 raise WorkspaceLockActiveError("別のプロセスがセッションを使用中です") from exc
             raise WorkspaceLockError("セッションロックを取得できませんでした") from exc
         return SessionWorkspaceLease(
@@ -232,6 +247,15 @@ class SessionWorkspaceManager:
                     logger.exception("Failed to remove session workspace: %s", resolved_directory)
                     return
                 time.sleep(self._cleanup_delay_seconds)
+
+
+def _is_lock_contention_error(exc: OSError) -> bool:
+    if os.name == "nt":
+        return bool(
+            getattr(exc, "winerror", None) in {33, 36}
+            or exc.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}
+        )
+    return exc.errno in {errno.EACCES, errno.EAGAIN}
 
 
 def _lock_windows_handle(handle: BufferedRandom) -> None:

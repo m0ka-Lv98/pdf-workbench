@@ -203,6 +203,17 @@ def main() -> int:
             if available is None
             else [available.x(), available.y(), available.width(), available.height()]
         )
+        visible_columns = [
+            dialog._tree.headerItem().text(index)
+            for index in range(dialog._tree.columnCount())
+            if not dialog._tree.isColumnHidden(index)
+        ]
+        hidden_columns = [
+            dialog._tree.headerItem().text(index)
+            for index in range(dialog._tree.columnCount())
+            if dialog._tree.isColumnHidden(index)
+        ]
+        horizontal_scrollbar = dialog._tree.horizontalScrollBar()
         fits_in_viewport = (
             dialog_x >= 0
             and dialog_y >= 0
@@ -223,6 +234,10 @@ def main() -> int:
             "recover_enabled": dialog._recover_button.isEnabled(),
             "discard_enabled": dialog._discard_button.isEnabled(),
             "later_visible": dialog._later_button.isVisible(),
+            "visible_columns": visible_columns,
+            "hidden_columns": hidden_columns,
+            "horizontal_scrollbar_visible": horizontal_scrollbar.isVisible(),
+            "horizontal_scrollbar_maximum": horizontal_scrollbar.maximum(),
             "fits_in_review_viewport": fits_in_viewport,
             "unique_color_count": _unique_color_count(canvas),
             "dialog_digest": hashlib.sha256(

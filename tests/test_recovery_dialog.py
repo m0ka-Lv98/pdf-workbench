@@ -144,17 +144,33 @@ def test_recovery_dialog_disables_unsafe_invalid_candidate(qtbot: QtBot, tmp_pat
 def test_recovery_dialog_fits_within_800x600(qtbot: QtBot, tmp_path: Path) -> None:
     dialog = RecoveryDialog([make_candidate(tmp_path, name="e" * 32, recoverable=True)])
     qtbot.addWidget(dialog)
-    dialog.resize(800, 600)
+    dialog.resize(720, 520)
     dialog.show()
     qtbot.waitUntil(dialog.isVisible)
 
-    assert dialog.width() <= 800
-    assert dialog.height() <= 600
+    assert dialog.width() <= 720
+    assert dialog.height() <= 520
     assert dialog._tree.geometry().width() > 0
     assert dialog._tree.geometry().height() > 0
     assert dialog._button_row_widget is not None
     assert dialog._button_row_widget.geometry().width() > 0
     assert dialog._button_row_widget.geometry().height() > 0
+    assert dialog._tree.isColumnHidden(RecoveryDialog.UPDATED_COLUMN) is True
+    assert dialog._tree.isColumnHidden(RecoveryDialog.SIZE_COLUMN) is True
+    assert dialog._tree.isColumnHidden(RecoveryDialog.STATE_COLUMN) is False
+    assert dialog._tree.header().sectionSize(RecoveryDialog.STATE_COLUMN) >= 150
+
+
+def test_recovery_dialog_shows_all_columns_in_regular_layout(qtbot: QtBot, tmp_path: Path) -> None:
+    dialog = RecoveryDialog([make_candidate(tmp_path, name="f" * 32, recoverable=True)])
+    qtbot.addWidget(dialog)
+    dialog.resize(920, 520)
+    dialog.show()
+    qtbot.waitUntil(dialog.isVisible)
+
+    assert dialog._tree.isColumnHidden(RecoveryDialog.UPDATED_COLUMN) is False
+    assert dialog._tree.isColumnHidden(RecoveryDialog.SIZE_COLUMN) is False
+    assert dialog._tree.isColumnHidden(RecoveryDialog.STATE_COLUMN) is False
 
 
 def test_recovery_dialog_compute_dialog_size_is_screen_safe() -> None:

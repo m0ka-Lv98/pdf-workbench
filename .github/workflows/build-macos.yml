@@ -433,9 +433,33 @@ jobs:
           compact_recovery = payloads["light-recovery-dialog-800x600"]
           assert compact_recovery["dialog_geometry_in_viewport"][2] <= 800
           assert compact_recovery["dialog_geometry_in_viewport"][3] <= 600
+          assert compact_recovery["visible_columns"] == ["対象", "ファイル", "元の場所", "状態"]
+          assert compact_recovery["hidden_columns"] == ["最終更新", "サイズ"]
+          assert compact_recovery["horizontal_scrollbar_visible"] is False
+          assert compact_recovery["horizontal_scrollbar_maximum"] == 0
 
           light_recovery = payloads["light-recovery-dialog-1100x800"]
           dark_recovery = payloads["dark-recovery-dialog-1100x800"]
+          assert light_recovery["visible_columns"] == [
+              "対象",
+              "ファイル",
+              "元の場所",
+              "最終更新",
+              "状態",
+              "サイズ",
+          ]
+          assert light_recovery["hidden_columns"] == []
+          assert light_recovery["horizontal_scrollbar_maximum"] == 0
+          assert dark_recovery["visible_columns"] == [
+              "対象",
+              "ファイル",
+              "元の場所",
+              "最終更新",
+              "状態",
+              "サイズ",
+          ]
+          assert dark_recovery["hidden_columns"] == []
+          assert dark_recovery["horizontal_scrollbar_maximum"] == 0
           assert (
               light_recovery["canvas_digest"]
               != dark_recovery["canvas_digest"]

@@ -272,6 +272,56 @@ def test_discard_active_workspace_without_lease_is_rejected(tmp_path: Path) -> N
         competing_lease.release()
 
 
+def test_discard_active_workspace_locked_by_subprocess_preserves_workspace(tmp_path: Path) -> None:
+    source_path = create_blank_pdf(tmp_path / "source.pdf", 1)
+    manager, recovery = create_session_environment(tmp_path)
+    session = manager.create_session(source_path)
+    recovery.write_metadata(session)
+    manager.release_session_lock(session.session_id)
+
+    candidate = recovery.scan_candidates().candidates[0]
+    assert candidate.lease is not None
+    candidate.lease.release()
+    candidate.lease = None
+
+    workspace_directory = session.workspace_directory
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import sys, time; "
+            "from pathlib import Path; "
+            "sys.path.insert(0, sys.argv[1]); "
+            "from pdf_workbench.services.session_workspace import SessionWorkspaceManager; "
+            "workspace = Path(sys.argv[2]); "
+            "manager = SessionWorkspaceManager(workspace.parent); "
+            "lease = manager.acquire_workspace_lock(workspace.name, workspace); "
+            "time.sleep(3); "
+            "lease.release()"
+        ),
+        str(source_root),
+        str(workspace_directory),
+    ]
+    process = subprocess.Popen(command)
+    try:
+        time.sleep(0.5)
+        with pytest.raises(RecoveryMetadataError, match="使用中"):
+            recovery.discard_candidate(candidate)
+        assert not (workspace_directory / recovery.DISCARDING_MARKER_NAME).exists()
+        assert (workspace_directory / manager.WORKING_COPY_NAME).exists()
+        assert (workspace_directory / manager.METADATA_NAME).exists()
+        assert (workspace_directory / manager.LOCK_NAME).exists()
+        assert workspace_directory.exists()
+    finally:
+        process.wait(timeout=10)
+
+    rescanned = recovery.scan_candidates()
+    assert len(rescanned.candidates) == 1
+    recovery.discard_candidate(rescanned.candidates[0])
+    assert not workspace_directory.exists()
+
+
 def test_scan_marks_modified_source_status(tmp_path: Path) -> None:
     source_path = create_blank_pdf(tmp_path / "source.pdf", 1)
     manager, recovery = create_session_environment(tmp_path)

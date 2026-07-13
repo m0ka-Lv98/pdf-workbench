@@ -5,10 +5,12 @@ from datetime import UTC
 from enum import StrEnum
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QResizeEvent
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QMessageBox,
     QPushButton,
@@ -34,6 +36,14 @@ class RecoveryDialogResult:
 
 
 class RecoveryDialog(QDialog):
+    TARGET_COLUMN = 0
+    FILE_COLUMN = 1
+    SOURCE_COLUMN = 2
+    UPDATED_COLUMN = 3
+    STATE_COLUMN = 4
+    SIZE_COLUMN = 5
+    COMPACT_LAYOUT_MAX_WIDTH = 760
+
     @staticmethod
     def compute_dialog_size(available_width: int, available_height: int) -> tuple[int, int]:
         width = min(920, max(640, available_width - 80))
@@ -52,17 +62,25 @@ class RecoveryDialog(QDialog):
         self._result = RecoveryDialogResult(RecoveryDialogAction.LATER, [])
         self._button_row_widget: QWidget | None = None
 
-        screen = self.screen() or QApplication.primaryScreen()
-        if screen is not None:
-            available = screen.availableGeometry()
+        parent_widget = self.parentWidget()
+        if parent_widget is not None and parent_widget.width() > 0 and parent_widget.height() > 0:
             width, height = self.compute_dialog_size(
-                available.width(),
-                available.height(),
+                parent_widget.width(),
+                parent_widget.height(),
             )
             self.resize(width, height)
         else:
-            width, height = self.compute_dialog_size(800, 600)
-            self.resize(width, height)
+            screen = self.screen() or QApplication.primaryScreen()
+            if screen is not None:
+                available = screen.availableGeometry()
+                width, height = self.compute_dialog_size(
+                    available.width(),
+                    available.height(),
+                )
+                self.resize(width, height)
+            else:
+                width, height = self.compute_dialog_size(800, 600)
+                self.resize(width, height)
         self.setMinimumSize(640, 420)
 
         layout = QVBoxLayout(self)
@@ -87,12 +105,9 @@ class RecoveryDialog(QDialog):
         self._tree.setSelectionMode(QTreeWidget.SelectionMode.NoSelection)
         self._tree.setColumnCount(6)
         self._tree.setHeaderLabels(["対象", "ファイル", "元の場所", "最終更新", "状態", "サイズ"])
-        self._tree.header().setStretchLastSection(False)
-        self._tree.header().resizeSection(0, 72)
-        self._tree.header().resizeSection(1, 180)
-        self._tree.header().resizeSection(2, 280)
-        self._tree.header().resizeSection(3, 150)
-        self._tree.header().resizeSection(4, 190)
+        header = self._tree.header()
+        header.setStretchLastSection(False)
+        header.setMinimumSectionSize(48)
 
         for index, candidate in enumerate(candidates):
             item = QTreeWidgetItem(self._tree)
@@ -139,11 +154,16 @@ class RecoveryDialog(QDialog):
         layout.addWidget(description)
         layout.addWidget(self._tree, 1)
         layout.addWidget(button_row_widget)
+        self._apply_column_layout()
         self._update_button_state()
 
     @property
     def result_value(self) -> RecoveryDialogResult:
         return self._result
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._apply_column_layout()
 
     def reject(self) -> None:
         self._later()
@@ -193,6 +213,33 @@ class RecoveryDialog(QDialog):
     def _later(self) -> None:
         self._result = RecoveryDialogResult(RecoveryDialogAction.LATER, [])
         self.done(QDialog.DialogCode.Rejected)
+
+    def _apply_column_layout(self) -> None:
+        compact = self.width() <= self.COMPACT_LAYOUT_MAX_WIDTH
+        header = self._tree.header()
+
+        self._tree.setColumnHidden(self.UPDATED_COLUMN, compact)
+        self._tree.setColumnHidden(self.SIZE_COLUMN, compact)
+
+        header.setSectionResizeMode(self.TARGET_COLUMN, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(self.FILE_COLUMN, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(self.SOURCE_COLUMN, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(self.UPDATED_COLUMN, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(self.STATE_COLUMN, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(self.SIZE_COLUMN, QHeaderView.ResizeMode.Fixed)
+
+        if compact:
+            header.resizeSection(self.TARGET_COLUMN, 56)
+            header.resizeSection(self.FILE_COLUMN, 148)
+            header.resizeSection(self.UPDATED_COLUMN, 0)
+            header.resizeSection(self.STATE_COLUMN, 176)
+            header.resizeSection(self.SIZE_COLUMN, 0)
+        else:
+            header.resizeSection(self.TARGET_COLUMN, 72)
+            header.resizeSection(self.FILE_COLUMN, 180)
+            header.resizeSection(self.UPDATED_COLUMN, 150)
+            header.resizeSection(self.STATE_COLUMN, 190)
+            header.resizeSection(self.SIZE_COLUMN, 96)
 
     @staticmethod
     def _status_text(candidate: RecoveryCandidate) -> str:
