@@ -71,5 +71,5 @@ test(redaction): verify removed text is not extractable
 - 単体テストまたは統合テストを追加
 - Ruff、mypy、pytestが成功
 - PDFを書き換える変更は構造検査と再オープン検査を追加
-- UI変更はmacOSまたはWindowsで確認し、Windows向け差分がある場合はWindowsでも確認
+- UI変更は少なくともCIまたはreview artifactで確認し、必要に応じてmacOSまたはWindowsで追加確認する
 - セキュリティ上の制約をREADMEまたはIssueへ記録
