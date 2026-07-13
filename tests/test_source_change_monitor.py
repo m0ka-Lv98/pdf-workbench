@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from PySide6.QtCore import Qt
 from pytestqt.qtbot import QtBot
 
@@ -154,3 +155,112 @@ def test_source_change_monitor_refresh_baseline_switches_watched_file(tmp_path: 
     assert str(old_path) not in monitor._watcher.files()
     assert str(new_path) in monitor._watcher.files()
     monitor.shutdown()
+
+
+def test_source_change_monitor_registers_missing_source_and_rearms_file_watch_after_recreate(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    session = create_session(tmp_path)
+    monitor = SourceChangeMonitor(poll_interval_ms=10, debounce_interval_ms=10)
+    session.source_path.unlink()
+    captured: list[SourceCheckResult] = []
+    monitor.source_status_changed.connect(lambda _sid, result: captured.append(result))
+
+    monitor.register_session(session)
+
+    assert session.session_id in monitor._file_to_sessions[session.source_path]
+    assert str(session.source_path.parent) in monitor._watcher.directories()
+    assert str(session.source_path) not in monitor._watcher.files()
+
+    replacement = create_blank_pdf(tmp_path / "replacement.pdf", 2)
+    session.source_path.write_bytes(replacement.read_bytes())
+    monitor._on_directory_changed(str(session.source_path.parent))
+    qtbot.waitUntil(lambda: str(session.source_path) in monitor._watcher.files())
+
+    assert session.session_id in monitor._file_to_sessions[session.source_path]
+
+    second_replacement = create_blank_pdf(tmp_path / "replacement-2.pdf", 3)
+    session.source_path.write_bytes(second_replacement.read_bytes())
+    monitor._on_file_changed(str(session.source_path))
+    qtbot.waitUntil(lambda: any(item.status is SourceStatus.MODIFIED for item in captured))
+    assert captured[-1].status is SourceStatus.MODIFIED
+    monitor.shutdown()
+
+
+def test_source_change_monitor_ignores_unregistered_session_for_direct_check(
+    tmp_path: Path,
+) -> None:
+    session = create_session(tmp_path)
+    monitor = SourceChangeMonitor(poll_interval_ms=10, debounce_interval_ms=10)
+
+    result = monitor.check_session_now(session)
+
+    assert result.status is SourceStatus.UNCHANGED
+    assert session.session_id not in monitor._sessions
+    monitor.shutdown()
+
+
+def test_source_change_monitor_directory_watch_ref_counts_sessions(tmp_path: Path) -> None:
+    first = create_session(tmp_path)
+    second_source_path = create_blank_pdf(tmp_path / "second-source.pdf", 1)
+    second_workspace = tmp_path / "workspace-second"
+    second_workspace.mkdir()
+    second_working_copy = second_workspace / "working.pdf"
+    second_working_copy.write_bytes(second_source_path.read_bytes())
+    second = DocumentSession(
+        source_path=second_source_path,
+        working_copy_path=second_working_copy,
+        workspace_directory=second_workspace,
+        source_fingerprint=FileFingerprint.from_path(second_source_path),
+    )
+    monitor = SourceChangeMonitor(poll_interval_ms=10, debounce_interval_ms=10)
+
+    monitor.register_session(first)
+    monitor.register_session(second)
+
+    directory_text = str(first.source_path.parent)
+    assert directory_text in monitor._watcher.directories()
+
+    monitor.unregister_session(first.session_id)
+    assert directory_text in monitor._watcher.directories()
+
+    monitor.unregister_session(second.session_id)
+    assert directory_text not in monitor._watcher.directories()
+    monitor.shutdown()
+
+
+def test_source_file_inspector_converts_resolve_errors_to_unreadable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    session = create_session(tmp_path)
+    inspector = SourceFileInspector()
+
+    monkeypatch.setattr(
+        Path,
+        "resolve",
+        lambda self, *args, **kwargs: (_ for _ in ()).throw(PermissionError("denied")),
+    )
+
+    result = inspector.inspect(session.source_path, session.source_fingerprint)
+
+    assert result.status is SourceStatus.UNREADABLE
+
+
+def test_source_file_inspector_converts_symlink_loop_to_unreadable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    session = create_session(tmp_path)
+    inspector = SourceFileInspector()
+
+    monkeypatch.setattr(
+        Path,
+        "resolve",
+        lambda self, *args, **kwargs: (_ for _ in ()).throw(RuntimeError("symlink loop")),
+    )
+
+    result = inspector.inspect(session.source_path, session.source_fingerprint)
+
+    assert result.status is SourceStatus.UNREADABLE

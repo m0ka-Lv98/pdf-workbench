@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import sys
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC
 from enum import StrEnum
@@ -82,6 +83,11 @@ class RestoreSessionResult(StrEnum):
     ATTACHED = "attached"
     DUPLICATE = "duplicate"
     FAILED = "failed"
+
+
+class SaveIntent(StrEnum):
+    SAVE = "save"
+    SAVE_AS = "save_as"
 
 
 class MainWindow(QMainWindow):
@@ -606,11 +612,20 @@ class MainWindow(QMainWindow):
         session = document.session
         if session.is_saving:
             return False
-        if target_path is None:
-            result = self._source_change_monitor.check_session_now(session)
-            if result.status is not SourceStatus.UNCHANGED:
-                self._apply_source_check_result(session, result, notify=False)
-        if target_path is None and session.requires_save_as:
+        intent = SaveIntent.SAVE if target_path is None else SaveIntent.SAVE_AS
+        source_check_result: SourceCheckResult | None = None
+        if intent is SaveIntent.SAVE:
+            source_check_result = self._source_change_monitor.check_session_now(session)
+            if (
+                source_check_result.status is not SourceStatus.UNCHANGED
+                and session.source_status is SourceStatus.UNCHANGED
+            ):
+                self._apply_source_check_result(session, source_check_result, notify=False)
+        if (
+            intent is SaveIntent.SAVE
+            and source_check_result is not None
+            and source_check_result.status is not SourceStatus.UNCHANGED
+        ) or (intent is SaveIntent.SAVE and session.requires_save_as):
             self._set_status_message(
                 "元のPDFが見つからないか変更されているため、別名で保存してください。",
                 timeout_ms=5000,
@@ -634,7 +649,12 @@ class MainWindow(QMainWindow):
             )
             return False
 
-        target_snapshot = self._prepare_target_snapshot(document, destination)
+        target_snapshot = self._prepare_target_snapshot(
+            document,
+            destination,
+            intent=intent,
+            source_check_result=source_check_result,
+        )
         if target_snapshot is None:
             return False
 
@@ -1134,17 +1154,48 @@ class MainWindow(QMainWindow):
         view.selection_changed.connect(self._update_actions)
         view.error_occurred.connect(lambda message: self._set_status_message(message, error=True))
         document = DocumentTab(session=session, view=view)
-        self._documents.append(document)
-        tab_index = self._tabs.addTab(
-            view,
-            IconProvider.icon(IconName.DOCUMENT, tone=IconTone.MUTED, size=16),
-            self._tab_title(document),
-        )
-        self._tabs.setTabToolTip(tab_index, self._tab_tooltip(document))
-        self._install_tab_close_button(view)
-        self._tabs.setCurrentIndex(tab_index)
-        self._stack.setCurrentWidget(self._tabs)
-        self._source_change_monitor.register_session(session)
+        tab_index: int | None = None
+        try:
+            self._documents.append(document)
+            tab_index = self._tabs.addTab(
+                view,
+                IconProvider.icon(IconName.DOCUMENT, tone=IconTone.MUTED, size=16),
+                self._tab_title(document),
+            )
+            self._tabs.setTabToolTip(tab_index, self._tab_tooltip(document))
+            self._install_tab_close_button(view)
+            self._tabs.setCurrentIndex(tab_index)
+            self._stack.setCurrentWidget(self._tabs)
+            self._source_change_monitor.register_session(session)
+        except Exception:
+            self._cancel_metadata_timer(session.session_id)
+            with suppress(Exception):
+                self._source_change_monitor.unregister_session(session.session_id)
+            if tab_index is not None:
+                self._tabs.removeTab(tab_index)
+            with suppress(ValueError):
+                self._documents.remove(document)
+            try:
+                view.close_document()
+            except Exception:
+                logger.exception(
+                    "Failed to close view after source monitor registration error: %s",
+                    session.session_id,
+                )
+            view.deleteLater()
+            if cleanup_on_failure:
+                self._workspace_manager.cleanup_session(session)
+            else:
+                self._workspace_manager.release_session_lock(session.session_id)
+            self._stack.setCurrentWidget(self._tabs if self._documents else self._empty_state)
+            self._refresh_source_change_banner()
+            self._update_window_title()
+            self._update_actions()
+            self._update_status()
+            self._update_overlay_geometry()
+            self._apply_search_inset()
+            raise
+
         self._remember_recent_file(session.source_path)
         self._refresh_source_change_banner()
         self._update_window_title()
@@ -1285,8 +1336,20 @@ class MainWindow(QMainWindow):
         self,
         document: DocumentTab,
         destination: Path,
+        *,
+        intent: SaveIntent,
+        source_check_result: SourceCheckResult | None = None,
     ) -> TargetSnapshot | None:
         session = document.session
+        if intent is SaveIntent.SAVE:
+            if source_check_result is None:
+                raise ValueError("source_check_result is required for SaveIntent.SAVE")
+            if source_check_result.status is not SourceStatus.UNCHANGED:
+                raise ValueError("SaveIntent.SAVE requires an unchanged source check result")
+            if source_check_result.current_fingerprint != session.source_fingerprint:
+                raise ValueError("SaveIntent.SAVE requires the baseline source fingerprint")
+            return TargetSnapshot(exists=True, fingerprint=session.source_fingerprint)
+
         if destination == session.source_path:
             if session.source_status is SourceStatus.MODIFIED:
                 result = QMessageBox.warning(
@@ -1308,6 +1371,7 @@ class MainWindow(QMainWindow):
                 )
                 if result != QMessageBox.StandardButton.Ok:
                     return None
+                return TargetSnapshot(exists=False, fingerprint=None)
             elif session.source_status is SourceStatus.UNREADABLE:
                 self._report_error(
                     "保存できません",
@@ -1325,41 +1389,12 @@ class MainWindow(QMainWindow):
             if result != QMessageBox.StandardButton.Yes:
                 return None
         try:
-            if destination == session.source_path and session.source_status is SourceStatus.MISSING:
-                return TargetSnapshot(exists=False, fingerprint=None)
             return TargetSnapshot.capture(destination)
         except OSError as exc:
             self._report_error("保存できません", f"保存先の状態を確認できませんでした。\n\n{exc}")
             return None
 
     def _confirm_save_as_target(self, document: DocumentTab, target_path: Path) -> bool:
-        session = document.session
-        if target_path != session.source_path:
-            return True
-        if session.source_status is SourceStatus.MODIFIED:
-            result = QMessageBox.warning(
-                self,
-                "外部変更を上書きしますか",
-                "元のPDFは別のアプリで変更されています。現在の作業コピーで上書きすると、外部アプリの変更内容は失われます。上書きしますか？",
-                QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
-                QMessageBox.StandardButton.Cancel,
-            )
-            return result == QMessageBox.StandardButton.Ok
-        if session.source_status is SourceStatus.MISSING:
-            result = QMessageBox.warning(
-                self,
-                "元のPDFを再作成しますか",
-                "元のPDFは削除または移動されています。この場所にPDFを再作成しますか？",
-                QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
-                QMessageBox.StandardButton.Cancel,
-            )
-            return result == QMessageBox.StandardButton.Ok
-        if session.source_status is SourceStatus.UNREADABLE:
-            self._report_error(
-                "保存できません",
-                "元のPDFの状態を確認できないため、この場所への上書きはできません。別の保存先を選択してください。",
-            )
-            return False
         return True
 
     def _handle_target_changed_during_save(

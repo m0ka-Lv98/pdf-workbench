@@ -603,3 +603,44 @@ def test_pdf_save_service_detects_new_target_created_after_confirmation(
     assert target_path.read_bytes() == b"created-elsewhere"
     assert session.is_modified is True
     assert temp_candidates(target_path.parent) == []
+
+
+def test_pdf_save_service_detects_target_change_during_mode_application(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    service = PdfSaveService()
+    session = create_session(tmp_path)
+    session.mark_modified("test operation")
+    target_path = tmp_path / "target.pdf"
+    target_path.write_bytes(b"original-bytes")
+    snapshot = target_snapshot(target_path)
+    external_bytes = b"changed-during-mode"
+    call_count = 0
+    original_ensure = service._ensure_target_snapshot_matches
+
+    def mutate_on_second_check(path: Path, current_snapshot: TargetSnapshot) -> None:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 2:
+            target_path.write_bytes(external_bytes)
+        original_ensure(path, current_snapshot)
+
+    monkeypatch.setattr(service, "_ensure_target_snapshot_matches", mutate_on_second_check)
+
+    with pytest.raises(TargetChangedError):
+        service.save_atomic(
+            session,
+            target_path,
+            expected_page_count=1,
+            target_snapshot=snapshot,
+        )
+
+    assert target_path.read_bytes() == external_bytes
+    assert session.is_modified is True
+    assert temp_candidates(target_path.parent) == []
+
+
+def test_target_snapshot_capture_rejects_directory(tmp_path: Path) -> None:
+    with pytest.raises(OSError):
+        TargetSnapshot.capture(tmp_path)

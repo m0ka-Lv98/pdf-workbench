@@ -57,6 +57,8 @@ class DocumentSession:
     source_status_checked_at: datetime | None = None
     source_change_detected_at: datetime | None = None
     source_status_revision: int = 0
+    last_observed_source_fingerprint: FileFingerprint | None = None
+    last_source_error_message: str | None = None
 
     def __post_init__(self) -> None:
         self.source_path = self.source_path.expanduser().resolve()
@@ -106,6 +108,8 @@ class DocumentSession:
         self.source_status = SourceStatus.UNCHANGED
         self.source_status_checked_at = saved_at
         self.source_change_detected_at = None
+        self.last_observed_source_fingerprint = fingerprint
+        self.last_source_error_message = None
 
     def set_navigation_state(self, *, page_index: int, zoom_factor: float) -> None:
         if page_index < 0:
@@ -126,6 +130,10 @@ class DocumentSession:
         self.source_status_checked_at = now
         self.source_change_detected_at = None if source_status is SourceStatus.UNCHANGED else now
         self.requires_save_as = source_status is not SourceStatus.UNCHANGED
+        self.last_observed_source_fingerprint = (
+            self.source_fingerprint if source_status is SourceStatus.UNCHANGED else None
+        )
+        self.last_source_error_message = None
         if source_status is not SourceStatus.UNCHANGED:
             self.source_status_revision += 1
 
@@ -140,18 +148,26 @@ class DocumentSession:
         if not isinstance(result, SourceCheckResult):
             raise TypeError("result must be SourceCheckResult")
 
-        fingerprint_changed = result.current_fingerprint != self.source_fingerprint
         status_changed = result.status is not self.source_status
         previous_status = self.source_status
         previous_checked_at = self.source_status_checked_at
         previous_requires_save_as = self.requires_save_as
+        previous_observed_fingerprint = self.last_observed_source_fingerprint
+        previous_error_message = self.last_source_error_message
 
         self.source_status = result.status
         self.source_status_checked_at = result.checked_at
         if result.status is SourceStatus.UNCHANGED:
             self.source_change_detected_at = None
+            self.last_observed_source_fingerprint = result.current_fingerprint
+            self.last_source_error_message = None
         elif self.source_change_detected_at is None or previous_status is SourceStatus.UNCHANGED:
             self.source_change_detected_at = result.checked_at
+            self.last_observed_source_fingerprint = result.current_fingerprint
+            self.last_source_error_message = result.error_message
+        else:
+            self.last_observed_source_fingerprint = result.current_fingerprint
+            self.last_source_error_message = result.error_message
 
         self.requires_save_as = bool(
             result.status is not SourceStatus.UNCHANGED
@@ -162,12 +178,26 @@ class DocumentSession:
             )
         )
 
-        if status_changed or fingerprint_changed:
+        observed_fingerprint_changed = result.current_fingerprint != previous_observed_fingerprint
+        error_message_changed = result.error_message != previous_error_message
+
+        should_increment_revision = status_changed or (
+            result.status is SourceStatus.MODIFIED and observed_fingerprint_changed
+        )
+        should_increment_revision = should_increment_revision or (
+            result.status is SourceStatus.MISSING and previous_status is not SourceStatus.MISSING
+        )
+        should_increment_revision = should_increment_revision or (
+            result.status is SourceStatus.UNREADABLE and error_message_changed
+        )
+
+        if should_increment_revision:
             self.source_status_revision += 1
 
         return bool(
             status_changed
-            or fingerprint_changed
+            or observed_fingerprint_changed
+            or error_message_changed
             or previous_requires_save_as != self.requires_save_as
             or previous_checked_at is None
         )

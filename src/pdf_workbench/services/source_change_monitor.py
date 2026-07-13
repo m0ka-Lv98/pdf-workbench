@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import stat
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -30,22 +31,33 @@ class SourceFileInspector:
         path: Path,
         expected_fingerprint: FileFingerprint,
     ) -> SourceCheckResult:
-        resolved_path = path.expanduser().resolve()
         checked_at = datetime.now(UTC)
+        expanded_path = path.expanduser()
+        fallback_path = expanded_path if expanded_path.is_absolute() else expanded_path.absolute()
         try:
+            resolved_path = expanded_path.resolve()
             stat_result = resolved_path.stat()
         except FileNotFoundError:
             return SourceCheckResult(
-                path=resolved_path,
+                path=fallback_path,
                 status=SourceStatus.MISSING,
                 expected_fingerprint=expected_fingerprint,
                 current_fingerprint=None,
                 checked_at=checked_at,
                 error_message="元のPDFが見つかりません",
             )
+        except RuntimeError as exc:
+            return SourceCheckResult(
+                path=fallback_path,
+                status=SourceStatus.UNREADABLE,
+                expected_fingerprint=expected_fingerprint,
+                current_fingerprint=None,
+                checked_at=checked_at,
+                error_message=f"元のPDFの状態を確認できません: {exc}",
+            )
         except OSError as exc:
             return SourceCheckResult(
-                path=resolved_path,
+                path=fallback_path,
                 status=SourceStatus.UNREADABLE,
                 expected_fingerprint=expected_fingerprint,
                 current_fingerprint=None,
@@ -53,7 +65,7 @@ class SourceFileInspector:
                 error_message=f"元のPDFの状態を確認できません: {exc}",
             )
 
-        if not resolved_path.is_file():
+        if not stat.S_ISREG(stat_result.st_mode):
             return SourceCheckResult(
                 path=resolved_path,
                 status=SourceStatus.UNREADABLE,
@@ -155,6 +167,8 @@ class SourceChangeMonitor(QObject):
         self._last_results[session.session_id] = self.inspect_session(session)
 
     def check_session_now(self, session: DocumentSession) -> SourceCheckResult:
+        if session.session_id not in self._sessions:
+            return self.inspect_session(session)
         self._sessions[session.session_id] = session
         result = self.inspect_session(session)
         self._rearm_file_watch(session.source_path.expanduser().resolve())
@@ -192,9 +206,9 @@ class SourceChangeMonitor(QObject):
         resolved_path = session.source_path.expanduser().resolve()
         directory = resolved_path.parent
         self._directory_to_sessions.setdefault(directory, set()).add(session.session_id)
+        self._file_to_sessions.setdefault(resolved_path, set()).add(session.session_id)
         self._ensure_directory_watch(directory)
         if resolved_path.exists():
-            self._file_to_sessions.setdefault(resolved_path, set()).add(session.session_id)
             self._ensure_file_watch(resolved_path)
 
     def _remove_session_from_watch_maps(self, session_id: str, source_path: Path) -> None:
