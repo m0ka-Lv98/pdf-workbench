@@ -197,6 +197,22 @@ jobs:
           capture_recovery_dialog "light-recovery-dialog-1100x800" "1100x800" "light"
           capture_recovery_dialog "dark-recovery-dialog-1100x800" "1100x800" "dark"
           capture_recovery_dialog "light-recovery-dialog-800x600" "800x600" "light"
+
+          capture_source_change() {
+            local stem="$1"
+            local size="$2"
+            local scheme="$3"
+            python scripts/capture_source_change_review.py \
+              --fixture-pdf tests/fixtures/real-search-english.pdf \
+              --window-size "$size" \
+              --color-scheme "$scheme" \
+              --output-png "$review_dir/$stem.png" \
+              --output-json "$review_dir/$stem.json"
+          }
+
+          capture_source_change "light-source-changed-1100x800" "1100x800" "light"
+          capture_source_change "dark-source-changed-1100x800" "1100x800" "dark"
+          capture_source_change "light-source-changed-800x600" "800x600" "light"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -222,6 +238,12 @@ jobs:
             ui-review/dark-recovery-dialog-1100x800.json
             ui-review/light-recovery-dialog-800x600.png
             ui-review/light-recovery-dialog-800x600.json
+            ui-review/light-source-changed-1100x800.png
+            ui-review/light-source-changed-1100x800.json
+            ui-review/dark-source-changed-1100x800.png
+            ui-review/dark-source-changed-1100x800.json
+            ui-review/light-source-changed-800x600.png
+            ui-review/light-source-changed-800x600.json
           if-no-files-found: error
       - name: Verify UI review screenshots
         shell: bash
@@ -247,6 +269,9 @@ jobs:
               "light-recovery-dialog-1100x800": [1100, 800],
               "dark-recovery-dialog-1100x800": [1100, 800],
               "light-recovery-dialog-800x600": [800, 600],
+              "light-source-changed-1100x800": [1100, 800],
+              "dark-source-changed-1100x800": [1100, 800],
+              "light-source-changed-800x600": [800, 600],
           }
 
           def center_y(rect: list[int]) -> int:
@@ -491,6 +516,37 @@ jobs:
               images["dark-search-1100x800"],
               payloads["dark-search-1100x800"]["search_input_surface_border_geometry"],
               (96, 165, 250),
+          )
+
+          for stem in (
+              "light-source-changed-1100x800",
+              "dark-source-changed-1100x800",
+              "light-source-changed-800x600",
+          ):
+              payload = payloads[stem]
+              assert payload["source_change_banner_visible"] is True
+              assert payload["source_status"] == "modified"
+              assert "[外部変更]" in payload["tab_title"]
+              assert payload["save_action_enabled"] is True
+              assert payload["save_as_action_enabled"] is True
+              assert payload["source_change_banner_fits_in_viewport"] is True
+              assert payload["source_change_button_clipping"] is False
+              assert payload["source_change_horizontal_overflow"] is False
+              assert payload["source_change_banner_geometry"][2] > 0
+              assert payload["source_change_banner_geometry"][3] > 0
+              assert payload["source_change_message_geometry"][2] > 0
+              assert payload["source_change_save_as_geometry"][2] > 0
+              assert payload["source_change_recheck_geometry"][2] > 0
+              assert payload["source_change_later_geometry"][2] > 0
+
+          light_source_changed = payloads["light-source-changed-1100x800"]
+          dark_source_changed = payloads["dark-source-changed-1100x800"]
+          assert brightness(
+              images["dark-source-changed-1100x800"],
+              dark_source_changed["source_change_banner_geometry"],
+          ) < brightness(
+              images["light-source-changed-1100x800"],
+              light_source_changed["source_change_banner_geometry"],
           )
           PY
       - name: Package app bundle

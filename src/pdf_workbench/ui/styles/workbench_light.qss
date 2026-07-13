@@ -55,6 +55,45 @@ QWidget#searchToolbar {
   background: transparent;
 }
 
+QWidget#sourceChangeBanner {
+  background: #fff7e8;
+  border-top: 1px solid #f3d08b;
+  border-bottom: 1px solid #f3d08b;
+}
+
+QWidget#sourceChangeBanner[sourceStatus="modified"] {
+  background: #fff7e8;
+}
+
+QWidget#sourceChangeBanner[sourceStatus="missing"],
+QWidget#sourceChangeBanner[sourceStatus="unreadable"] {
+  background: #fff4ef;
+  border-top: 1px solid #efb794;
+  border-bottom: 1px solid #efb794;
+}
+
+QWidget#sourceChangeBanner QLabel#sourceChangeBannerMessage {
+  color: #5a3f16;
+  background: transparent;
+}
+
+QWidget#sourceChangeBanner QPushButton {
+  min-height: 32px;
+  border: 1px solid #d9dde3;
+  border-radius: 7px;
+  background: #ffffff;
+  color: #20242a;
+  padding: 0 12px;
+}
+
+QWidget#sourceChangeBanner QPushButton:hover {
+  background: #f1f3f6;
+}
+
+QWidget#sourceChangeBanner QPushButton:pressed {
+  background: #e5e9ef;
+}
+
 QWidget#searchSurface {
   background: transparent;
   border: none;

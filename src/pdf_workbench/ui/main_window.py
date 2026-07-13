@@ -5,6 +5,7 @@ import logging
 import os
 import sys
 from dataclasses import dataclass
+from datetime import UTC
 from enum import StrEnum
 from functools import partial
 from pathlib import Path
@@ -38,9 +39,14 @@ from PySide6.QtWidgets import (
 )
 
 from pdf_workbench.core.settings import configure_qsettings
-from pdf_workbench.domain.document_session import DocumentSession
+from pdf_workbench.domain.document_session import DocumentSession, SourceStatus
 from pdf_workbench.services.pdf_renderer import PdfRenderService
-from pdf_workbench.services.pdf_save_service import PdfSaveError, PdfSaveService
+from pdf_workbench.services.pdf_save_service import (
+    PdfSaveError,
+    PdfSaveService,
+    TargetChangedError,
+    TargetSnapshot,
+)
 from pdf_workbench.services.session_recovery import (
     RecoveryMetadataError,
     SessionRecoveryService,
@@ -49,11 +55,19 @@ from pdf_workbench.services.session_workspace import (
     SessionWorkspaceManager,
     WorkspaceCreationError,
 )
+from pdf_workbench.services.source_change_monitor import (
+    SourceChangeMonitor,
+    SourceCheckResult,
+)
 from pdf_workbench.ui.icon_provider import IconName, IconProvider, IconTone
 from pdf_workbench.ui.pdf_view import PdfView
 from pdf_workbench.ui.widgets.document_toolbar import DocumentToolbar, ToolbarState
 from pdf_workbench.ui.widgets.empty_state import EmptyState
 from pdf_workbench.ui.widgets.search_bar import SearchBar, SearchBarState
+from pdf_workbench.ui.widgets.source_change_banner import (
+    SourceChangeBanner,
+    SourceChangeBannerState,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +99,7 @@ class MainWindow(QMainWindow):
         workspace_manager: SessionWorkspaceManager | None = None,
         save_service: PdfSaveService | None = None,
         recovery_service: SessionRecoveryService | None = None,
+        source_change_monitor: SourceChangeMonitor | None = None,
     ) -> None:
         super().__init__()
         self._settings = settings if settings is not None else configure_qsettings()
@@ -100,8 +115,14 @@ class MainWindow(QMainWindow):
             if recovery_service is not None
             else SessionRecoveryService(self._workspace_manager)
         )
+        self._source_change_monitor = (
+            source_change_monitor
+            if source_change_monitor is not None
+            else SourceChangeMonitor(parent=self)
+        )
         self._documents: list[DocumentTab] = []
         self._metadata_timers: dict[str, QTimer] = {}
+        self._dismissed_source_banner_revisions: dict[str, int] = {}
         self._recent_files: list[Path] = self._load_recent_files()
         self._build_sha = os.environ.get("PDF_WORKBENCH_BUILD_SHA", "").strip()
         self._toolbar_widget = DocumentToolbar(self)
@@ -112,6 +133,7 @@ class MainWindow(QMainWindow):
         self._search_surface: QWidget | None = None
         self._workspace_overlay_host: QWidget | None = None
         self._empty_state = EmptyState(self)
+        self._source_change_banner = SourceChangeBanner(self)
         self._search_row_height = 52
         self._status_reset_timer = QTimer(self)
         self._status_reset_timer.setSingleShot(True)
@@ -180,6 +202,9 @@ class MainWindow(QMainWindow):
         self._toolbar_widget.rotate_requested.connect(self._rotate_page)
         self._toolbar_widget.page_requested.connect(self._set_page_from_toolbar)
         self._toolbar_widget.zoom_requested.connect(self._set_zoom_from_toolbar)
+        self._source_change_banner.save_as_requested.connect(self._save_current_document_as)
+        self._source_change_banner.recheck_requested.connect(self._recheck_current_source_status)
+        self._source_change_banner.dismiss_requested.connect(self._dismiss_current_source_banner)
         self._search_bar.search_requested.connect(self._search_text_changed)
         self._search_bar.next_requested.connect(self._next_match)
         self._search_bar.previous_requested.connect(self._previous_match)
@@ -190,6 +215,7 @@ class MainWindow(QMainWindow):
             focus_changed.connect(self._on_focus_changed)
         if app is not None:
             app.installEventFilter(self)
+        self._source_change_monitor.source_status_changed.connect(self._on_source_status_changed)
 
         self._create_actions()
         self._create_menu()
@@ -341,6 +367,8 @@ class MainWindow(QMainWindow):
         surface_layout.addWidget(self._search_bar)
         self._search_surface.setFixedHeight(40)
         layout.addWidget(self._search_surface)
+        self._source_change_banner.hide()
+        self._central_layout.addWidget(self._source_change_banner)
         self._central_layout.addWidget(self._stack, 1)
         self._search_toolbar.hide()
         self._search_toolbar.updateGeometry()
@@ -429,6 +457,8 @@ class MainWindow(QMainWindow):
 
         widget = self._tabs.widget(index)
         self._cancel_metadata_timer(document.session.session_id)
+        self._source_change_monitor.unregister_session(document.session.session_id)
+        self._dismissed_source_banner_revisions.pop(document.session.session_id, None)
         self._tabs.removeTab(index)
         self._documents.pop(index)
         if widget is not None:
@@ -440,6 +470,7 @@ class MainWindow(QMainWindow):
             self._stack.setCurrentWidget(self._empty_state)
             if self._search_toolbar is not None:
                 self._search_toolbar.hide()
+            self._source_change_banner.hide()
 
         self._update_window_title()
         self._update_actions()
@@ -575,6 +606,10 @@ class MainWindow(QMainWindow):
         session = document.session
         if session.is_saving:
             return False
+        if target_path is None:
+            result = self._source_change_monitor.check_session_now(session)
+            if result.status is not SourceStatus.UNCHANGED:
+                self._apply_source_check_result(session, result, notify=False)
         if target_path is None and session.requires_save_as:
             self._set_status_message(
                 "元のPDFが見つからないか変更されているため、別名で保存してください。",
@@ -599,6 +634,10 @@ class MainWindow(QMainWindow):
             )
             return False
 
+        target_snapshot = self._prepare_target_snapshot(document, destination)
+        if target_snapshot is None:
+            return False
+
         session.is_saving = True
         self._set_status_message("保存しています…")
         self._update_actions()
@@ -609,8 +648,11 @@ class MainWindow(QMainWindow):
                 session,
                 destination,
                 expected_page_count=document.view.page_count,
+                target_snapshot=target_snapshot,
             )
             saved = True
+        except TargetChangedError as exc:
+            self._handle_target_changed_during_save(document, destination, exc)
         except PdfSaveError as exc:
             logger.exception("Failed to save PDF: %s", destination)
             self._report_error(
@@ -629,8 +671,11 @@ class MainWindow(QMainWindow):
         index = self._find_document_index(session.source_path)
         if index is not None:
             self._tabs.setTabText(index, self._tab_title(document))
-            self._tabs.setTabToolTip(index, str(session.source_path))
+            self._tabs.setTabToolTip(index, self._tab_tooltip(document))
         self._remember_recent_file(session.source_path)
+        self._source_change_monitor.refresh_baseline(session)
+        self._dismissed_source_banner_revisions.pop(session.session_id, None)
+        self._refresh_source_change_banner()
         self._update_window_title()
         self._update_actions()
         self._update_status()
@@ -650,16 +695,8 @@ class MainWindow(QMainWindow):
         target_path = Path(filename).expanduser().resolve()
         if target_path.suffix.lower() != ".pdf":
             target_path = target_path.with_suffix(".pdf")
-        if target_path.exists() and target_path != document.session.source_path:
-            result = QMessageBox.question(
-                self,
-                "上書き確認",
-                f"{target_path.name} を上書きしますか？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if result != QMessageBox.StandardButton.Yes:
-                return None
+        if not self._confirm_save_as_target(document, target_path):
+            return None
         return target_path
 
     def _find_save_conflict(
@@ -692,6 +729,21 @@ class MainWindow(QMainWindow):
             return
         document.view.search("")
         self._sync_search_bar(document)
+
+    def _recheck_current_source_status(self) -> None:
+        document = self._current_document()
+        if document is None:
+            return
+        self._source_change_monitor.check_session_now(document.session)
+
+    def _dismiss_current_source_banner(self) -> None:
+        document = self._current_document()
+        if document is None:
+            return
+        self._dismissed_source_banner_revisions[document.session.session_id] = (
+            document.session.source_status_revision
+        )
+        self._refresh_source_change_banner()
 
     def _set_page_from_toolbar(self, page_index: int) -> None:
         document = self._current_document()
@@ -738,6 +790,7 @@ class MainWindow(QMainWindow):
             if not self.close_document_at(index):
                 event.ignore()
                 return
+        self._source_change_monitor.shutdown()
         shutdown_succeeded = self._render_service.shutdown()
         if not shutdown_succeeded:
             self._set_status_message("PDFレンダラーの終了を待ち切れませんでした", error=True)
@@ -774,8 +827,14 @@ class MainWindow(QMainWindow):
 
     def _tab_title(self, document: DocumentTab) -> str:
         recovered_suffix = " [復元]" if document.session.recovered_from_interrupted_session else ""
+        source_suffix = (
+            " [外部変更]" if document.session.source_status is not SourceStatus.UNCHANGED else ""
+        )
         modified_suffix = " *" if document.session.is_modified else ""
-        return f"{document.session.display_path.name}{recovered_suffix}{modified_suffix}"
+        return (
+            f"{document.session.display_path.name}"
+            f"{recovered_suffix}{source_suffix}{modified_suffix}"
+        )
 
     def _update_window_title(self) -> None:
         suffix = ""
@@ -826,6 +885,7 @@ class MainWindow(QMainWindow):
         if document is not None and self._is_search_open():
             self._search_bar.cancel_pending_search()
             self._sync_search_bar(document)
+        self._refresh_source_change_banner()
         self._update_window_title()
         self._update_actions()
         self._update_status()
@@ -894,6 +954,86 @@ class MainWindow(QMainWindow):
         if document is not None and document.view is view:
             self._sync_search_bar(document)
         self._update_status()
+
+    def _on_source_status_changed(self, session_id: str, result: object) -> None:
+        if not isinstance(result, SourceCheckResult):
+            return
+        document = next(
+            (item for item in self._documents if item.session.session_id == session_id),
+            None,
+        )
+        if document is None:
+            return
+        changed = self._apply_source_check_result(document.session, result)
+        if not changed:
+            return
+        self._persist_recovery_metadata(document.session)
+        index = self._find_document_index(document.session.source_path)
+        if index is not None:
+            self._tabs.setTabText(index, self._tab_title(document))
+            self._tabs.setTabToolTip(index, self._tab_tooltip(document))
+        self._update_actions()
+        self._update_window_title()
+        self._refresh_source_change_banner()
+        if self._current_document() is document:
+            self._show_source_status_message(document.session.source_status)
+
+    def _apply_source_check_result(
+        self,
+        session: DocumentSession,
+        result: SourceCheckResult,
+        *,
+        notify: bool = True,
+    ) -> bool:
+        previous_status = session.source_status
+        previous_revision = session.source_status_revision
+        changed = session.apply_source_check(result)
+        if session.source_status_revision != previous_revision:
+            self._dismissed_source_banner_revisions.pop(session.session_id, None)
+        if notify and changed and session.source_status is not previous_status:
+            self._show_source_status_message(session.source_status)
+        return changed
+
+    def _show_source_status_message(self, status: SourceStatus) -> None:
+        if status is SourceStatus.MODIFIED:
+            self._set_status_message("元のPDFが外部で変更されました", timeout_ms=5000)
+        elif status is SourceStatus.MISSING:
+            self._set_status_message("元のPDFが見つかりません", timeout_ms=5000)
+        elif status is SourceStatus.UNREADABLE:
+            self._set_status_message("元のPDFの状態を確認できません", timeout_ms=5000)
+
+    def _refresh_source_change_banner(self) -> None:
+        document = self._current_document()
+        if document is None:
+            self._source_change_banner.hide()
+            return
+        session = document.session
+        if session.source_status is SourceStatus.UNCHANGED:
+            self._source_change_banner.hide()
+            return
+        dismissed_revision = self._dismissed_source_banner_revisions.get(session.session_id)
+        if dismissed_revision == session.source_status_revision:
+            self._source_change_banner.hide()
+            return
+        if session.source_status is SourceStatus.MODIFIED:
+            message = (
+                "元のPDFが別のアプリで変更されました。現在のタブは作業コピーを表示しています。"
+                "通常の上書き保存は停止されています。"
+            )
+        elif session.source_status is SourceStatus.MISSING:
+            message = "元のPDFが削除または移動されました。作業コピーは保持されています。"
+        else:
+            message = (
+                "元のPDFの状態を確認できません。安全のため通常の上書き保存は停止されています。"
+            )
+        self._source_change_banner.set_state(
+            SourceChangeBannerState(
+                status_text=session.source_status.value,
+                message_text=message,
+                source_path_text=str(session.source_path),
+                visible=True,
+            )
+        )
 
     def _remember_recent_file(self, path: Path) -> None:
         normalized = path.resolve()
@@ -1000,14 +1140,13 @@ class MainWindow(QMainWindow):
             IconProvider.icon(IconName.DOCUMENT, tone=IconTone.MUTED, size=16),
             self._tab_title(document),
         )
-        tooltip = str(session.source_path)
-        if session.recovered_from_interrupted_session:
-            tooltip = f"{session.source_path}\n復旧されたセッション"
-        self._tabs.setTabToolTip(tab_index, tooltip)
+        self._tabs.setTabToolTip(tab_index, self._tab_tooltip(document))
         self._install_tab_close_button(view)
         self._tabs.setCurrentIndex(tab_index)
         self._stack.setCurrentWidget(self._tabs)
+        self._source_change_monitor.register_session(session)
         self._remember_recent_file(session.source_path)
+        self._refresh_source_change_banner()
         self._update_window_title()
         self._update_actions()
         self._update_status()
@@ -1078,6 +1217,28 @@ class MainWindow(QMainWindow):
         self._update_actions()
         self._update_window_title()
 
+    def _tab_tooltip(self, document: DocumentTab) -> str:
+        lines = [str(document.session.source_path)]
+        if document.session.recovered_from_interrupted_session:
+            lines.append("復旧されたセッション")
+        if document.session.source_status is SourceStatus.MODIFIED:
+            lines.append("元のPDFが外部で変更されています")
+            lines.append("現在のタブは作業コピーを表示しています")
+        elif document.session.source_status is SourceStatus.MISSING:
+            lines.append("元のPDFが削除または移動されています")
+            lines.append("現在のタブは作業コピーを表示しています")
+        elif document.session.source_status is SourceStatus.UNREADABLE:
+            lines.append("元のPDFの状態を確認できません")
+            lines.append("現在のタブは作業コピーを表示しています")
+        if document.session.source_change_detected_at is not None:
+            lines.append(
+                "検知時刻: "
+                + document.session.source_change_detected_at.astimezone(UTC).strftime(
+                    "%Y-%m-%d %H:%M UTC"
+                )
+            )
+        return "\n".join(lines)
+
     def _save_window_state(self) -> None:
         self._settings.setValue(self._GEOMETRY_KEY, self.saveGeometry())
         self._settings.sync()
@@ -1118,6 +1279,101 @@ class MainWindow(QMainWindow):
             current_index=state.current_index,
             total_count=state.total_count,
             progress_text=self._search_progress_text(state),
+        )
+
+    def _prepare_target_snapshot(
+        self,
+        document: DocumentTab,
+        destination: Path,
+    ) -> TargetSnapshot | None:
+        session = document.session
+        if destination == session.source_path:
+            if session.source_status is SourceStatus.MODIFIED:
+                result = QMessageBox.warning(
+                    self,
+                    "外部変更を上書きしますか",
+                    "元のPDFは別のアプリで変更されています。現在の作業コピーで上書きすると、外部アプリの変更内容は失われます。上書きしますか？",
+                    QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Cancel,
+                )
+                if result != QMessageBox.StandardButton.Ok:
+                    return None
+            elif session.source_status is SourceStatus.MISSING:
+                result = QMessageBox.warning(
+                    self,
+                    "元のPDFを再作成しますか",
+                    "元のPDFは削除または移動されています。この場所にPDFを再作成しますか？",
+                    QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Cancel,
+                )
+                if result != QMessageBox.StandardButton.Ok:
+                    return None
+            elif session.source_status is SourceStatus.UNREADABLE:
+                self._report_error(
+                    "保存できません",
+                    "元のPDFの状態を確認できないため、この場所への上書きはできません。別の保存先を選択してください。",
+                )
+                return None
+        elif destination.exists():
+            result = QMessageBox.question(
+                self,
+                "上書き確認",
+                f"{destination.name} を上書きしますか？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if result != QMessageBox.StandardButton.Yes:
+                return None
+        try:
+            if destination == session.source_path and session.source_status is SourceStatus.MISSING:
+                return TargetSnapshot(exists=False, fingerprint=None)
+            return TargetSnapshot.capture(destination)
+        except OSError as exc:
+            self._report_error("保存できません", f"保存先の状態を確認できませんでした。\n\n{exc}")
+            return None
+
+    def _confirm_save_as_target(self, document: DocumentTab, target_path: Path) -> bool:
+        session = document.session
+        if target_path != session.source_path:
+            return True
+        if session.source_status is SourceStatus.MODIFIED:
+            result = QMessageBox.warning(
+                self,
+                "外部変更を上書きしますか",
+                "元のPDFは別のアプリで変更されています。現在の作業コピーで上書きすると、外部アプリの変更内容は失われます。上書きしますか？",
+                QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            return result == QMessageBox.StandardButton.Ok
+        if session.source_status is SourceStatus.MISSING:
+            result = QMessageBox.warning(
+                self,
+                "元のPDFを再作成しますか",
+                "元のPDFは削除または移動されています。この場所にPDFを再作成しますか？",
+                QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            return result == QMessageBox.StandardButton.Ok
+        if session.source_status is SourceStatus.UNREADABLE:
+            self._report_error(
+                "保存できません",
+                "元のPDFの状態を確認できないため、この場所への上書きはできません。別の保存先を選択してください。",
+            )
+            return False
+        return True
+
+    def _handle_target_changed_during_save(
+        self,
+        document: DocumentTab,
+        destination: Path,
+        error: TargetChangedError,
+    ) -> None:
+        logger.warning("Target changed during save: %s (%s)", destination, error)
+        self._source_change_monitor.check_session_now(document.session)
+        self._refresh_source_change_banner()
+        self._report_error(
+            "保存に失敗しました",
+            "保存中に保存先が別のプロセスで変更されたため、上書きを中止しました。元のPDFは変更していません。",
         )
 
     def _is_search_open(self) -> bool:
