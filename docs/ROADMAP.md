@@ -1,43 +1,78 @@
 # 開発ロードマップ
 
-## 開発目標
+## M0A: Bootstrap and development environment — complete
 
-### M0: Bootstrap
+- Python 3.12 / 3.13
+- `venv + pip`
+- Ruff
+- mypy
+- pytest
+- macOS / Windows / Ubuntu の cross-platform CI
+- PySide6 application bootstrap
+- user-profile settings and logs
 
-- Python 3.12/3.13プロジェクト
-- uvによる依存固定
-- Ruff、mypy、pytest
-- GitHub Actions
-- PyInstallerのWindowsビルド
-- 最小Qtアプリ
-- macOS/Windowsの開発環境整備
+完了条件: CI が成功し、開発環境を macOS と Windows で再現できる。
 
-完了条件: CIが成功し、macOSとWindowsで開発用アプリを起動できる。Windowsで配布向けビルドを作成できる。
+## M0B: Packaging automation — partial, non-blocking
 
-### M1: Viewer
+- Windows `onedir`
+- experimental Windows `onefile`
+- macOS arm64 artifact
+- packaged smoke tests
+- Windows packaged GUI validation は #20 で継続
+- macOS x86_64 は #36 で追跡
+- signing、notarization、installer、physical-device validation は後続
+- 現時点では #9、#19、#7、#8 をブロックしない
 
-- PDFiumレンダリング
-- 連続ページ表示
-- サムネイル
-- ページ移動
-- ズーム
-- 検索とコピー
-- 大規模PDFの遅延読み込み
+完了条件: 自動 packaging hardening を継続しつつ、次の実装順序を止めない。
 
-完了条件: 1000ページPDFを全ページ一括画像化せず閲覧できる。
+## M1: Viewer core — complete
 
-### M2: Page operations
+- tabbed document shell
+- PDFium rendering
+- continuous-page view
+- lazy rendering
+- render cache
+- page navigation
+- zoom
+- search
+- text selection
+- copy
+- coordinate mapping
+- light / dark application UI
 
-- 結合、分割、抽出
-- 挿入、削除、複製、置換
-- 並べ替え
-- 回転、切り抜き
-- Undo/Redo
-- 安全保存
+完了条件: 1000 ページ級 PDF を全ページ一括ラスタライズせず閲覧でき、検索・選択・コピーまで行える。
 
-完了条件: 保存後のPDFがQPDF検査と再レンダリング検査を通る。
+## M2A: Safe document lifecycle — complete
 
-### M3: Markup
+- working copy
+- atomic Save / Save As
+- reopen and render validation
+- unsaved-change close guard
+- recovery metadata
+- startup recovery
+- source-file external-change detection
+- save-target race checks
+
+Issue #6 は完了済み。
+
+## M2B: Command architecture and Undo/Redo — next
+
+詳細は #9 を参照。
+
+## Cross-cutting: Compatibility and regression corpus — starts before page writing
+
+詳細は #19 を参照。#19 Phase A は、#7 の破壊的ページ操作を merge する前に必要だが、#19 全体の完了は前提にしない。
+
+## M2C: Page organizer and core page operations
+
+詳細は #7 を参照。
+
+## M2D: Merge, split, extract, and image-to-PDF
+
+詳細は #8 を参照。
+
+## M3: Markup
 
 - ハイライト、下線、取り消し線
 - 付箋、テキストボックス
@@ -45,11 +80,11 @@
 - 透かし、ページ番号
 - 署名画像
 
-完了条件: Acrobat Reader、Edge、Chromeで標準注釈として表示できる。
+完了条件: 標準的な PDF 注釈として主要ビューアで表示できる。
 
-### M4: OCR and redaction
+## M4: OCR and redaction
 
-- OCRmyPDF統合
+- OCRmyPDF 統合
 - 日本語・英語
 - 傾き補正、自動回転
 - 手動・検索ベース墨消し
@@ -57,20 +92,20 @@
 
 完了条件: 墨消し対象が抽出テキスト、コンテンツストリーム、埋め込み画像に残らない。
 
-### M5: Optimize and protect
+## M5: Optimize and protect
 
 - 画像圧縮
 - 不要オブジェクト削除
-- Web最適化
-- AES暗号化
+- Web 最適化
+- AES 暗号化
 - パスワードと権限
 - バッチ処理
 
 完了条件: 処理結果と削減サイズを提示し、失敗時に原本を保持する。
 
-### M6: Forms and limited editing
+## M6: Forms and limited editing
 
-- AcroForm入力・保存・フラット化
+- AcroForm 入力・保存・フラット化
 - テキスト追加
 - 短文置換
 - 画像追加・移動・置換
@@ -78,20 +113,31 @@
 
 完了条件: 日本語を埋め込みフォントで追加でき、他の主要ビューアで表示できる。
 
-### M7: Compare and release hardening
+## M7: Compare and release hardening
 
 - テキスト比較
 - ページ画像比較
-- 視覚回帰テスト
-- 破損PDF・暗号化PDFの検証
-- Windows署名・インストーラー検討
+- release packaging hardening
+- 破損 PDF・暗号化 PDF の検証
+- Windows 署名・インストーラー検討
+
+視覚回帰と互換性テストは M7 だけに閉じず、#19 の横断活動として前倒しで拡張する。
 
 完了条件: 日常利用版として再現可能なリリースを作成できる。
 
-## PyInstaller方針
+## Current implementation order
+
+1. #9 Command architecture and Undo/Redo
+2. #19 Phase A compatibility corpus
+3. #7 Page organizer and core page operations
+4. #8 Merge, split, extract, and image-to-PDF
+5. #10 以降の markup、OCR、redaction、optimization、forms 等
+6. #20 と #36 は初期リリース前の packaging hardening として並行または後続
+
+## PyInstaller 方針
 
 - 開発中と初期配布: `onedir`
-- 安定後の任意配布: `onefile`
-- Windowsランナー上でのみWindows EXEを作る
-- EXEの隣へ設定を書かず、`%LOCALAPPDATA%`等へ保存する
-- 外部OCR実行ファイルは初期段階では別途インストールとし、後に同梱方式を検討する
+- 実験的配布: `onefile`
+- Windows ランナー上でのみ Windows EXE を作る
+- 実行ファイルの隣へ設定を書かず、ユーザープロファイル配下へ保存する
+- 外部 OCR 実行ファイルは初期段階では別途インストールとし、後に同梱方式を検討する
