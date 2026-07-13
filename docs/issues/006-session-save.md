@@ -12,7 +12,7 @@ Prevent source-file corruption and provide a reliable edit lifecycle.
 - [x] Atomic save-as
 - [x] Reopen validation after save
 - [x] Recovery metadata for interrupted sessions
-- [ ] File-change detection when another process modifies the source
+- [x] File-change detection when another process modifies the source
 
 ## Acceptance criteria
 
