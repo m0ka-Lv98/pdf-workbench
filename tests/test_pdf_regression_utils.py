@@ -179,3 +179,14 @@ def test_content_bearing_accepts_non_blank_image() -> None:
         )
     finally:
         image.close()
+
+
+def test_visual_comparison_can_run_repeatedly() -> None:
+    first = make_image()
+    second = make_image()
+    try:
+        for _ in range(100):
+            assert_images_visually_close(first, second)
+    finally:
+        first.close()
+        second.close()

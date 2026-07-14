@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -14,15 +15,19 @@ from pdf_regression_utils import (
     assert_pdf_contains_text,
     assert_pdf_matches_manifest,
     assert_pdfium_renders_all_pages,
+    box_within,
     compatibility_fixture_dir,
     file_sha256,
     flatten_on_white,
     inspect_pdf_structure,
     inspect_pdfium_pages,
     load_compatibility_manifest,
+    normalize_box,
     normalize_rotation,
     render_pdf_pages,
 )
+
+SUBSET_FONT_NAME_PATTERN = re.compile(r"^/[A-Z]{6}\+")
 
 
 @pytest.fixture(scope="module")
@@ -80,19 +85,32 @@ def test_manifest_integrity(
         expected = item["expected"]
         assert isinstance(expected, Mapping)
         page_count = int(expected["page_count"])
+        assert isinstance(expected["content_bearing"], bool)
         pages = expected["pages"]
         assert isinstance(pages, list)
         assert len(pages) == page_count
         for page in pages:
             assert isinstance(page, Mapping)
             assert normalize_rotation(int(page["rotation"])) in {0, 90, 180, 270}
-            for box_name in ("media_box", "crop_box", "visible_box"):
-                box = page[box_name]
+            media_box = normalize_box(page["media_box"])  # type: ignore[arg-type]
+            crop_box = normalize_box(page["crop_box"])  # type: ignore[arg-type]
+            visible_box = normalize_box(page["visible_box"])  # type: ignore[arg-type]
+            for box in (media_box, crop_box, visible_box):
                 assert len(box) == 4
                 assert all(math.isfinite(float(value)) for value in box)
+            assert box_within(crop_box, media_box)
+            assert box_within(visible_box, media_box)
             annotations = page["annotations"]
             assert isinstance(annotations, list)
             assert len(page["annotation_subtypes"]) == len(annotations)
+            expected_subtypes = [str(annotation["subtype"]) for annotation in annotations]
+            assert page["annotation_subtypes"] == expected_subtypes
+            for annotation in annotations:
+                assert isinstance(annotation, Mapping)
+                assert str(annotation["subtype"])
+                rect = normalize_box(annotation["rect"])  # type: ignore[arg-type]
+                assert box_within(rect, media_box)
+                assert isinstance(annotation["has_appearance"], bool)
 
 
 def test_all_fixtures_match_structural_manifest(
@@ -114,12 +132,15 @@ def test_pdfium_renders_all_fixture_pages(
             fixture_dir / name,
             expected_page_count=int(expected["page_count"]),
         )
+        content_bearing = expected["content_bearing"]
+        assert isinstance(content_bearing, bool)
         for page_index, image in enumerate(images):
-            assert_image_has_non_background_content(
-                image,
-                fixture_name=name,
-                page_index=page_index,
-            )
+            if content_bearing:
+                assert_image_has_non_background_content(
+                    image,
+                    fixture_name=name,
+                    page_index=page_index,
+                )
             flattened = flatten_on_white(image)
             flattened.close()
             image.close()
@@ -190,6 +211,7 @@ def test_annotations_round_trip_preserves_rectangles_and_appearance(
 
 def test_japanese_fixture_uses_embedded_subset_font() -> None:
     source_path = compatibility_fixture_dir() / "japanese-text.pdf"
+    assert_pdf_contains_text(source_path, "PDFワークベンチ 日本語互換性テスト")
     with pikepdf.open(source_path) as pdf:
         page = pdf.pages[0]
         fonts = page.Resources.get("/Font", None)
@@ -215,11 +237,10 @@ def test_japanese_fixture_uses_embedded_subset_font() -> None:
                     if hasattr(descriptor_ref, "get_object")
                     else descriptor_ref
                 )
-                found_embedded_stream = any(
-                    key in descriptor for key in ("/FontFile", "/FontFile2", "/FontFile3")
-                )
+                if any(key in descriptor for key in ("/FontFile", "/FontFile2", "/FontFile3")):
+                    found_embedded_stream = True
                 font_name = str(descriptor.get("/FontName", ""))
-                if font_name.startswith("/") and "+" in font_name[:8]:
+                if SUBSET_FONT_NAME_PATTERN.match(font_name):
                     found_subset_name = True
         assert found_embedded_stream
         assert found_subset_name

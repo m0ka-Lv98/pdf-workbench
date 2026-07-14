@@ -421,8 +421,10 @@ def assert_images_visually_close(
 ) -> None:
     actual_flat = flatten_on_white(actual)
     expected_flat = flatten_on_white(expected)
-    diff = None
-    channel_max = None
+    diff: Image.Image | None = None
+    channels: tuple[Image.Image, ...] = ()
+    rg_max: Image.Image | None = None
+    channel_max: Image.Image | None = None
     try:
         if actual_flat.size != expected_flat.size:
             raise AssertionError(
@@ -438,7 +440,8 @@ def assert_images_visually_close(
             histogram = channel.histogram()
             for value, count in enumerate(histogram):
                 weighted_sum += value * count
-        channel_max = ImageChops.lighter(ImageChops.lighter(channels[0], channels[1]), channels[2])
+        rg_max = ImageChops.lighter(channels[0], channels[1])
+        channel_max = ImageChops.lighter(rg_max, channels[2])
         significant_pixels = sum(
             count
             for value, count in enumerate(channel_max.histogram())
@@ -454,6 +457,10 @@ def assert_images_visually_close(
                 f"significant_pixel_fraction={significant_fraction:.6f}"
             )
     finally:
+        for channel in channels:
+            channel.close()
+        if rg_max is not None:
+            rg_max.close()
         if diff is not None:
             diff.close()
         if channel_max is not None:
