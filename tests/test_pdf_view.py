@@ -16,6 +16,7 @@ from pdf_workbench.services.pdf_renderer import (
     DocumentRevision,
     PageTextIndex,
     PdfRenderService,
+    RenderFailure,
     RenderRequest,
     RenderResult,
     TextCharacterBox,
@@ -27,7 +28,7 @@ class FakeRenderService(QObject):
     document_loaded = Signal(object, int, object)
     document_failed = Signal(object, int, str)
     render_succeeded = Signal(object)
-    render_failed = Signal(object, int, int, str)
+    render_failed = Signal(object)
     text_page_indexed = Signal(object, object, object)
     text_index_progress = Signal(object, object, int, int, int)
     text_index_completed = Signal(object, object, int, int)
@@ -268,6 +269,16 @@ def make_render_result(request: RenderRequest) -> RenderResult:
     )
 
 
+def make_render_failure(request: RenderRequest, message: str = "render failed") -> RenderFailure:
+    return RenderFailure(
+        document_id=request.document_id,
+        generation=request.generation,
+        page_index=request.page_index,
+        cache_key=request.cache_key,
+        message=message,
+    )
+
+
 def show_view(qtbot: QtBot, view: PdfView) -> QWidget:
     wrapper = QWidget()
     wrapper.resize(520, 420)
@@ -367,6 +378,120 @@ def test_opening_large_document_does_not_queue_all_pages(
     view._request_visible_pages()
 
     assert 0 < len(service.render_requests) < 10
+
+
+def test_page_organizer_initializes_with_page_zero_selected(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    document_path = create_pdf(tmp_path / "organizer-initial.pdf", 6)
+    service = FakeRenderService(create_metadata(document_path, 6))
+    view = PdfView(render_service=service, debounce_interval_ms=0)
+    _wrapper = show_view(qtbot, view)
+
+    view.open_document(document_path)
+    qtbot.waitUntil(lambda: view.page_count == 6)
+
+    assert view.selected_page_indexes == (0,)
+    assert view._page_organizer.list_view.currentIndex().row() == 0
+
+
+def test_page_organizer_current_page_sync_preserves_multi_selection(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    document_path = create_pdf(tmp_path / "organizer-sync.pdf", 8)
+    service = FakeRenderService(create_metadata(document_path, 8))
+    view = PdfView(render_service=service, debounce_interval_ms=0)
+    _wrapper = show_view(qtbot, view)
+
+    view.open_document(document_path)
+    qtbot.waitUntil(lambda: view.page_count == 8)
+
+    view._page_organizer.set_selected_page_indexes((1, 3, 5), current_index=5)
+    view.set_page(6)
+
+    assert view.page_index == 6
+    assert view.selected_page_indexes == (1, 3, 5)
+    assert view._page_organizer.list_view.currentIndex().row() == 6
+
+
+def test_page_organizer_requests_low_resolution_thumbnail_renders(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    document_path = create_pdf(tmp_path / "organizer-thumbnails.pdf", 12)
+    service = FakeRenderService(create_metadata(document_path, 12))
+    view = PdfView(render_service=service, debounce_interval_ms=0)
+    _wrapper = show_view(qtbot, view)
+
+    view.open_document(document_path)
+    qtbot.waitUntil(lambda: view.page_count == 12)
+    qtbot.waitUntil(lambda: bool(view._page_organizer.visible_page_indexes))
+    view._request_visible_pages()
+
+    main_requests = [request for request in service.render_requests if request.priority < 10]
+    thumbnail_requests = [request for request in service.render_requests if request.priority >= 10]
+
+    assert main_requests
+    assert thumbnail_requests
+    assert all(request.logical_zoom == 0.25 for request in thumbnail_requests)
+    assert all(
+        request.page_index in view._desired_thumbnail_pages for request in thumbnail_requests
+    )
+
+
+def test_thumbnail_render_result_does_not_satisfy_main_page_placeholder(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    document_path = create_pdf(tmp_path / "thumbnail-routing.pdf", 5)
+    service = FakeRenderService(create_metadata(document_path, 5))
+    view = PdfView(render_service=service, debounce_interval_ms=0)
+    _wrapper = show_view(qtbot, view)
+
+    view.open_document(document_path)
+    qtbot.waitUntil(lambda: view.page_count == 5)
+    qtbot.waitUntil(lambda: bool(view._page_organizer.visible_page_indexes))
+    view._request_visible_pages()
+
+    main_request = next(request for request in service.render_requests if request.priority < 10)
+    thumbnail_request = next(
+        request
+        for request in service.render_requests
+        if request.priority >= 10 and request.page_index == main_request.page_index
+    )
+
+    service.render_succeeded.emit(make_render_result(thumbnail_request))
+
+    assert view._canvas.pages[main_request.page_index].state != PlaceholderState.DISPLAYED
+    assert view._page_organizer.expected_key_for_page(thumbnail_request.page_index) == (
+        thumbnail_request.cache_key
+    )
+
+
+def test_thumbnail_render_failure_is_routed_by_cache_key(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    document_path = create_pdf(tmp_path / "thumbnail-failure.pdf", 5)
+    service = FakeRenderService(create_metadata(document_path, 5))
+    view = PdfView(render_service=service, debounce_interval_ms=0)
+    _wrapper = show_view(qtbot, view)
+
+    view.open_document(document_path)
+    qtbot.waitUntil(lambda: view.page_count == 5)
+    qtbot.waitUntil(lambda: bool(view._page_organizer.visible_page_indexes))
+    view._request_visible_pages()
+
+    thumbnail_request = next(
+        request for request in service.render_requests if request.priority >= 10
+    )
+    service.render_failed.emit(make_render_failure(thumbnail_request, "thumb failed"))
+
+    assert view._page_organizer.expected_key_for_page(thumbnail_request.page_index) == (
+        thumbnail_request.cache_key
+    )
 
 
 def test_zoom_change_discards_old_generation_results(
@@ -584,9 +709,9 @@ def test_real_render_service_rerenders_after_zoom_change(qtbot: QtBot, tmp_path:
     qtbot.waitUntil(lambda: len(backend.render_calls) >= 1)
 
     view.set_zoom(2.0)
-    qtbot.waitUntil(lambda: len(backend.render_calls) >= 2)
+    qtbot.waitUntil(lambda: any(call == (0, 2.0, 0, 1.0) for call in backend.render_calls))
 
-    assert backend.render_calls[-1] == (0, 2.0, 0, 1.0)
+    assert (0, 2.0, 0, 1.0) in backend.render_calls
     assert len(factory_calls) == 1
     assert backend.close_call_count == 0
     assert threading.get_ident() not in backend.operation_thread_ids
@@ -610,9 +735,9 @@ def test_real_render_service_rerenders_after_rotation_change(
     qtbot.waitUntil(lambda: len(backend.render_calls) >= 1)
 
     view.set_rotation(90)
-    qtbot.waitUntil(lambda: len(backend.render_calls) >= 2)
+    qtbot.waitUntil(lambda: any(call == (0, 1.5, 90, 1.0) for call in backend.render_calls))
 
-    assert backend.render_calls[-1] == (0, 1.5, 90, 1.0)
+    assert (0, 1.5, 90, 1.0) in backend.render_calls
     assert len(factory_calls) == 1
     assert backend.close_call_count == 0
 

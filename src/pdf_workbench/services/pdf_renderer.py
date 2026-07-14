@@ -117,6 +117,15 @@ class RenderResult:
     cache_key: RenderCacheKey
 
 
+@dataclass(frozen=True, slots=True)
+class RenderFailure:
+    document_id: str
+    generation: int
+    page_index: int
+    cache_key: RenderCacheKey
+    message: str
+
+
 @dataclass(slots=True)
 class WorkerDocumentContext:
     backend: PdfDocumentBackend
@@ -239,7 +248,17 @@ class PdfiumDocumentBackend:
             scale = logical_zoom * device_pixel_ratio
             bitmap = page.render(scale=scale, rotation=rotation)
             pil_image = bitmap.to_pil().convert("RGBA")
-            qimage = QImage(ImageQt(pil_image)).copy()
+            try:
+                qimage = QImage(ImageQt(pil_image)).copy()
+            finally:
+                try:
+                    pil_image.close()
+                except Exception:
+                    logger.exception("Failed to close temporary PIL image after PDF render")
+                try:
+                    bitmap.close()
+                except Exception:
+                    logger.exception("Failed to close temporary PDFium bitmap after PDF render")
         finally:
             page.close()
 
@@ -424,7 +443,7 @@ class PdfRenderWorker(QObject):
     document_loaded = Signal(object, int, object)
     document_failed = Signal(object, int, str)
     render_succeeded = Signal(object)
-    render_failed = Signal(object, int, int, str)
+    render_failed = Signal(object)
     text_page_indexed = Signal(object, object, object)
     text_index_progress = Signal(object, object, int, int, int)
     text_index_completed = Signal(object, object, int, int)
@@ -712,10 +731,13 @@ class PdfRenderWorker(QObject):
         except Exception as exc:
             if self._is_request_current(next_request):
                 self.render_failed.emit(
-                    next_request.document_id,
-                    next_request.generation,
-                    next_request.page_index,
-                    str(exc),
+                    RenderFailure(
+                        document_id=next_request.document_id,
+                        generation=next_request.generation,
+                        page_index=next_request.page_index,
+                        cache_key=next_request.cache_key,
+                        message=str(exc),
+                    )
                 )
         else:
             if self._is_request_current(next_request):
@@ -830,7 +852,7 @@ class PdfRenderService(QObject):
     document_loaded = Signal(object, int, object)
     document_failed = Signal(object, int, str)
     render_succeeded = Signal(object)
-    render_failed = Signal(object, int, int, str)
+    render_failed = Signal(object)
     text_page_indexed = Signal(object, object, object)
     text_index_progress = Signal(object, object, int, int, int)
     text_index_completed = Signal(object, object, int, int)

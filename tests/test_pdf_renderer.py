@@ -15,6 +15,7 @@ from pdf_workbench.services.pdf_renderer import (
     PdfiumDocumentBackend,
     PdfRenderWorker,
     RenderCacheKey,
+    RenderFailure,
     RenderImageCache,
     RenderRequest,
     TextCharacterBox,
@@ -154,6 +155,17 @@ class BlockingBackend(FakeBackend):
     def close(self) -> None:
         self.close_call_count += 1
         super().close()
+
+
+class FailingRenderBackend(FakeBackend):
+    def render_page(
+        self,
+        page_index: int,
+        logical_zoom: float,
+        rotation: int,
+        device_pixel_ratio: float,
+    ) -> QImage:
+        raise RuntimeError(f"render failed {page_index}")
 
 
 def test_render_cache_hits_existing_entry(tmp_path: Path) -> None:
@@ -532,6 +544,7 @@ def test_generation_update_does_not_affect_other_document(tmp_path: Path) -> Non
         priority=0,
         revision=revision_b,
     )
+
     worker.enqueue_render(request_a)
     worker.enqueue_render(request_b)
 
@@ -544,6 +557,34 @@ def test_generation_update_does_not_affect_other_document(tmp_path: Path) -> Non
     worker._process_next()
 
     assert backends["b"].render_calls == [0]
+
+
+def test_render_worker_failure_includes_cache_key(tmp_path: Path) -> None:
+    cache = RenderImageCache(max_bytes=1024 * 1024)
+    backend = FailingRenderBackend("failing")
+    worker = PdfRenderWorker(lambda _path: backend, cache)
+    revision = make_revision(tmp_path)
+    path = tmp_path / "sample.pdf"
+    failures: list[RenderFailure] = []
+    worker.render_failed.connect(lambda failure: failures.append(failure))
+
+    worker.open_document("doc-1", path, 1, revision)
+    request = RenderRequest(
+        document_id="doc-1",
+        generation=1,
+        page_index=1,
+        logical_zoom=0.25,
+        rotation=90,
+        device_pixel_ratio=2.0,
+        priority=10,
+        revision=revision,
+    )
+    worker.enqueue_render(request)
+    worker._process_next()
+
+    assert len(failures) == 1
+    assert failures[0].cache_key == request.cache_key
+    assert failures[0].page_index == 1
 
 
 def test_worker_closes_backend_when_metadata_read_fails(tmp_path: Path) -> None:

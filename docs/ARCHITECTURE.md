@@ -38,6 +38,17 @@ infrastructure
 ### RenderService
 
 PDFiumを使い、ページを必要な解像度で遅延レンダリングする。現在は単一worker thread上でPDFium呼び出しを直列化し、表示領域優先キュー、隣接ページprefetch、LRUキャッシュを持つ。
+Issue #7 Phase 1では、同じdocument contextを共有したまま、main canvas用の高解像度描画とpage organizer用の低解像度サムネイル描画を別の`RenderCacheKey`で要求する。結果と失敗はpage indexだけではなくcache key単位でUIへ振り分け、main viewとthumbnail sidebarが互いの描画結果を取り違えないようにする。
+
+### PageOrganizer
+
+連続ページ表示とは別に、ページ一覧、current page marker、multi-selection、低解像度サムネイルの表示を担当する。`QListView` + model + delegateで構成し、選択中ページ集合とmain viewerのcurrent pageを分離して扱う。
+
+- 通常クリックはsingle selectionとページ移動
+- Shiftはrange selection
+- Ctrl/Commandはnon-contiguous multi-selection
+- viewer側のスクロールでcurrent pageが変わっても、organizerの既存selectionは解除しない
+- サムネイル要求はvisible rowsと隣接行だけに限定し、全文書のeager rasterizeは行わない
 
 ### CoordinateMapper
 

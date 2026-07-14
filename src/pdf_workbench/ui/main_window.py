@@ -517,26 +517,12 @@ class MainWindow(QMainWindow):
         if document is None:
             return
         document.view.set_page(document.view.page_index - 1)
-        document.session.set_navigation_state(
-            page_index=document.view.page_index,
-            zoom_factor=document.session.zoom_factor,
-        )
-        self._schedule_recovery_metadata_persist(document.session)
-        self._sync_toolbar(document)
-        self._update_status()
 
     def _next_page(self) -> None:
         document = self._current_document()
         if document is None:
             return
         document.view.set_page(document.view.page_index + 1)
-        document.session.set_navigation_state(
-            page_index=document.view.page_index,
-            zoom_factor=document.session.zoom_factor,
-        )
-        self._schedule_recovery_metadata_persist(document.session)
-        self._sync_toolbar(document)
-        self._update_status()
 
     def _change_zoom(self, multiplier: float) -> None:
         document = self._current_document()
@@ -866,13 +852,6 @@ class MainWindow(QMainWindow):
         if document is None:
             return
         document.view.set_page(page_index)
-        document.session.set_navigation_state(
-            page_index=document.view.page_index,
-            zoom_factor=document.session.zoom_factor,
-        )
-        self._schedule_recovery_metadata_persist(document.session)
-        self._sync_toolbar(document)
-        self._update_status()
 
     def _set_zoom_from_toolbar(self, zoom_factor: float) -> None:
         document = self._current_document()
@@ -1072,6 +1051,20 @@ class MainWindow(QMainWindow):
             self._sync_search_bar(document)
         self._update_status()
 
+    def _on_view_current_page_changed(self, view: PdfView, page_index: int) -> None:
+        document = next((item for item in self._documents if item.view is view), None)
+        if document is None:
+            return
+        document.session.set_navigation_state(
+            page_index=page_index,
+            zoom_factor=document.session.zoom_factor,
+        )
+        self._schedule_recovery_metadata_persist(document.session)
+        current_document = self._current_document()
+        if current_document is not None and current_document.view is view:
+            self._sync_toolbar(document)
+            self._update_status()
+
     def _on_source_status_changed(self, session_id: str, result: object) -> None:
         if not isinstance(result, SourceCheckResult):
             return
@@ -1235,6 +1228,9 @@ class MainWindow(QMainWindow):
             view.document_loaded.connect(
                 apply_restored_page,
                 Qt.ConnectionType.SingleShotConnection,
+            )
+            view.current_page_changed.connect(
+                lambda page_index: self._on_view_current_page_changed(view, page_index)
             )
             view.open_document(session.document_path)
             if view.page_count > 0:
