@@ -61,6 +61,11 @@ _MAX_USER_ZOOM = 5.0
 _BASE_RENDER_SCALE = 1.5
 _MIN_LOGICAL_ZOOM = _BASE_RENDER_SCALE * _MIN_USER_ZOOM
 _MAX_LOGICAL_ZOOM = _BASE_RENDER_SCALE * _MAX_USER_ZOOM
+_THUMBNAIL_TARGET_WIDTH = 140.0
+_THUMBNAIL_TARGET_HEIGHT = 182.0
+_THUMBNAIL_MAX_LOGICAL_ZOOM = 0.25
+_THUMBNAIL_PRIORITY_VISIBLE = 10
+_THUMBNAIL_PRIORITY_PREFETCH = 11
 _MATCH_COLOR = QColor(255, 214, 51, 120)
 _CURRENT_MATCH_COLOR = QColor(255, 167, 38, 160)
 _SELECTION_COLOR = QColor(33, 150, 243, 96)
@@ -402,7 +407,6 @@ class PdfView(QWidget):
         self._closed = False
         self._desired_pages: set[int] = set()
         self._expected_main_render_keys: dict[int, RenderCacheKey] = {}
-        self._desired_thumbnail_pages: tuple[int, ...] = ()
         self._text_indexes: dict[int, PageTextIndex] = {}
         self._search_query: str = ""
         self._search_matches: list[SearchMatch] = []
@@ -520,7 +524,6 @@ class PdfView(QWidget):
         self._set_current_page_index(0, emit=False)
         self._metadata = None
         self._desired_pages.clear()
-        self._desired_thumbnail_pages = ()
         self._expected_main_render_keys.clear()
         self._page_organizer.clear()
         self._clear_text_state(clear_query=True)
@@ -567,8 +570,7 @@ class PdfView(QWidget):
         self._logical_zoom = max(_MIN_LOGICAL_ZOOM, min(scale, _MAX_LOGICAL_ZOOM))
         self._desired_pages.clear()
         self._expected_main_render_keys.clear()
-        self._desired_thumbnail_pages = ()
-        self._page_organizer.clear_thumbnails_except(set())
+        self._page_organizer.set_desired_thumbnail_pages(())
         self._advance_render_generation()
         for index, page in enumerate(self._canvas.pages):
             page.configure(
@@ -580,6 +582,7 @@ class PdfView(QWidget):
             page.clear_pixmap("待機中")
         self._content.adjustSize()
         self._schedule_visible_page_update()
+        self._page_organizer.schedule_visible_thumbnail_update(force=True)
         self.state_changed.emit()
 
     def set_rotation(self, rotation: int) -> None:
@@ -592,8 +595,7 @@ class PdfView(QWidget):
             return
         self._desired_pages.clear()
         self._expected_main_render_keys.clear()
-        self._desired_thumbnail_pages = ()
-        self._page_organizer.clear_thumbnails_except(set())
+        self._page_organizer.set_desired_thumbnail_pages(())
         self._advance_render_generation()
         for index, page in enumerate(self._canvas.pages):
             page.configure(
@@ -605,6 +607,7 @@ class PdfView(QWidget):
             page.clear_pixmap("待機中")
         self._content.adjustSize()
         self._schedule_visible_page_update()
+        self._page_organizer.schedule_visible_thumbnail_update(force=True)
         self.state_changed.emit()
 
     def set_search_overlay_inset(self, inset: int) -> None:
@@ -629,7 +632,6 @@ class PdfView(QWidget):
             return
         self._path = None
         self._desired_pages.clear()
-        self._desired_thumbnail_pages = ()
         self._expected_main_render_keys.clear()
         self._page_organizer.clear()
         self._clear_text_state(clear_query=True)
@@ -685,13 +687,15 @@ class PdfView(QWidget):
             page.mouse_selection_finished.connect(self._finish_selection)
         self._canvas.set_pages(pages)
         self._page_organizer.set_document(metadata.pages)
-        self._set_current_page_index(0)
+        self._set_current_page_index(0, emit=False)
         self._status_label.hide()
         self._canvas.show()
         self._content.adjustSize()
         self._schedule_visible_page_update()
+        self._page_organizer.schedule_visible_thumbnail_update(force=True)
         self._refresh_page_overlays()
         self.document_loaded.emit()
+        self.current_page_changed.emit(self._current_page_index)
         self.state_changed.emit()
 
     def _on_document_failed(self, document_id: object, generation: int, message: str) -> None:
@@ -1270,6 +1274,7 @@ class PdfView(QWidget):
 
         requests = self._visible_page_requests()
         if not requests:
+            self._page_organizer.set_desired_thumbnail_pages(())
             return
         self._desired_pages = {request.page_index for request in requests}
         self._expected_main_render_keys = {
@@ -1394,6 +1399,11 @@ class PdfView(QWidget):
         self._generation += 1
 
     def _set_current_page_index(self, page_index: int, *, emit: bool = True) -> bool:
+        if self._metadata is None:
+            if page_index != 0:
+                raise ValueError("page index must be zero before document metadata is available")
+        elif not 0 <= page_index < self.page_count:
+            raise ValueError("page index is out of range")
         if page_index == self._current_page_index:
             return False
         self._current_page_index = page_index
@@ -1410,44 +1420,73 @@ class PdfView(QWidget):
     def _on_visible_thumbnail_pages_changed(self, page_indexes: object) -> None:
         if not isinstance(page_indexes, tuple):
             return
-        self._desired_thumbnail_pages = tuple(
-            page_index for page_index in page_indexes if 0 <= page_index < self.page_count
-        )
+        desired_page_indexes = self._page_organizer.set_desired_thumbnail_pages(page_indexes)
         if self._metadata is None or self._path is None:
             return
-        self._request_visible_thumbnails(self._metadata.revision)
+        if desired_page_indexes:
+            self._request_visible_thumbnails(self._metadata.revision)
 
     def _request_visible_thumbnails(self, revision: DocumentRevision) -> None:
-        if self._metadata is None or not self._desired_thumbnail_pages:
+        if self._metadata is None:
             return
-        requested = set(self._desired_thumbnail_pages)
+        desired_page_indexes = self._page_organizer.desired_thumbnail_pages
+        if not desired_page_indexes:
+            return
         visible_pages = set(self._page_organizer.visible_page_indexes)
-        self._page_organizer.clear_thumbnails_except(requested)
-        for offset, page_index in enumerate(self._desired_thumbnail_pages):
+        for offset, page_index in enumerate(desired_page_indexes):
+            logical_zoom = self._thumbnail_logical_zoom(page_index)
             cache_key = RenderCacheKey(
                 revision=revision,
                 page_index=page_index,
-                logical_zoom=0.25,
+                logical_zoom=logical_zoom,
                 rotation=self._rotation,
                 device_pixel_ratio=self.devicePixelRatioF(),
             )
-            self._page_organizer.set_thumbnail_requested(
+            needs_request = self._page_organizer.prepare_thumbnail_request(
                 page_index,
                 cache_key,
                 rendering=offset == 0,
             )
+            if not needs_request:
+                continue
             self._render_service.request_render(
                 RenderRequest(
                     document_id=self._document_id,
                     generation=self._generation,
                     page_index=page_index,
-                    logical_zoom=0.25,
+                    logical_zoom=logical_zoom,
                     rotation=self._rotation,
                     device_pixel_ratio=self.devicePixelRatioF(),
-                    priority=10 if page_index in visible_pages else 11,
+                    priority=(
+                        _THUMBNAIL_PRIORITY_VISIBLE
+                        if page_index in visible_pages
+                        else _THUMBNAIL_PRIORITY_PREFETCH
+                    ),
                     revision=revision,
                 )
             )
+
+    def _thumbnail_logical_zoom(self, page_index: int) -> float:
+        if self._metadata is None:
+            return _THUMBNAIL_MAX_LOGICAL_ZOOM
+        metadata = self._metadata.pages[page_index]
+        mapper = PageCoordinateMapper(
+            geometry=metadata.geometry,
+            additional_rotation=self._rotation,
+            logical_zoom=1.0,
+            device_pixel_ratio=1.0,
+        )
+        base_size = mapper.view_size
+        width = max(1.0, base_size.width())
+        height = max(1.0, base_size.height())
+        logical_zoom = min(
+            _THUMBNAIL_MAX_LOGICAL_ZOOM,
+            _THUMBNAIL_TARGET_WIDTH / width,
+            _THUMBNAIL_TARGET_HEIGHT / height,
+        )
+        if not math.isfinite(logical_zoom) or logical_zoom <= 0:
+            return _THUMBNAIL_MAX_LOGICAL_ZOOM
+        return logical_zoom
 
     def _clear_text_state(self, *, clear_query: bool) -> None:
         self._release_mouse_grab()

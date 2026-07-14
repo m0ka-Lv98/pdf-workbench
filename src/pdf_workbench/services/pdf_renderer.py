@@ -244,26 +244,33 @@ class PdfiumDocumentBackend:
             raise ValueError("rotation must be one of 0, 90, 180, 270")
 
         page = self._document[page_index]
+        bitmap: Any | None = None
+        source_image: Any | None = None
+        rgba_image: Any | None = None
         try:
             scale = logical_zoom * device_pixel_ratio
             bitmap = page.render(scale=scale, rotation=rotation)
-            pil_image = bitmap.to_pil().convert("RGBA")
-            try:
-                qimage = QImage(ImageQt(pil_image)).copy()
-            finally:
-                try:
-                    pil_image.close()
-                except Exception:
-                    logger.exception("Failed to close temporary PIL image after PDF render")
-                try:
-                    bitmap.close()
-                except Exception:
-                    logger.exception("Failed to close temporary PDFium bitmap after PDF render")
+            source_image = bitmap.to_pil()
+            rgba_image = source_image.convert("RGBA")
+            qimage = QImage(ImageQt(rgba_image)).copy()
         finally:
-            page.close()
+            self._close_render_resource(rgba_image, "temporary RGBA PIL image")
+            self._close_render_resource(source_image, "temporary source PIL image")
+            self._close_render_resource(bitmap, "temporary PDFium bitmap")
+            self._close_render_resource(page, "PDFium page")
 
         qimage.setDevicePixelRatio(device_pixel_ratio)
         return qimage
+
+    @staticmethod
+    def _close_render_resource(resource: object | None, label: str) -> None:
+        if resource is None:
+            return
+        try:
+            close = resource.close  # type: ignore[attr-defined]
+            close()
+        except Exception:
+            logger.exception("Failed to close %s after PDF render", label)
 
     def extract_text_page(
         self,

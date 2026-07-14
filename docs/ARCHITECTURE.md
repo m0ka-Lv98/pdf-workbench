@@ -49,6 +49,10 @@ Issue #7 Phase 1では、同じdocument contextを共有したまま、main canv
 - Ctrl/Commandはnon-contiguous multi-selection
 - viewer側のスクロールでcurrent pageが変わっても、organizerの既存selectionは解除しない
 - サムネイル要求はvisible rowsと隣接行だけに限定し、全文書のeager rasterizeは行わない
+- thumbnail logical zoomはpage geometryとtarget rectangleから算出し、main canvasとは別の`RenderCacheKey`で管理する
+- desired thumbnail pagesとexpected cache keysを一体で保持し、generation変更後はvisible rowsを明示的に再通知する
+- desired外になったページへ遅れて届いたsuccess/failureは捨て、Phase 1のselection変更はdirty stateや`CommandHistory`へ影響させない
+- PDFium bitmap、`to_pil()`のsource image、RGBA conversion imageは明示的にcloseし、cleanup failureはbest effortでログ化する
 
 ### CoordinateMapper
 

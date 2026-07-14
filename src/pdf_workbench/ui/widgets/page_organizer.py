@@ -125,10 +125,11 @@ class PageOrganizerModel(QAbstractListModel):
         entry = self._entries[page_index]
         entry.state = state
         entry.message = message
+        entry.image = None
         self.dataChanged.emit(
             self.index(page_index),
             self.index(page_index),
-            [_OrganizerRoles.THUMBNAIL_STATE, _OrganizerRoles.MESSAGE],
+            [_OrganizerRoles.THUMBNAIL, _OrganizerRoles.THUMBNAIL_STATE, _OrganizerRoles.MESSAGE],
         )
 
     def set_thumbnail_image(self, page_index: int, image: QImage) -> None:
@@ -179,6 +180,7 @@ class PageOrganizerListView(QListView):
         self._visible_timer.timeout.connect(self._emit_visible_pages)
         self.verticalScrollBar().valueChanged.connect(self._schedule_visible_pages)
         self._visible_rows: tuple[int, ...] = ()
+        self._last_emitted_pages: tuple[int, ...] | None = None
 
     def setModel(self, model: QAbstractItemModel | None) -> None:
         previous = self.selectionModel()
@@ -189,7 +191,7 @@ class PageOrganizerListView(QListView):
         current = self.selectionModel()
         if current is not None:
             current.currentChanged.connect(self._on_current_changed)
-        self._schedule_visible_pages()
+        self.schedule_visible_thumbnail_update(force=True)
 
     def selectionCommand(
         self,
@@ -226,10 +228,15 @@ class PageOrganizerListView(QListView):
     def _schedule_visible_pages(self) -> None:
         self._visible_timer.start()
 
+    def schedule_visible_thumbnail_update(self, *, force: bool = False) -> None:
+        if force:
+            self._last_emitted_pages = None
+        self._schedule_visible_pages()
+
     def _emit_visible_pages(self) -> None:
         model = self.model()
         if model is None:
-            self.visible_thumbnail_pages_changed.emit(())
+            self._emit_if_changed(())
             return
         visible: list[int] = []
         for row in range(model.rowCount()):
@@ -238,7 +245,7 @@ class PageOrganizerListView(QListView):
                 visible.append(row)
         if not visible:
             self._visible_rows = ()
-            self.visible_thumbnail_pages_changed.emit(())
+            self._emit_if_changed(())
             return
         self._visible_rows = tuple(visible)
         prefetch: set[int] = set(visible)
@@ -247,7 +254,13 @@ class PageOrganizerListView(QListView):
                 prefetch.add(visible[0] - offset)
             if visible[-1] + offset < model.rowCount():
                 prefetch.add(visible[-1] + offset)
-        self.visible_thumbnail_pages_changed.emit(tuple(sorted(prefetch)))
+        self._emit_if_changed(tuple(sorted(prefetch)))
+
+    def _emit_if_changed(self, page_indexes: tuple[int, ...]) -> None:
+        if self._last_emitted_pages == page_indexes:
+            return
+        self._last_emitted_pages = page_indexes
+        self.visible_thumbnail_pages_changed.emit(page_indexes)
 
     @property
     def visible_rows(self) -> tuple[int, ...]:
@@ -376,6 +389,14 @@ class ThumbnailImageCache:
         self._items.clear()
         self._total_bytes = 0
 
+    @property
+    def item_count(self) -> int:
+        return len(self._items)
+
+    @property
+    def total_bytes(self) -> int:
+        return self._total_bytes
+
 
 class PageOrganizer(QWidget):
     page_requested = Signal(int)
@@ -417,6 +438,7 @@ class PageOrganizer(QWidget):
         self._selection_guard = False
         self._current_page_index = 0
         self._selected_page_indexes: tuple[int, ...] = ()
+        self._desired_page_indexes: frozenset[int] = frozenset()
         self._expected_keys: dict[int, RenderCacheKey] = {}
         self._thumbnail_cache = ThumbnailImageCache()
 
@@ -438,7 +460,49 @@ class PageOrganizer(QWidget):
     def selected_page_indexes(self) -> tuple[int, ...]:
         return self._selected_page_indexes
 
+    @property
+    def current_page_index(self) -> int:
+        return self._current_page_index
+
+    @property
+    def row_count(self) -> int:
+        return self._model.rowCount()
+
+    @property
+    def desired_thumbnail_pages(self) -> tuple[int, ...]:
+        return tuple(sorted(self._desired_page_indexes))
+
+    @property
+    def expected_key_count(self) -> int:
+        return len(self._expected_keys)
+
+    @property
+    def thumbnail_cache_item_count(self) -> int:
+        return self._thumbnail_cache.item_count
+
+    @property
+    def thumbnail_cache_total_bytes(self) -> int:
+        return self._thumbnail_cache.total_bytes
+
+    def page_display_text(self, page_index: int) -> str:
+        model_index = self._model.index(page_index)
+        return str(model_index.data(Qt.ItemDataRole.DisplayRole) or "")
+
+    def thumbnail_state(self, page_index: int) -> str:
+        model_index = self._model.index(page_index)
+        return str(model_index.data(_OrganizerRoles.THUMBNAIL_STATE) or "")
+
+    def thumbnail_message(self, page_index: int) -> str:
+        model_index = self._model.index(page_index)
+        return str(model_index.data(_OrganizerRoles.MESSAGE) or "")
+
+    def has_thumbnail_image(self, page_index: int) -> bool:
+        model_index = self._model.index(page_index)
+        return isinstance(model_index.data(_OrganizerRoles.THUMBNAIL), QImage)
+
     def set_document(self, pages: tuple[PageMetadata, ...]) -> None:
+        previous_selection = self._selected_page_indexes
+        self._desired_page_indexes = frozenset()
         self._expected_keys.clear()
         self._thumbnail_cache.clear()
         self._model.set_entries(pages)
@@ -449,14 +513,22 @@ class PageOrganizer(QWidget):
             self.set_selected_page_indexes((0,), current_index=0)
         else:
             self._selected_page_indexes = ()
+            if previous_selection:
+                self.page_selection_changed.emit(())
+        self._list.schedule_visible_thumbnail_update(force=True)
 
     def clear(self) -> None:
+        previous_selection = self._selected_page_indexes
+        self._desired_page_indexes = frozenset()
         self._expected_keys.clear()
         self._thumbnail_cache.clear()
         self._current_page_index = 0
         self._selected_page_indexes = ()
         self._count.setText("0")
         self._model.clear()
+        if previous_selection:
+            self.page_selection_changed.emit(())
+        self._list.schedule_visible_thumbnail_update(force=True)
 
     def set_current_page(self, page_index: int) -> None:
         if self._model.rowCount() == 0 or not 0 <= page_index < self._model.rowCount():
@@ -483,15 +555,32 @@ class PageOrganizer(QWidget):
     ) -> None:
         if self._list.selectionModel() is None:
             return
+        valid_indexes = tuple(
+            sorted(
+                {
+                    page_index
+                    for page_index in page_indexes
+                    if 0 <= page_index < self._model.rowCount()
+                }
+            )
+        )
+        if current_index is not None and not 0 <= current_index < self._model.rowCount():
+            current_index = None
+        if current_index is None:
+            if valid_indexes:
+                current_index = valid_indexes[-1]
+            elif (
+                self._model.rowCount() > 0
+                and 0 <= self._current_page_index < self._model.rowCount()
+            ):
+                current_index = self._current_page_index
         self._selection_guard = True
         try:
             self._list.clearSelection()
-            if current_index is None and page_indexes:
-                current_index = page_indexes[-1]
             flags = (
                 QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows
             )
-            for page_index in page_indexes:
+            for page_index in valid_indexes:
                 model_index = self._model.index(page_index)
                 if model_index.isValid():
                     self._list.selectionModel().select(model_index, flags)
@@ -504,31 +593,70 @@ class PageOrganizer(QWidget):
                     )
         finally:
             self._selection_guard = False
-        self._selected_page_indexes = tuple(sorted(dict.fromkeys(page_indexes)))
+        self._selected_page_indexes = valid_indexes
         self.page_selection_changed.emit(self._selected_page_indexes)
 
-    def set_thumbnail_requested(
+    def schedule_visible_thumbnail_update(self, *, force: bool = False) -> None:
+        self._list.schedule_visible_thumbnail_update(force=force)
+
+    def set_desired_thumbnail_pages(self, page_indexes: tuple[int, ...]) -> tuple[int, ...]:
+        valid_indexes = tuple(
+            sorted(
+                {
+                    page_index
+                    for page_index in page_indexes
+                    if 0 <= page_index < self._model.rowCount()
+                }
+            )
+        )
+        self._desired_page_indexes = frozenset(valid_indexes)
+        for page_index in list(self._expected_keys):
+            if page_index not in self._desired_page_indexes:
+                self._expected_keys.pop(page_index, None)
+                self._model.clear_thumbnail(page_index)
+        for page_index in range(self._model.rowCount()):
+            if page_index not in self._desired_page_indexes:
+                self._model.clear_thumbnail(page_index)
+        return valid_indexes
+
+    def prepare_thumbnail_request(
         self,
         page_index: int,
         key: RenderCacheKey,
         *,
         rendering: bool,
-    ) -> None:
+    ) -> bool:
+        if page_index not in self._desired_page_indexes:
+            return False
+        if not 0 <= page_index < self._model.rowCount():
+            return False
+        expected_key = self._expected_keys.get(page_index)
+        current_state = self._model.data(
+            self._model.index(page_index),
+            _OrganizerRoles.THUMBNAIL_STATE,
+        )
+        if expected_key == key and current_state in {"queued", "rendering", "displayed"}:
+            return False
         self._expected_keys[page_index] = key
         cached = self._thumbnail_cache.get(key)
         if cached is not None:
             self._model.set_thumbnail_image(page_index, cached)
-            return
+            return False
         self._model.set_thumbnail_state(
             page_index,
             "rendering" if rendering else "queued",
             "サムネイル生成中" if rendering else "サムネイル待機中",
         )
+        return True
 
     def expected_key_for_page(self, page_index: int) -> RenderCacheKey | None:
         return self._expected_keys.get(page_index)
 
     def apply_thumbnail(self, page_index: int, key: RenderCacheKey, image: QImage) -> bool:
+        if page_index not in self._desired_page_indexes:
+            return False
+        if not 0 <= page_index < self._model.rowCount():
+            return False
         if self._expected_keys.get(page_index) != key:
             return False
         evicted = self._thumbnail_cache.put(key, image)
@@ -538,15 +666,14 @@ class PageOrganizer(QWidget):
         return True
 
     def apply_thumbnail_failure(self, page_index: int, key: RenderCacheKey, message: str) -> bool:
+        if page_index not in self._desired_page_indexes:
+            return False
+        if not 0 <= page_index < self._model.rowCount():
+            return False
         if self._expected_keys.get(page_index) != key:
             return False
         self._model.set_thumbnail_state(page_index, "error", message)
         return True
-
-    def clear_thumbnails_except(self, page_indexes: set[int]) -> None:
-        for page_index in range(self._model.rowCount()):
-            if page_index not in page_indexes:
-                self._model.clear_thumbnail(page_index)
 
     def _clear_page_for_key(self, key: RenderCacheKey) -> None:
         for page_index, expected_key in self._expected_keys.items():
