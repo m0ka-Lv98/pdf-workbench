@@ -1,0 +1,436 @@
+{
+  "schema_version": 1,
+  "fixtures": [
+    {
+      "file": "digital-basic.pdf",
+      "sha256": "b47583b5c0a9913cac490d976845197dac127aa1e01717870d9d125674b54263",
+      "purpose": "normal digitally generated PDF",
+      "provenance": {
+        "kind": "generated-in-repository",
+        "generator": "scripts/generate_compatibility_fixtures.py",
+        "license": "MIT",
+        "font": {
+          "family": "Noto Sans CJK JP",
+          "file_name": "NotoSansCJKjp-Regular.otf",
+          "version": "2.004",
+          "source": "https://github.com/notofonts/noto-cjk/tree/main/Sans",
+          "license": "SIL Open Font License 1.1",
+          "sha256": "68a3fc98800b2a27b371f2fb79991daf3633bd89309d4ffaa6946fd587f375b5"
+        }
+      },
+      "expected": {
+        "page_count": 2,
+        "pages": [
+          {
+            "media_box": [
+              0.0,
+              0.0,
+              612.0,
+              792.0
+            ],
+            "crop_box": [
+              0.0,
+              0.0,
+              612.0,
+              792.0
+            ],
+            "visible_box": [
+              0.0,
+              0.0,
+              612.0,
+              792.0
+            ],
+            "rotation": 0,
+            "annotation_subtypes": [],
+            "annotations": []
+          },
+          {
+            "media_box": [
+              0.0,
+              0.0,
+              612.0,
+              792.0
+            ],
+            "crop_box": [
+              0.0,
+              0.0,
+              612.0,
+              792.0
+            ],
+            "visible_box": [
+              0.0,
+              0.0,
+              612.0,
+              792.0
+            ],
+            "rotation": 0,
+            "annotation_subtypes": [],
+            "annotations": []
+          }
+        ],
+        "text_contains": [],
+        "content_bearing": true
+      }
+    },
+    {
+      "file": "english-text.pdf",
+      "sha256": "6f2fc1068aad43e3243795bf6fbe323fe62bd465c5919d7fcb8d084a1710e2c4",
+      "purpose": "extractable English text",
+      "provenance": {
+        "kind": "generated-in-repository",
+        "generator": "scripts/generate_compatibility_fixtures.py",
+        "license": "MIT",
+        "font": {
+          "family": "Noto Sans CJK JP",
+          "file_name": "NotoSansCJKjp-Regular.otf",
+          "version": "2.004",
+          "source": "https://github.com/notofonts/noto-cjk/tree/main/Sans",
+          "license": "SIL Open Font License 1.1",
+          "sha256": "68a3fc98800b2a27b371f2fb79991daf3633bd89309d4ffaa6946fd587f375b5"
+        }
+      },
+      "expected": {
+        "page_count": 1,
+        "pages": [
+          {
+            "media_box": [
+              0.0,
+              0.0,
+              400.0,
+              300.0
+            ],
+            "crop_box": [
+              0.0,
+              0.0,
+              400.0,
+              300.0
+            ],
+            "visible_box": [
+              0.0,
+              0.0,
+              400.0,
+              300.0
+            ],
+            "rotation": 0,
+            "annotation_subtypes": [],
+            "annotations": []
+          }
+        ],
+        "text_contains": [
+          "PDF Workbench English compatibility fixture"
+        ],
+        "content_bearing": true
+      }
+    },
+    {
+      "file": "japanese-text.pdf",
+      "sha256": "b607dec17b7b3a30da0c1b96aa1beccf34ab4176af7642bf1e59a15079051641",
+      "purpose": "extractable horizontal Japanese text",
+      "provenance": {
+        "kind": "generated-in-repository",
+        "generator": "scripts/generate_compatibility_fixtures.py",
+        "license": "MIT",
+        "font": {
+          "family": "Noto Sans CJK JP",
+          "file_name": "NotoSansCJKjp-Regular.otf",
+          "version": "2.004",
+          "source": "https://github.com/notofonts/noto-cjk/tree/main/Sans",
+          "license": "SIL Open Font License 1.1",
+          "sha256": "68a3fc98800b2a27b371f2fb79991daf3633bd89309d4ffaa6946fd587f375b5"
+        }
+      },
+      "expected": {
+        "page_count": 1,
+        "pages": [
+          {
+            "media_box": [
+              0.0,
+              0.0,
+              400.0,
+              300.0
+            ],
+            "crop_box": [
+              0.0,
+              0.0,
+              400.0,
+              300.0
+            ],
+            "visible_box": [
+              0.0,
+              0.0,
+              400.0,
+              300.0
+            ],
+            "rotation": 0,
+            "annotation_subtypes": [],
+            "annotations": []
+          }
+        ],
+        "text_contains": [
+          "PDFワークベンチ 日本語互換性テスト"
+        ],
+        "content_bearing": true
+      }
+    },
+    {
+      "file": "page-boxes.pdf",
+      "sha256": "07fd1648ee95e78ff0d4279cda83cfeb34b6d5673f487a84c89553814d9d1452",
+      "purpose": "MediaBox and CropBox coverage",
+      "provenance": {
+        "kind": "generated-in-repository",
+        "generator": "scripts/generate_compatibility_fixtures.py",
+        "license": "MIT",
+        "font": {
+          "family": "Noto Sans CJK JP",
+          "file_name": "NotoSansCJKjp-Regular.otf",
+          "version": "2.004",
+          "source": "https://github.com/notofonts/noto-cjk/tree/main/Sans",
+          "license": "SIL Open Font License 1.1",
+          "sha256": "68a3fc98800b2a27b371f2fb79991daf3633bd89309d4ffaa6946fd587f375b5"
+        }
+      },
+      "expected": {
+        "page_count": 2,
+        "pages": [
+          {
+            "media_box": [
+              0.0,
+              0.0,
+              612.0,
+              792.0
+            ],
+            "crop_box": [
+              36.0,
+              72.0,
+              576.0,
+              720.0
+            ],
+            "visible_box": [
+              36.0,
+              72.0,
+              576.0,
+              720.0
+            ],
+            "rotation": 0,
+            "annotation_subtypes": [],
+            "annotations": []
+          },
+          {
+            "media_box": [
+              -20.0,
+              -10.0,
+              580.0,
+              790.0
+            ],
+            "crop_box": [
+              50.0,
+              100.0,
+              450.0,
+              700.0
+            ],
+            "visible_box": [
+              50.0,
+              100.0,
+              450.0,
+              700.0
+            ],
+            "rotation": 0,
+            "annotation_subtypes": [],
+            "annotations": []
+          }
+        ],
+        "text_contains": [],
+        "content_bearing": true
+      }
+    },
+    {
+      "file": "rotations.pdf",
+      "sha256": "36a0a4be017f7be5ad6d4b42ca0aa34d801d68dfefba6eb4d826fbdfbb8418d4",
+      "purpose": "intrinsic rotation coverage",
+      "provenance": {
+        "kind": "generated-in-repository",
+        "generator": "scripts/generate_compatibility_fixtures.py",
+        "license": "MIT",
+        "font": {
+          "family": "Noto Sans CJK JP",
+          "file_name": "NotoSansCJKjp-Regular.otf",
+          "version": "2.004",
+          "source": "https://github.com/notofonts/noto-cjk/tree/main/Sans",
+          "license": "SIL Open Font License 1.1",
+          "sha256": "68a3fc98800b2a27b371f2fb79991daf3633bd89309d4ffaa6946fd587f375b5"
+        }
+      },
+      "expected": {
+        "page_count": 4,
+        "pages": [
+          {
+            "media_box": [
+              0.0,
+              0.0,
+              420.0,
+              300.0
+            ],
+            "crop_box": [
+              0.0,
+              0.0,
+              420.0,
+              300.0
+            ],
+            "visible_box": [
+              0.0,
+              0.0,
+              420.0,
+              300.0
+            ],
+            "rotation": 0,
+            "annotation_subtypes": [],
+            "annotations": []
+          },
+          {
+            "media_box": [
+              0.0,
+              0.0,
+              420.0,
+              300.0
+            ],
+            "crop_box": [
+              0.0,
+              0.0,
+              420.0,
+              300.0
+            ],
+            "visible_box": [
+              0.0,
+              0.0,
+              420.0,
+              300.0
+            ],
+            "rotation": 90,
+            "annotation_subtypes": [],
+            "annotations": []
+          },
+          {
+            "media_box": [
+              0.0,
+              0.0,
+              420.0,
+              300.0
+            ],
+            "crop_box": [
+              0.0,
+              0.0,
+              420.0,
+              300.0
+            ],
+            "visible_box": [
+              0.0,
+              0.0,
+              420.0,
+              300.0
+            ],
+            "rotation": 180,
+            "annotation_subtypes": [],
+            "annotations": []
+          },
+          {
+            "media_box": [
+              0.0,
+              0.0,
+              420.0,
+              300.0
+            ],
+            "crop_box": [
+              0.0,
+              0.0,
+              420.0,
+              300.0
+            ],
+            "visible_box": [
+              0.0,
+              0.0,
+              420.0,
+              300.0
+            ],
+            "rotation": 270,
+            "annotation_subtypes": [],
+            "annotations": []
+          }
+        ],
+        "text_contains": [],
+        "content_bearing": true
+      }
+    },
+    {
+      "file": "annotations.pdf",
+      "sha256": "1205c3f5f3c39ec1965377050794d9a9afa872811f3430b7a4a247782ef75415",
+      "purpose": "annotation preservation coverage",
+      "provenance": {
+        "kind": "generated-in-repository",
+        "generator": "scripts/generate_compatibility_fixtures.py",
+        "license": "MIT",
+        "font": {
+          "family": "Noto Sans CJK JP",
+          "file_name": "NotoSansCJKjp-Regular.otf",
+          "version": "2.004",
+          "source": "https://github.com/notofonts/noto-cjk/tree/main/Sans",
+          "license": "SIL Open Font License 1.1",
+          "sha256": "68a3fc98800b2a27b371f2fb79991daf3633bd89309d4ffaa6946fd587f375b5"
+        }
+      },
+      "expected": {
+        "page_count": 1,
+        "pages": [
+          {
+            "media_box": [
+              0.0,
+              0.0,
+              400.0,
+              400.0
+            ],
+            "crop_box": [
+              0.0,
+              0.0,
+              400.0,
+              400.0
+            ],
+            "visible_box": [
+              0.0,
+              0.0,
+              400.0,
+              400.0
+            ],
+            "rotation": 0,
+            "annotation_subtypes": [
+              "/Text",
+              "/Square"
+            ],
+            "annotations": [
+              {
+                "subtype": "/Text",
+                "rect": [
+                  60.0,
+                  250.0,
+                  90.0,
+                  280.0
+                ],
+                "has_appearance": false
+              },
+              {
+                "subtype": "/Square",
+                "rect": [
+                  100.0,
+                  130.0,
+                  280.0,
+                  220.0
+                ],
+                "has_appearance": false
+              }
+            ]
+          }
+        ],
+        "text_contains": [],
+        "content_bearing": true
+      }
+    }
+  ]
+}

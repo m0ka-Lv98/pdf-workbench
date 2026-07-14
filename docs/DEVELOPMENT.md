@@ -49,6 +49,24 @@ mypy src/pdf_workbench
 pytest --cov=pdf_workbench
 ```
 
+PDF を書き換える PR では、`tests/fixtures/compatibility/` の互換性 corpus を使った回帰確認を追加する。corpus は committed static fixture を正本とし、通常の test / CI 実行中には再生成しない。fixture を更新する場合だけ `scripts/generate_compatibility_fixtures.py` を手動実行し、`manifest.json` の provenance と expectation を更新する。
+
+日本語 text fixture を追加・更新する場合は、redistributable font の出典、version、license、取得 font file の SHA-256 を `tests/fixtures/compatibility/manifest.json` と `tests/fixtures/compatibility/README.md` に記録する。
+
+PDF-writing PR の最低限の回帰チェック:
+
+- pikepdf で構造再オープン
+- page count と page order
+- MediaBox、CropBox、visible box
+- intrinsic rotation
+- PDFium で全対象ページを再オープン・描画
+- relevant annotation subtype、rectangle、appearance の保存
+- relevant English/Japanese text の抽出
+- source と round-trip output の platform-neutral visual comparison
+- byte equality は要求しない
+- fixture 追加・更新時は provenance、license、SHA-256、manifest expectation を更新
+- Phase A では物理実機、Acrobat、Edge、Chrome による手動確認を要求しない
+
 ## ブランチ
 
 - `main`: 常に起動可能
