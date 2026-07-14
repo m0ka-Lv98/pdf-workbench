@@ -298,12 +298,12 @@ class MainWindow(QMainWindow):
         self.undo_action = QAction("元に戻す", self)
         self.undo_action.setShortcut(QKeySequence.StandardKey.Undo)
         self.undo_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
-        self.undo_action.triggered.connect(self._undo_current_command)
+        self.undo_action.triggered.connect(self._trigger_undo)
 
         self.redo_action = QAction("やり直す", self)
         self.redo_action.setShortcut(QKeySequence.StandardKey.Redo)
         self.redo_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
-        self.redo_action.triggered.connect(self._redo_current_command)
+        self.redo_action.triggered.connect(self._trigger_redo)
 
         self.save_as_action = QAction("名前を付けて保存", self)
         self.save_as_action.setShortcut(QKeySequence.StandardKey.SaveAs)
@@ -614,7 +614,7 @@ class MainWindow(QMainWindow):
 
     def execute_document_command(self, command: DocumentCommand) -> bool:
         document = self._current_document()
-        if document is None:
+        if document is None or document.session.is_saving:
             return False
         try:
             change = document.command_history.execute(command)
@@ -629,9 +629,23 @@ class MainWindow(QMainWindow):
         )
         return True
 
+    def _trigger_undo(self) -> bool:
+        focus_widget = QApplication.focusWidget()
+        if isinstance(focus_widget, QLineEdit) and focus_widget.isUndoAvailable():
+            focus_widget.undo()
+            return True
+        return self._undo_current_command()
+
+    def _trigger_redo(self) -> bool:
+        focus_widget = QApplication.focusWidget()
+        if isinstance(focus_widget, QLineEdit) and focus_widget.isRedoAvailable():
+            focus_widget.redo()
+            return True
+        return self._redo_current_command()
+
     def _undo_current_command(self) -> bool:
         document = self._current_document()
-        if document is None or not document.command_history.can_undo:
+        if document is None or document.session.is_saving or not document.command_history.can_undo:
             return False
         description = document.command_history.undo_description
         if description is None:
@@ -651,7 +665,7 @@ class MainWindow(QMainWindow):
 
     def _redo_current_command(self) -> bool:
         document = self._current_document()
-        if document is None or not document.command_history.can_redo:
+        if document is None or document.session.is_saving or not document.command_history.can_redo:
             return False
         description = document.command_history.redo_description
         if description is None:
@@ -769,9 +783,9 @@ class MainWindow(QMainWindow):
             self._update_status()
             return False
 
-        self._persist_recovery_metadata(session)
         document.command_history.mark_clean()
         session.set_modified(document.command_history.is_dirty)
+        self._persist_recovery_metadata(session)
         index = self._find_document_index(session.source_path)
         if index is not None:
             self._tabs.setTabText(index, self._tab_title(document))
@@ -1399,8 +1413,12 @@ class MainWindow(QMainWindow):
             return
         undo_description = document.command_history.undo_description
         redo_description = document.command_history.redo_description
-        self.undo_action.setEnabled(document.command_history.can_undo)
-        self.redo_action.setEnabled(document.command_history.can_redo)
+        self.undo_action.setEnabled(
+            not document.session.is_saving and document.command_history.can_undo
+        )
+        self.redo_action.setEnabled(
+            not document.session.is_saving and document.command_history.can_redo
+        )
         self.undo_action.setText(
             f"元に戻す: {undo_description}" if undo_description is not None else "元に戻す"
         )

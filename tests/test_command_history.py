@@ -52,6 +52,55 @@ class RecordingCommand(DocumentCommand):
         return CommandChange.from_command(self)
 
 
+class StateCommand(DocumentCommand):
+    def __init__(
+        self,
+        description: str,
+        state: list[str],
+        *,
+        token: str,
+        fail_execute: bool = False,
+        fail_undo: bool = False,
+        fail_redo: bool = False,
+        fail_rollback_redo: bool = False,
+        fail_rollback_undo: bool = False,
+    ) -> None:
+        self.description = description
+        self.affected_pages = frozenset({0})
+        self._state = state
+        self._token = token
+        self._fail_execute = fail_execute
+        self._fail_undo = fail_undo
+        self._fail_redo = fail_redo
+        self._fail_rollback_redo = fail_rollback_redo
+        self._fail_rollback_undo = fail_rollback_undo
+
+    def execute(self) -> CommandChange:
+        if self._fail_execute:
+            raise RuntimeError(f"execute failed: {self.description}")
+        self._state.append(self._token)
+        return CommandChange.from_command(self)
+
+    def undo(self) -> CommandChange:
+        if self._fail_undo:
+            raise RuntimeError(f"undo failed: {self.description}")
+        if self._fail_rollback_undo:
+            self._fail_rollback_undo = False
+            raise RuntimeError(f"rollback undo failed: {self.description}")
+        removed = self._state.pop()
+        assert removed == self._token
+        return CommandChange.from_command(self)
+
+    def redo(self) -> CommandChange:
+        if self._fail_redo:
+            raise RuntimeError(f"redo failed: {self.description}")
+        if self._fail_rollback_redo:
+            self._fail_rollback_redo = False
+            raise RuntimeError(f"rollback redo failed: {self.description}")
+        self._state.append(self._token)
+        return CommandChange.from_command(self)
+
+
 def test_command_history_starts_clean() -> None:
     history = CommandHistory()
 
@@ -228,6 +277,113 @@ def test_compound_command_raises_dedicated_error_when_rollback_fails() -> None:
         command.execute()
 
     assert exc_info.value.command is command
+    assert exc_info.value.operation == "execute"
     assert isinstance(exc_info.value.original_cause, RuntimeError)
     assert exc_info.value.rollback_command is first
     assert isinstance(exc_info.value.rollback_cause, RuntimeError)
+
+
+def test_compound_command_undo_rolls_back_partially_undone_state() -> None:
+    state: list[str] = []
+    first = StateCommand("A", state, token="A", fail_undo=True)
+    second = StateCommand("B", state, token="B")
+    third = StateCommand("C", state, token="C")
+    command = CompoundCommand("Compound", [first, second, third])
+    command.execute()
+
+    with pytest.raises(RuntimeError, match="undo failed: A"):
+        command.undo()
+
+    assert state == ["A", "B", "C"]
+
+
+def test_compound_command_undo_rollback_failure_raises_dedicated_error() -> None:
+    state: list[str] = []
+    first = StateCommand("A", state, token="A", fail_undo=True)
+    second = StateCommand("B", state, token="B", fail_rollback_redo=True)
+    third = StateCommand("C", state, token="C")
+    command = CompoundCommand("Compound", [first, second, third])
+    command.execute()
+
+    with pytest.raises(CompoundCommandRollbackError) as exc_info:
+        command.undo()
+
+    assert exc_info.value.operation == "undo"
+    assert isinstance(exc_info.value.original_cause, RuntimeError)
+    assert isinstance(exc_info.value.rollback_cause, RuntimeError)
+    assert exc_info.value.rollback_command is second
+
+
+def test_compound_command_redo_rolls_back_partially_redone_state() -> None:
+    state: list[str] = []
+    first = StateCommand("A", state, token="A")
+    second = StateCommand("B", state, token="B")
+    third = StateCommand("C", state, token="C", fail_redo=True)
+    command = CompoundCommand("Compound", [first, second, third])
+    command.execute()
+    command.undo()
+    assert state == []
+
+    with pytest.raises(RuntimeError, match="redo failed: C"):
+        command.redo()
+
+    assert state == []
+
+
+def test_compound_command_redo_rollback_failure_raises_dedicated_error() -> None:
+    state: list[str] = []
+    first = StateCommand("A", state, token="A")
+    second = StateCommand("B", state, token="B")
+    third = StateCommand("C", state, token="C", fail_redo=True)
+    command = CompoundCommand("Compound", [first, second, third])
+    command.execute()
+    command.undo()
+    second._fail_rollback_undo = True
+
+    with pytest.raises(CompoundCommandRollbackError) as exc_info:
+        command.redo()
+
+    assert exc_info.value.operation == "redo"
+    assert isinstance(exc_info.value.original_cause, RuntimeError)
+    assert isinstance(exc_info.value.rollback_cause, RuntimeError)
+    assert exc_info.value.rollback_command is second
+
+
+def test_command_history_undo_failure_leaves_dirty_state_and_descriptions_unchanged() -> None:
+    history = CommandHistory()
+    history.execute(RecordingCommand("Works"))
+    history.mark_clean()
+    history.execute(RecordingCommand("Fail undo", fail_undo=True))
+
+    assert history.is_dirty is True
+    assert history.undo_description == "Fail undo"
+    assert history.redo_description is None
+
+    with pytest.raises(CommandUndoError):
+        history.undo()
+
+    assert history.is_dirty is True
+    assert history.can_undo is True
+    assert history.can_redo is False
+    assert history.undo_description == "Fail undo"
+    assert history.redo_description is None
+
+
+def test_command_history_redo_failure_leaves_dirty_state_and_descriptions_unchanged() -> None:
+    history = CommandHistory()
+    history.execute(RecordingCommand("Fail redo", fail_redo=True))
+    history.mark_clean()
+    history.undo()
+
+    assert history.is_dirty is True
+    assert history.redo_description == "Fail redo"
+    assert history.undo_description is None
+
+    with pytest.raises(CommandRedoError):
+        history.redo()
+
+    assert history.is_dirty is True
+    assert history.can_undo is False
+    assert history.can_redo is True
+    assert history.undo_description is None
+    assert history.redo_description == "Fail redo"

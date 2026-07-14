@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import Literal
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,15 +20,28 @@ class DocumentCommand(ABC):
 
     @abstractmethod
     def execute(self) -> CommandChange | None:
-        """Apply this command."""
+        """Apply this command atomically.
+
+        On success the whole operation must be applied. On failure the document state must
+        remain exactly as it was before the call. Partial mutation is not allowed.
+        CompoundCommand satisfies this contract by rolling child commands back when needed.
+        """
 
     @abstractmethod
     def undo(self) -> CommandChange | None:
-        """Undo this command."""
+        """Undo this command atomically.
+
+        On success the whole operation must be reverted. On failure the document state must
+        remain exactly as it was before the call. Partial mutation is not allowed.
+        CompoundCommand satisfies this contract by rolling child commands back when needed.
+        """
 
     def redo(self) -> CommandChange | None:
-        """Redo this command.
+        """Redo this command atomically.
 
+        On success the whole operation must be re-applied. On failure the document state must
+        remain exactly as it was before the call. Partial mutation is not allowed.
+        CompoundCommand satisfies this contract by rolling child commands back when needed.
         Commands may override this when re-executing differs from the initial execute step.
         """
 
@@ -68,12 +82,14 @@ class CompoundCommandRollbackError(CommandHistoryError):
         self,
         command: CompoundCommand,
         *,
+        operation: Literal["execute", "undo", "redo"],
         original_cause: Exception,
         rollback_command: DocumentCommand,
         rollback_cause: Exception,
     ) -> None:
-        super().__init__(f"Compound command rollback failed: {command.description}")
+        super().__init__(f"Compound command {operation} rollback failed: {command.description}")
         self.command = command
+        self.operation = operation
         self.original_cause = original_cause
         self.rollback_command = rollback_command
         self.rollback_cause = rollback_cause
@@ -106,6 +122,7 @@ class CompoundCommand(DocumentCommand):
                 except Exception as rollback_exc:
                     raise CompoundCommandRollbackError(
                         self,
+                        operation="execute",
                         original_cause=exc,
                         rollback_command=rollback_command,
                         rollback_cause=rollback_exc,
@@ -114,13 +131,45 @@ class CompoundCommand(DocumentCommand):
         return CommandChange.from_command(self)
 
     def undo(self) -> CommandChange:
-        for command in reversed(self._commands):
-            command.undo()
+        undone: list[DocumentCommand] = []
+        try:
+            for command in reversed(self._commands):
+                command.undo()
+                undone.append(command)
+        except Exception as exc:
+            for rollback_command in reversed(undone):
+                try:
+                    rollback_command.redo()
+                except Exception as rollback_exc:
+                    raise CompoundCommandRollbackError(
+                        self,
+                        operation="undo",
+                        original_cause=exc,
+                        rollback_command=rollback_command,
+                        rollback_cause=rollback_exc,
+                    ) from rollback_exc
+            raise exc
         return CommandChange.from_command(self)
 
     def redo(self) -> CommandChange:
-        for command in self._commands:
-            command.redo()
+        redone: list[DocumentCommand] = []
+        try:
+            for command in self._commands:
+                command.redo()
+                redone.append(command)
+        except Exception as exc:
+            for rollback_command in reversed(redone):
+                try:
+                    rollback_command.undo()
+                except Exception as rollback_exc:
+                    raise CompoundCommandRollbackError(
+                        self,
+                        operation="redo",
+                        original_cause=exc,
+                        rollback_command=rollback_command,
+                        rollback_cause=rollback_exc,
+                    ) from rollback_exc
+            raise exc
         return CommandChange.from_command(self)
 
 
