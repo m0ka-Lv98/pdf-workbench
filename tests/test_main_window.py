@@ -30,6 +30,10 @@ from pdf_test_utils import (
     create_image_only_pdf,
     create_qt_text_pdf,
 )
+from pdf_workbench.domain.command_history import (
+    CommandChange,
+    DocumentCommand,
+)
 from pdf_workbench.domain.document_session import DocumentSession, FileFingerprint, SourceStatus
 from pdf_workbench.services.page_coordinates import PageMetadata
 from pdf_workbench.services.pdf_renderer import (
@@ -326,6 +330,63 @@ class TrackingWorkspaceManager(SessionWorkspaceManager):
     def cleanup_session(self, session: DocumentSession) -> None:
         self.cleaned_sessions.append(session.session_id)
         super().cleanup_session(session)
+
+
+class StubDocumentCommand(DocumentCommand):
+    def __init__(
+        self,
+        description: str,
+        *,
+        affected_pages: frozenset[int] | None = None,
+        fail_execute: bool = False,
+        fail_undo: bool = False,
+        fail_redo: bool = False,
+        events: list[str] | None = None,
+    ) -> None:
+        self.description = description
+        self.affected_pages = affected_pages
+        self._fail_execute = fail_execute
+        self._fail_undo = fail_undo
+        self._fail_redo = fail_redo
+        self._events = events if events is not None else []
+
+    def execute(self) -> CommandChange:
+        self._events.append(f"execute:{self.description}")
+        if self._fail_execute:
+            raise RuntimeError(f"execute failed: {self.description}")
+        return CommandChange.from_command(self)
+
+    def undo(self) -> CommandChange:
+        self._events.append(f"undo:{self.description}")
+        if self._fail_undo:
+            raise RuntimeError(f"undo failed: {self.description}")
+        return CommandChange.from_command(self)
+
+    def redo(self) -> CommandChange:
+        self._events.append(f"redo:{self.description}")
+        if self._fail_redo:
+            raise RuntimeError(f"redo failed: {self.description}")
+        return CommandChange.from_command(self)
+
+
+class CountingDocumentCommand(StubDocumentCommand):
+    def __init__(self, description: str) -> None:
+        super().__init__(description)
+        self.execute_calls = 0
+        self.undo_calls = 0
+        self.redo_calls = 0
+
+    def execute(self) -> CommandChange:
+        self.execute_calls += 1
+        return super().execute()
+
+    def undo(self) -> CommandChange:
+        self.undo_calls += 1
+        return super().undo()
+
+    def redo(self) -> CommandChange:
+        self.redo_calls += 1
+        return super().redo()
 
 
 def test_main_window_opens_and_closes_multiple_documents(
@@ -2790,3 +2851,453 @@ def test_main_window_open_document_rolls_back_when_monitor_registration_fails(
     assert window._documents == []
     assert workspace_manager.cleaned_sessions
     assert "monitor failure" in reported[0]
+
+
+def test_main_window_undo_redo_disabled_without_document(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    window = MainWindow(create_settings(tmp_path))
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    assert window.undo_action.isEnabled() is False
+    assert window.redo_action.isEnabled() is False
+    assert window.undo_action.text() == "元に戻す"
+    assert window.redo_action.text() == "やり直す"
+
+
+def test_main_window_execute_command_updates_dirty_state_and_actions(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    recovery_service = FakeRecoveryService()
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+        recovery_service=recovery_service,
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    document_path = create_blank_pdf(tmp_path / "history.pdf", 1)
+    window.open_document(document_path)
+    recovery_service.write_calls.clear()
+
+    command = StubDocumentCommand("回転", affected_pages=frozenset({0}))
+
+    assert window.execute_document_command(command) is True
+
+    document = window._documents[0]
+    assert document.session.is_modified is True
+    assert document.session.operation_history[-1] == "回転"
+    assert window.undo_action.isEnabled() is True
+    assert window.undo_action.text() == "元に戻す: 回転"
+    assert window.redo_action.isEnabled() is False
+    assert recovery_service.write_calls == [document.session.session_id]
+
+
+def test_main_window_undo_and_redo_follow_clean_marker(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    document_path = create_blank_pdf(tmp_path / "clean-marker.pdf", 1)
+    window.open_document(document_path)
+
+    assert window.execute_document_command(StubDocumentCommand("Rotate")) is True
+
+    document = window._documents[0]
+    assert window._save_current_document() is True
+    assert document.session.is_modified is False
+    assert window.undo_action.isEnabled() is True
+    assert window.redo_action.isEnabled() is False
+
+    assert window._undo_current_command() is True
+    assert document.session.is_modified is True
+    assert window.redo_action.isEnabled() is True
+    assert document.session.operation_history[-1] == "Undo: Rotate"
+
+    assert window._redo_current_command() is True
+    assert document.session.is_modified is False
+    assert document.session.operation_history[-1] == "Redo: Rotate"
+
+
+def test_main_window_save_failure_does_not_move_clean_marker(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    save_service = FakeSaveService(should_fail=True)
+    reported: list[tuple[str, str]] = []
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+        save_service=save_service,
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    monkeypatch.setattr(
+        window,
+        "_report_error",
+        lambda title, message: reported.append((title, message)),
+    )
+    document_path = create_blank_pdf(tmp_path / "save-fail-history.pdf", 1)
+    window.open_document(document_path)
+    document = window._documents[0]
+    assert window.execute_document_command(StubDocumentCommand("Rotate")) is True
+
+    assert window._save_current_document() is False
+    assert document.session.is_modified is True
+    assert document.command_history.is_dirty is True
+    assert window.undo_action.isEnabled() is True
+    assert reported
+
+
+def test_main_window_command_history_is_per_tab(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    first = create_blank_pdf(tmp_path / "first-history.pdf", 1)
+    second = create_blank_pdf(tmp_path / "second-history.pdf", 1)
+    window.open_document(first)
+    window.open_document(second)
+
+    assert window.execute_document_command(StubDocumentCommand("Second tab edit")) is True
+    assert window.undo_action.text() == "元に戻す: Second tab edit"
+
+    window._tabs.setCurrentIndex(0)
+    assert window.undo_action.isEnabled() is False
+
+    window.execute_document_command(StubDocumentCommand("First tab edit"))
+    assert window.undo_action.text() == "元に戻す: First tab edit"
+
+    window._tabs.setCurrentIndex(1)
+    assert window.undo_action.text() == "元に戻す: Second tab edit"
+
+
+def test_main_window_recovered_modified_session_stays_dirty_with_empty_history(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    document_path = create_blank_pdf(tmp_path / "recovered-history.pdf", 1)
+    session = create_workspace_manager(tmp_path).create_session(document_path)
+    session.mark_modified("Recovered edit")
+    session.mark_recovered(SourceStatus.MODIFIED)
+
+    assert window.restore_session(session) is RestoreSessionResult.ATTACHED
+
+    document = window._documents[0]
+    assert document.session.is_modified is True
+    assert document.command_history.is_dirty is True
+    assert document.command_history.can_undo is False
+    assert document.command_history.can_redo is False
+    assert window.undo_action.isEnabled() is False
+    assert window.redo_action.isEnabled() is False
+
+
+def test_main_window_failed_execute_undo_redo_leave_history_state_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    document_path = create_blank_pdf(tmp_path / "failed-history.pdf", 1)
+    window.open_document(document_path)
+    errors: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        window,
+        "_report_error",
+        lambda title, message: errors.append((title, message)),
+    )
+
+    assert window.execute_document_command(StubDocumentCommand("Boom", fail_execute=True)) is False
+
+    document = window._documents[0]
+    assert document.session.is_modified is False
+    assert document.session.operation_history == []
+    assert document.command_history.can_undo is False
+    assert errors
+
+    assert window.execute_document_command(StubDocumentCommand("Works")) is True
+    assert window._undo_current_command() is True
+    assert window._redo_current_command() is True
+
+    failing_undo_window = MainWindow(
+        create_settings(tmp_path / "undo"),
+        workspace_manager=create_workspace_manager(tmp_path / "undo"),
+    )
+    qtbot.addWidget(failing_undo_window)
+    show_window(qtbot, failing_undo_window)
+    second_document_path = create_blank_pdf(tmp_path / "undo-fail.pdf", 1)
+    failing_undo_window.open_document(second_document_path)
+    monkeypatch.setattr(
+        failing_undo_window,
+        "_report_error",
+        lambda title, message: errors.append((title, message)),
+    )
+    assert (
+        failing_undo_window.execute_document_command(
+            StubDocumentCommand("Undo fail", fail_undo=True)
+        )
+        is True
+    )
+    assert failing_undo_window._undo_current_command() is False
+    assert failing_undo_window._documents[0].command_history.can_undo is True
+
+    redo_window = MainWindow(
+        create_settings(tmp_path / "redo"),
+        workspace_manager=create_workspace_manager(tmp_path / "redo"),
+    )
+    qtbot.addWidget(redo_window)
+    show_window(qtbot, redo_window)
+    third_document_path = create_blank_pdf(tmp_path / "redo-fail.pdf", 1)
+    redo_window.open_document(third_document_path)
+    monkeypatch.setattr(
+        redo_window,
+        "_report_error",
+        lambda title, message: errors.append((title, message)),
+    )
+    assert (
+        redo_window.execute_document_command(StubDocumentCommand("Redo fail", fail_redo=True))
+        is True
+    )
+    assert redo_window._undo_current_command() is True
+    assert redo_window._redo_current_command() is False
+    assert redo_window._documents[0].command_history.can_redo is True
+
+
+def test_main_window_undo_redo_shortcuts_are_standard(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    window = MainWindow(create_settings(tmp_path))
+    qtbot.addWidget(window)
+
+    assert window.undo_action.shortcut().matches(QKeySequence.StandardKey.Undo)
+    assert window.redo_action.shortcut().matches(QKeySequence.StandardKey.Redo)
+
+
+def test_main_window_save_persists_metadata_after_clean_state_synchronization(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+        save_service=FakeSaveService(),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    document_path = create_blank_pdf(tmp_path / "metadata-order.pdf", 1)
+    window.open_document(document_path)
+    document = window._documents[0]
+    assert window.execute_document_command(StubDocumentCommand("Rotate")) is True
+    snapshots: list[tuple[bool, bool, bool]] = []
+
+    def record_metadata(session: DocumentSession, *, required: bool = False) -> bool:
+        snapshots.append(
+            (
+                document.command_history.is_dirty,
+                session.is_modified,
+                document.command_history.can_undo,
+            )
+        )
+        return True
+
+    monkeypatch.setattr(window, "_persist_recovery_metadata", record_metadata)
+
+    assert window._save_current_document() is True
+
+    assert snapshots[-1] == (False, False, True)
+    assert document.command_history.can_undo is True
+    assert document.command_history.is_dirty is False
+    assert document.session.is_modified is False
+
+
+def test_main_window_disables_undo_redo_while_saving(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    document_path = create_blank_pdf(tmp_path / "saving-actions.pdf", 1)
+    window.open_document(document_path)
+    document = window._documents[0]
+    assert window.execute_document_command(StubDocumentCommand("Rotate")) is True
+
+    document.session.is_saving = True
+    window._update_actions()
+
+    assert window.undo_action.isEnabled() is False
+    assert window.redo_action.isEnabled() is False
+
+
+def test_main_window_rejects_direct_command_changes_while_saving(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    recovery_service = FakeRecoveryService()
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+        recovery_service=recovery_service,
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    document_path = create_blank_pdf(tmp_path / "saving-guards.pdf", 1)
+    window.open_document(document_path)
+    document = window._documents[0]
+    assert window.execute_document_command(StubDocumentCommand("Rotate")) is True
+    assert window._undo_current_command() is True
+    recovery_service.write_calls.clear()
+    document.session.is_saving = True
+    baseline_history = list(document.session.operation_history)
+    baseline_dirty = document.command_history.is_dirty
+
+    execute_command = CountingDocumentCommand("Blocked execute")
+    assert window.execute_document_command(execute_command) is False
+    assert execute_command.execute_calls == 0
+
+    assert window._undo_current_command() is False
+    assert window._redo_current_command() is False
+    assert document.command_history.is_dirty is baseline_dirty
+    assert list(document.session.operation_history) == baseline_history
+    assert recovery_service.write_calls == []
+    assert document.command_history.undo_description is None
+    assert document.command_history.redo_description == "Rotate"
+
+
+def test_main_window_undo_action_prefers_line_edit_history(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    recovery_service = FakeRecoveryService()
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+        recovery_service=recovery_service,
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    document_path = create_blank_pdf(tmp_path / "line-edit-undo.pdf", 1)
+    window.open_document(document_path)
+    document = window._documents[0]
+    command = CountingDocumentCommand("Document edit")
+    assert window.execute_document_command(command) is True
+    recovery_service.write_calls.clear()
+    assert window.open_search_bar() is True
+    line_edit = window._search_bar.search_input
+    line_edit.clear()
+    line_edit.setFocus(Qt.FocusReason.ShortcutFocusReason)
+    qtbot.keyClicks(line_edit, "Alpha")
+    assert line_edit.text() == "Alpha"
+
+    assert window._trigger_undo() is True
+    assert line_edit.text() == ""
+    assert document.command_history.can_undo is True
+    assert command.undo_calls == 0
+    assert command.redo_calls == 0
+    assert document.session.is_modified is True
+    assert document.session.operation_history == ["Document edit"]
+    assert recovery_service.write_calls == []
+
+    assert window._trigger_redo() is True
+    assert line_edit.text() == "Alpha"
+    assert document.command_history.can_undo is True
+    assert command.undo_calls == 0
+    assert command.redo_calls == 0
+    assert document.session.operation_history == ["Document edit"]
+    assert recovery_service.write_calls == []

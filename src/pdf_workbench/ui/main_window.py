@@ -40,6 +40,14 @@ from PySide6.QtWidgets import (
 )
 
 from pdf_workbench.core.settings import configure_qsettings
+from pdf_workbench.domain.command_history import (
+    CommandChange,
+    CommandExecutionError,
+    CommandHistory,
+    CommandRedoError,
+    CommandUndoError,
+    DocumentCommand,
+)
 from pdf_workbench.domain.document_session import DocumentSession, SourceStatus
 from pdf_workbench.services.pdf_renderer import PdfRenderService
 from pdf_workbench.services.pdf_save_service import (
@@ -77,6 +85,7 @@ logger = logging.getLogger(__name__)
 class DocumentTab:
     session: DocumentSession
     view: PdfView
+    command_history: CommandHistory
 
 
 class RestoreSessionResult(StrEnum):
@@ -286,6 +295,16 @@ class MainWindow(QMainWindow):
         self.save_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
         self.save_action.triggered.connect(self._save_current_document)
 
+        self.undo_action = QAction("元に戻す", self)
+        self.undo_action.setShortcut(QKeySequence.StandardKey.Undo)
+        self.undo_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+        self.undo_action.triggered.connect(self._trigger_undo)
+
+        self.redo_action = QAction("やり直す", self)
+        self.redo_action.setShortcut(QKeySequence.StandardKey.Redo)
+        self.redo_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+        self.redo_action.triggered.connect(self._trigger_redo)
+
         self.save_as_action = QAction("名前を付けて保存", self)
         self.save_as_action.setShortcut(QKeySequence.StandardKey.SaveAs)
         self.save_as_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
@@ -297,6 +316,8 @@ class MainWindow(QMainWindow):
 
         for action in (
             self.open_action,
+            self.undo_action,
+            self.redo_action,
             self.save_action,
             self.save_as_action,
             self.close_action,
@@ -331,6 +352,9 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self.zoom_out_action)
 
         edit_menu = self.menuBar().addMenu("編集")
+        edit_menu.addAction(self.undo_action)
+        edit_menu.addAction(self.redo_action)
+        edit_menu.addSeparator()
         edit_menu.addAction(self.find_action)
         edit_menu.addAction(self.find_next_action)
         edit_menu.addAction(self.find_previous_action)
@@ -588,6 +612,77 @@ class MainWindow(QMainWindow):
         if not document.view.copy_selected_text():
             self._set_status_message("コピーするテキストが選択されていません", timeout_ms=3000)
 
+    def execute_document_command(self, command: DocumentCommand) -> bool:
+        document = self._current_document()
+        if document is None or document.session.is_saving:
+            return False
+        try:
+            change = document.command_history.execute(command)
+        except CommandExecutionError as exc:
+            logger.exception("Failed to execute command: %s", exc.command.description)
+            self._report_error("編集に失敗しました", str(exc.cause))
+            return False
+        self._finalize_successful_command(
+            document,
+            description=command.description,
+            change=change,
+        )
+        return True
+
+    def _trigger_undo(self) -> bool:
+        focus_widget = QApplication.focusWidget()
+        if isinstance(focus_widget, QLineEdit) and focus_widget.isUndoAvailable():
+            focus_widget.undo()
+            return True
+        return self._undo_current_command()
+
+    def _trigger_redo(self) -> bool:
+        focus_widget = QApplication.focusWidget()
+        if isinstance(focus_widget, QLineEdit) and focus_widget.isRedoAvailable():
+            focus_widget.redo()
+            return True
+        return self._redo_current_command()
+
+    def _undo_current_command(self) -> bool:
+        document = self._current_document()
+        if document is None or document.session.is_saving or not document.command_history.can_undo:
+            return False
+        description = document.command_history.undo_description
+        if description is None:
+            return False
+        try:
+            change = document.command_history.undo()
+        except CommandUndoError as exc:
+            logger.exception("Failed to undo command: %s", exc.command.description)
+            self._report_error("元に戻せませんでした", str(exc.cause))
+            return False
+        self._finalize_successful_command(
+            document,
+            description=f"Undo: {description}",
+            change=change,
+        )
+        return True
+
+    def _redo_current_command(self) -> bool:
+        document = self._current_document()
+        if document is None or document.session.is_saving or not document.command_history.can_redo:
+            return False
+        description = document.command_history.redo_description
+        if description is None:
+            return False
+        try:
+            change = document.command_history.redo()
+        except CommandRedoError as exc:
+            logger.exception("Failed to redo command: %s", exc.command.description)
+            self._report_error("やり直せませんでした", str(exc.cause))
+            return False
+        self._finalize_successful_command(
+            document,
+            description=f"Redo: {description}",
+            change=change,
+        )
+        return True
+
     def _save_current_document(self) -> bool:
         document = self._current_document()
         if document is None:
@@ -688,6 +783,8 @@ class MainWindow(QMainWindow):
             self._update_status()
             return False
 
+        document.command_history.mark_clean()
+        session.set_modified(document.command_history.is_dirty)
         self._persist_recovery_metadata(session)
         index = self._find_document_index(session.source_path)
         if index is not None:
@@ -877,6 +974,7 @@ class MainWindow(QMainWindow):
         document = self._current_document()
         document_selection = bool(document and document.view.selected_text)
         self.close_action.setEnabled(has_document)
+        self._update_undo_redo_actions(document)
         self.save_action.setEnabled(
             bool(
                 document
@@ -1161,7 +1259,11 @@ class MainWindow(QMainWindow):
         view.search_state_changed.connect(lambda: self._on_view_search_state_changed(view))
         view.selection_changed.connect(self._update_actions)
         view.error_occurred.connect(lambda message: self._set_status_message(message, error=True))
-        document = DocumentTab(session=session, view=view)
+        document = DocumentTab(
+            session=session,
+            view=view,
+            command_history=CommandHistory(initially_dirty=session.is_modified),
+        )
         tab_index: int | None = None
         try:
             self._documents.append(document)
@@ -1268,13 +1370,61 @@ class MainWindow(QMainWindow):
         document: DocumentTab,
         description: str,
     ) -> None:
-        document.session.mark_modified(description)
-        self._persist_recovery_metadata(document.session, required=True)
+        document.session.is_modified = True
+        document.session.record_operation(description)
+        self._persist_recovery_metadata(document.session)
         index = self._find_document_index(document.session.source_path)
         if index is not None:
             self._tabs.setTabText(index, self._tab_title(document))
         self._update_actions()
         self._update_window_title()
+        self._update_status()
+
+    def _finalize_successful_command(
+        self,
+        document: DocumentTab,
+        *,
+        description: str,
+        change: CommandChange,
+    ) -> None:
+        document.session.set_modified(document.command_history.is_dirty)
+        document.session.record_operation(description)
+        self._persist_recovery_metadata(document.session)
+        self._apply_command_change(document, change)
+        index = self._find_document_index(document.session.source_path)
+        if index is not None:
+            self._tabs.setTabText(index, self._tab_title(document))
+            self._tabs.setTabToolTip(index, self._tab_tooltip(document))
+        self._update_actions()
+        self._update_window_title()
+        self._update_status()
+
+    def _apply_command_change(self, document: DocumentTab, change: CommandChange) -> None:
+        # Issue #9 only wires the invalidation seam. Concrete editing commands will decide
+        # whether page-level or whole-document refresh is necessary in later milestones.
+        _ = (document, change)
+
+    def _update_undo_redo_actions(self, document: DocumentTab | None) -> None:
+        if document is None:
+            self.undo_action.setEnabled(False)
+            self.redo_action.setEnabled(False)
+            self.undo_action.setText("元に戻す")
+            self.redo_action.setText("やり直す")
+            return
+        undo_description = document.command_history.undo_description
+        redo_description = document.command_history.redo_description
+        self.undo_action.setEnabled(
+            not document.session.is_saving and document.command_history.can_undo
+        )
+        self.redo_action.setEnabled(
+            not document.session.is_saving and document.command_history.can_redo
+        )
+        self.undo_action.setText(
+            f"元に戻す: {undo_description}" if undo_description is not None else "元に戻す"
+        )
+        self.redo_action.setText(
+            f"やり直す: {redo_description}" if redo_description is not None else "やり直す"
+        )
 
     def _tab_tooltip(self, document: DocumentTab) -> str:
         lines = [str(document.session.source_path)]

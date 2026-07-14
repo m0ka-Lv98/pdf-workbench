@@ -51,6 +51,24 @@ def test_recovery_metadata_round_trip(tmp_path: Path) -> None:
     assert payload["operation_history"] == ["rotate page 1"]
 
 
+def test_restore_candidate_keeps_dirty_flag_and_string_history_only(tmp_path: Path) -> None:
+    source_path = create_blank_pdf(tmp_path / "source.pdf", 1)
+    manager, recovery = create_session_environment(tmp_path)
+    session = manager.create_session(source_path)
+    session.mark_modified("rotate page 1")
+    recovery.write_metadata(session)
+    manager.release_session_lock(session.session_id)
+
+    candidate = recovery.scan_candidates().candidates[0]
+    restored = recovery.restore_candidate(candidate)
+
+    assert restored.is_modified is True
+    assert restored.operation_history == ["rotate page 1"]
+    assert restored.recovered_from_interrupted_session is True
+
+    manager.release_session_lock(restored.session_id)
+
+
 def test_recovery_metadata_write_failure_preserves_existing_metadata(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

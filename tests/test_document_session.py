@@ -53,6 +53,24 @@ def test_mark_modified_records_operation(tmp_path: Path) -> None:
     assert session.operation_history == ["rotate page 1"]
 
 
+def test_record_operation_appends_without_forcing_dirty(tmp_path: Path) -> None:
+    session = create_session(tmp_path)
+
+    session.record_operation("Undo: rotate page 1")
+
+    assert session.is_modified is False
+    assert session.operation_history == ["Undo: rotate page 1"]
+
+
+def test_set_modified_updates_dirty_flag_without_appending_history(tmp_path: Path) -> None:
+    session = create_session(tmp_path)
+
+    session.set_modified(True)
+
+    assert session.is_modified is True
+    assert session.operation_history == []
+
+
 def test_mark_saved_updates_source_path_and_fingerprint(tmp_path: Path) -> None:
     session = create_session(tmp_path)
     session.mark_modified("delete page 2")
@@ -106,6 +124,17 @@ def test_mark_modified_limits_operation_history(tmp_path: Path) -> None:
 
     for index in range(150):
         session.mark_modified(f"op-{index}")
+
+    assert len(session.operation_history) == DocumentSession.MAX_OPERATION_HISTORY
+    assert session.operation_history[0] == "op-50"
+    assert session.operation_history[-1] == "op-149"
+
+
+def test_record_operation_limits_operation_history(tmp_path: Path) -> None:
+    session = create_session(tmp_path)
+
+    for index in range(150):
+        session.record_operation(f"op-{index}")
 
     assert len(session.operation_history) == DocumentSession.MAX_OPERATION_HISTORY
     assert session.operation_history[0] == "op-50"
