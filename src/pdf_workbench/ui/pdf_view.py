@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from pdf_workbench.domain.mutation import PageIndexTransition
 from pdf_workbench.services.page_coordinates import (
     PageCoordinateMapper,
     PageMetadata,
@@ -679,11 +680,13 @@ class PdfView(QWidget):
         new_revision: DocumentRevision,
         *,
         affected_pages: frozenset[int],
+        page_index_transition: PageIndexTransition | None = None,
     ) -> None:
         self._render_service.transition_cache_revision(
             old_revision,
             new_revision,
             affected_pages=affected_pages,
+            page_index_transition=page_index_transition,
         )
 
     def _advance_render_generation(self) -> None:

@@ -28,6 +28,7 @@ class ToolbarState:
     page_index: int
     page_count: int
     zoom_factor: float
+    can_duplicate: bool = True
     can_rotate: bool = True
 
 
@@ -72,6 +73,7 @@ class DocumentToolbar(QWidget):
     search_requested = Signal()
     previous_requested = Signal()
     next_requested = Signal()
+    duplicate_requested = Signal()
     rotate_requested = Signal()
     page_requested = Signal(int)
     zoom_requested = Signal(float)
@@ -191,6 +193,14 @@ class DocumentToolbar(QWidget):
         self.rotate_button.clicked.connect(self.rotate_requested.emit)
         self._root.addWidget(self.rotate_button, 0, Qt.AlignmentFlag.AlignVCenter)
 
+        self.duplicate_button = self._icon_button(
+            "Duplicate selected pages",
+            "選択したページを複製",
+            object_name="duplicatePagesButton",
+        )
+        self.duplicate_button.clicked.connect(self.duplicate_requested.emit)
+        self._root.addWidget(self.duplicate_button, 0, Qt.AlignmentFlag.AlignVCenter)
+
         self._root.addStretch(1)
 
         self.setFixedHeight(54)
@@ -203,6 +213,7 @@ class DocumentToolbar(QWidget):
         self.search_button.setEnabled(state.has_document)
         self.previous_button.setEnabled(state.has_document and state.page_index > 0)
         self.next_button.setEnabled(state.has_document and state.page_index + 1 < state.page_count)
+        self.duplicate_button.setEnabled(state.has_document and state.can_duplicate)
         self.rotate_button.setEnabled(state.has_document and state.can_rotate)
         self.zoom_out_button.setEnabled(state.has_document)
         self.zoom_in_button.setEnabled(state.has_document)
@@ -231,6 +242,7 @@ class DocumentToolbar(QWidget):
         self.next_button.setIcon(IconProvider.icon(IconName.CHEVRON_RIGHT, size=18))
         self.zoom_out_button.setIcon(IconProvider.icon(IconName.ZOOM_OUT, size=18))
         self.zoom_in_button.setIcon(IconProvider.icon(IconName.ZOOM_IN, size=18))
+        self.duplicate_button.setIcon(IconProvider.icon(IconName.DUPLICATE, size=18))
         self.rotate_button.setIcon(IconProvider.icon(IconName.ROTATE_CLOCKWISE, size=18))
         self.zoom_field.refresh_theme_assets()
 
@@ -285,6 +297,7 @@ class DocumentToolbar(QWidget):
             self.next_button,
             self.zoom_out_button,
             self.zoom_in_button,
+            self.duplicate_button,
             self.rotate_button,
         ):
             button.setFixedSize(icon_extent, icon_extent)

@@ -50,7 +50,7 @@ from pdf_workbench.domain.command_history import (
     DocumentCommand,
 )
 from pdf_workbench.domain.document_session import DocumentSession, SourceStatus
-from pdf_workbench.domain.page_commands import RotatePagesCommand
+from pdf_workbench.domain.page_commands import DuplicatePagesCommand, RotatePagesCommand
 from pdf_workbench.services.pdf_page_mutation import PdfPageMutationService
 from pdf_workbench.services.pdf_renderer import PdfRenderService
 from pdf_workbench.services.pdf_save_service import (
@@ -220,6 +220,7 @@ class MainWindow(QMainWindow):
         self._toolbar_widget.search_requested.connect(self.open_search_bar)
         self._toolbar_widget.previous_requested.connect(self._previous_page)
         self._toolbar_widget.next_requested.connect(self._next_page)
+        self._toolbar_widget.duplicate_requested.connect(self._duplicate_selected_pages)
         self._toolbar_widget.rotate_requested.connect(self._rotate_page)
         self._toolbar_widget.page_requested.connect(self._set_page_from_toolbar)
         self._toolbar_widget.zoom_requested.connect(self._set_zoom_from_toolbar)
@@ -316,6 +317,9 @@ class MainWindow(QMainWindow):
         self.save_as_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
         self.save_as_action.triggered.connect(self._save_current_document_as)
 
+        self.duplicate_pages_action = QAction("選択したページを複製", self)
+        self.duplicate_pages_action.triggered.connect(self._duplicate_selected_pages)
+
         self.copy_action = QAction("コピー", self)
         self.copy_action.setShortcut(QKeySequence.StandardKey.Copy)
         self.copy_action.triggered.connect(self._copy_selection)
@@ -324,6 +328,7 @@ class MainWindow(QMainWindow):
             self.open_action,
             self.undo_action,
             self.redo_action,
+            self.duplicate_pages_action,
             self.save_action,
             self.save_as_action,
             self.close_action,
@@ -360,6 +365,8 @@ class MainWindow(QMainWindow):
         edit_menu = self.menuBar().addMenu("編集")
         edit_menu.addAction(self.undo_action)
         edit_menu.addAction(self.redo_action)
+        edit_menu.addSeparator()
+        edit_menu.addAction(self.duplicate_pages_action)
         edit_menu.addSeparator()
         edit_menu.addAction(self.find_action)
         edit_menu.addAction(self.find_next_action)
@@ -560,6 +567,21 @@ class MainWindow(QMainWindow):
             return
         self.execute_document_command(
             RotatePagesCommand(
+                document.session.document_path,
+                page_indexes,
+                self._page_mutation_service,
+            )
+        )
+
+    def _duplicate_selected_pages(self) -> None:
+        document = self._current_document()
+        if document is None or document.session.is_saving or document.mutation_in_progress:
+            return
+        page_indexes = tuple(sorted(set(document.view.selected_page_indexes)))
+        if not page_indexes:
+            return
+        self.execute_document_command(
+            DuplicatePagesCommand(
                 document.session.document_path,
                 page_indexes,
                 self._page_mutation_service,
@@ -1018,6 +1040,14 @@ class MainWindow(QMainWindow):
         )
         self.save_as_action.setEnabled(
             bool(document and not document.session.is_saving and not document.mutation_in_progress)
+        )
+        self.duplicate_pages_action.setEnabled(
+            bool(
+                document
+                and document.view.selected_page_indexes
+                and not document.session.is_saving
+                and not document.mutation_in_progress
+            )
         )
         self.previous_action.setEnabled(has_document)
         self.next_action.setEnabled(has_document)
@@ -1528,11 +1558,15 @@ class MainWindow(QMainWindow):
         change: CommandChange | None = None,
         timeout_ms: int = 5000,
     ) -> bool:
+        reload_snapshot = (
+            self._transform_mutation_snapshot(snapshot, change) if change is not None else snapshot
+        )
         if change is not None and change.mutation_result is not None:
             document.view.transition_render_cache(
                 change.mutation_result.old_revision,
                 change.mutation_result.new_revision,
                 affected_pages=change.mutation_result.affected_pages,
+                page_index_transition=change.mutation_result.page_index_transition,
             )
         event_loop = QEventLoop(self)
         success = False
@@ -1559,7 +1593,7 @@ class MainWindow(QMainWindow):
 
         document.view.mutation_reload_completed.connect(handle_completed)
         timeout.timeout.connect(handle_timeout)
-        started = document.view.reload_after_working_copy_mutation(snapshot)
+        started = document.view.reload_after_working_copy_mutation(reload_snapshot)
         if not started:
             self._set_document_mutation_state(document, False)
             with suppress(RuntimeError, TypeError):
@@ -1578,6 +1612,57 @@ class MainWindow(QMainWindow):
         with suppress(RuntimeError, TypeError):
             timeout.timeout.disconnect(handle_timeout)
         return success
+
+    def _transform_mutation_snapshot(
+        self,
+        snapshot: PdfViewMutationSnapshot,
+        change: CommandChange,
+    ) -> PdfViewMutationSnapshot:
+        mutation_result = change.mutation_result
+        if mutation_result is None or mutation_result.page_index_transition is None:
+            return snapshot
+        transition = mutation_result.page_index_transition
+        mapped_current_page = self._mapped_page_index(
+            snapshot.current_page_index,
+            transition.current_page_old_to_new,
+        )
+        if mapped_current_page is None:
+            mapped_current_page = 0
+        if change.selected_page_indexes_after is not None:
+            selected_page_indexes = tuple(
+                page_index
+                for page_index in change.selected_page_indexes_after
+                if 0 <= page_index < mutation_result.page_count
+            )
+        else:
+            selected_page_indexes = tuple(
+                mapped_page_index
+                for page_index in snapshot.selected_page_indexes
+                if (
+                    mapped_page_index := self._mapped_page_index(
+                        page_index,
+                        transition.current_page_old_to_new,
+                    )
+                )
+                is not None
+            )
+        if not selected_page_indexes:
+            selected_page_indexes = (mapped_current_page,)
+        return PdfViewMutationSnapshot(
+            current_page_index=mapped_current_page,
+            selected_page_indexes=selected_page_indexes,
+            logical_zoom=snapshot.logical_zoom,
+            search_query=snapshot.search_query,
+        )
+
+    @staticmethod
+    def _mapped_page_index(
+        old_page_index: int,
+        mapping: tuple[int | None, ...],
+    ) -> int | None:
+        if not 0 <= old_page_index < len(mapping):
+            return None
+        return mapping[old_page_index]
 
     def _set_document_mutation_state(self, document: DocumentTab, active: bool) -> None:
         document.mutation_in_progress = active
@@ -1649,6 +1734,11 @@ class MainWindow(QMainWindow):
                 page_index=document.view.page_index,
                 page_count=document.view.page_count,
                 zoom_factor=document.session.zoom_factor,
+                can_duplicate=bool(
+                    document.view.selected_page_indexes
+                    and not document.session.is_saving
+                    and not document.mutation_in_progress
+                ),
                 can_rotate=bool(
                     document.view.selected_page_indexes
                     and not document.session.is_saving

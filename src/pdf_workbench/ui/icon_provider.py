@@ -21,6 +21,7 @@ class IconName(StrEnum):
     CHEVRON_DOWN = "chevron-down"
     ZOOM_OUT = "zoom-out"
     ZOOM_IN = "zoom-in"
+    DUPLICATE = "duplicate"
     ROTATE_CLOCKWISE = "rotate-clockwise"
     CLOSE = "close"
     DOCUMENT = "document"

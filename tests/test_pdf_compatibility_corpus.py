@@ -26,6 +26,7 @@ from pdf_regression_utils import (
     normalize_rotation,
     render_pdf_pages,
 )
+from pdf_workbench.services.pdf_page_mutation import PdfPageMutationService
 
 SUBSET_FONT_NAME_PATTERN = re.compile(r"^/[A-Z]{6}\+")
 
@@ -292,3 +293,64 @@ def test_noop_round_trip_preserves_structure_and_rendering(
         finally:
             for image in source_images + round_trip_images:
                 image.close()
+
+
+@pytest.mark.parametrize(
+    ("name", "selected_page_index"),
+    [
+        ("rotations.pdf", 1),
+        ("page-boxes.pdf", 0),
+        ("annotations.pdf", 0),
+    ],
+)
+def test_duplicate_round_trip_preserves_fixture_structure_and_rendering(
+    tmp_path: Path,
+    fixture_map: Mapping[str, Mapping[str, object]],
+    name: str,
+    selected_page_index: int,
+) -> None:
+    fixture_dir = compatibility_fixture_dir()
+    fixture_path = fixture_dir / name
+    working_copy_path = tmp_path / name
+    tolerance = VisualComparisonTolerance()
+    service = PdfPageMutationService()
+    expected = fixture_map[name]["expected"]
+    assert isinstance(expected, Mapping)
+    fixture_sha_before = file_sha256(fixture_path)
+    with pikepdf.open(fixture_path) as pdf:
+        pdf.save(working_copy_path)
+
+    mutation = service.duplicate_pages(working_copy_path, (selected_page_index,))
+
+    assert file_sha256(fixture_path) == fixture_sha_before
+    assert_pdfium_renders_all_pages(
+        working_copy_path,
+        expected_page_count=int(expected["page_count"]) + 1,
+    )
+    duplicated_images = render_pdf_pages(working_copy_path, scale=0.4)
+    try:
+        duplicate_page_index = mutation.receipt.duplicate_page_indexes[0]
+        assert_images_visually_close(
+            duplicated_images[duplicate_page_index],
+            duplicated_images[selected_page_index],
+            tolerance=tolerance,
+            label=f"{name} duplicate render",
+        )
+    finally:
+        for image in duplicated_images:
+            image.close()
+
+    undo_result = service.undo_page_duplication(working_copy_path, mutation.receipt)
+    assert undo_result.page_count == int(expected["page_count"])
+    assert_pdf_matches_manifest(working_copy_path, expected)  # type: ignore[arg-type]
+    assert_pdfium_renders_all_pages(
+        working_copy_path,
+        expected_page_count=int(expected["page_count"]),
+    )
+
+    redo_mutation = service.duplicate_pages(working_copy_path, (selected_page_index,))
+    assert redo_mutation.receipt.duplicate_page_indexes == mutation.receipt.duplicate_page_indexes
+    assert_pdfium_renders_all_pages(
+        working_copy_path,
+        expected_page_count=int(expected["page_count"]) + 1,
+    )

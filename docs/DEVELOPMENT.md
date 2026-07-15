@@ -61,6 +61,12 @@ PDF-writing PR の最低限の回帰チェック:
 - intrinsic rotation
 - PDFium で全対象ページを再オープン・描画
 - relevant annotation subtype、rectangle、appearance の保存
+- duplicate / delete のような page-count-changing command では、page index transition と cache remap を明示的に検証する
+- selected-page duplication では original source PDF が Save まで不変であることを確認する
+- selected-page duplication では source page の直後に duplicate が入ること、page order が安定していることを検証する
+- page object と annotation object の独立性、annotation `/P` back-reference、raw/effective rotation、all page boxes の保存を検証する
+- execute / undo / redo の各経路で、pikepdf 再オープンと PDFium render を通して semantic restoration を確認する
+- form / widget page duplication は fail-closed とし、working copy hash が変わらないことを確認する
 - relevant English/Japanese text の抽出
 - source と round-trip output の platform-neutral visual comparison
 - byte equality は要求しない

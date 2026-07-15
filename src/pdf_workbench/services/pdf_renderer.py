@@ -15,6 +15,7 @@ from pypdf import PdfReader
 from PySide6.QtCore import QEventLoop, QObject, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QImage
 
+from pdf_workbench.domain.mutation import PageIndexTransition
 from pdf_workbench.services.page_coordinates import PageGeometry, PageMetadata, PdfRect
 
 logger = logging.getLogger(__name__)
@@ -219,6 +220,7 @@ class PdfRenderServiceProtocol(Protocol):
         new_revision: DocumentRevision,
         *,
         affected_pages: frozenset[int],
+        page_index_transition: PageIndexTransition | None = None,
     ) -> None: ...
 
     def update_document_generation(
@@ -473,12 +475,54 @@ class RenderImageCache:
         new_revision: DocumentRevision,
         *,
         affected_pages: frozenset[int],
+        page_index_transition: PageIndexTransition | None = None,
     ) -> None:
+        if page_index_transition is not None and not isinstance(
+            page_index_transition,
+            PageIndexTransition,
+        ):
+            raise TypeError("page_index_transition must be PageIndexTransition")
         if old_revision == new_revision:
             for key in list(self._items):
                 if key.revision == old_revision and key.page_index in affected_pages:
                     image = self._items.pop(key)
                     self._total_bytes -= self._image_bytes(image)
+            return
+
+        if page_index_transition is not None:
+            remapped: OrderedDict[RenderCacheKey, tuple[QImage, bool]] = OrderedDict()
+            total_bytes = 0
+            for key, image in self._items.items():
+                next_key = key
+                from_new_revision = key.revision != old_revision
+                if key.revision == old_revision:
+                    if key.page_index >= page_index_transition.old_page_count:
+                        raise ValueError("cache key page index is outside the transition range")
+                    mapped_page_index = page_index_transition.cache_old_to_new[key.page_index]
+                    if mapped_page_index is None:
+                        continue
+                    next_key = RenderCacheKey(
+                        revision=new_revision,
+                        page_index=mapped_page_index,
+                        logical_zoom=key.logical_zoom,
+                        rotation=key.rotation,
+                        device_pixel_ratio=key.device_pixel_ratio,
+                    )
+                existing = remapped.get(next_key)
+                if existing is not None:
+                    _, existing_from_new_revision = existing
+                    if existing_from_new_revision and not from_new_revision:
+                        continue
+                    if not existing_from_new_revision and from_new_revision:
+                        total_bytes -= self._image_bytes(existing[0])
+                        remapped.pop(next_key)
+                    else:
+                        continue
+                remapped[next_key] = (image, from_new_revision)
+                total_bytes += self._image_bytes(image)
+            self._items = OrderedDict((key, value[0]) for key, value in remapped.items())
+            self._total_bytes = total_bytes
+            self._evict_if_needed()
             return
 
         updated: OrderedDict[RenderCacheKey, tuple[QImage, bool]] = OrderedDict()
@@ -761,12 +805,13 @@ class PdfRenderWorker(QObject):
         self._drop_pending_render_for_document(document_id)
         context.generation = generation
 
-    @Slot(object, object, object)
+    @Slot(object, object, object, object)
     def transition_cache_revision(
         self,
         old_revision: object,
         new_revision: object,
         affected_pages: object,
+        page_index_transition: object,
     ) -> None:
         if not isinstance(old_revision, DocumentRevision):
             raise TypeError("old_revision must be DocumentRevision")
@@ -774,10 +819,16 @@ class PdfRenderWorker(QObject):
             raise TypeError("new_revision must be DocumentRevision")
         if not isinstance(affected_pages, frozenset):
             raise TypeError("affected_pages must be frozenset[int]")
+        if page_index_transition is not None and not isinstance(
+            page_index_transition,
+            PageIndexTransition,
+        ):
+            raise TypeError("page_index_transition must be PageIndexTransition")
         self._cache.transition_revision(
             old_revision,
             new_revision,
             affected_pages=affected_pages,
+            page_index_transition=page_index_transition,
         )
 
     @Slot()
@@ -1040,7 +1091,7 @@ class PdfRenderService(QObject):
     _close_requested = Signal(str, int)
     _release_requested = Signal(object)
     _update_generation_requested = Signal(str, int, object)
-    _transition_cache_requested = Signal(object, object, object)
+    _transition_cache_requested = Signal(object, object, object, object)
     _shutdown_requested = Signal()
 
     def __init__(
@@ -1183,10 +1234,16 @@ class PdfRenderService(QObject):
         new_revision: DocumentRevision,
         *,
         affected_pages: frozenset[int],
+        page_index_transition: PageIndexTransition | None = None,
     ) -> None:
         if self._shutdown_requested_once or not self._thread.isRunning():
             return
-        self._transition_cache_requested.emit(old_revision, new_revision, affected_pages)
+        self._transition_cache_requested.emit(
+            old_revision,
+            new_revision,
+            affected_pages,
+            page_index_transition,
+        )
 
     def shutdown(self, timeout_ms: int = 3000) -> bool:
         if not self._thread.isRunning():

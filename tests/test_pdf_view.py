@@ -12,6 +12,7 @@ from PySide6.QtWidgets import QApplication, QWidget
 from pytestqt.qtbot import QtBot
 
 from pdf_regression_utils import compatibility_fixture_dir, file_sha256
+from pdf_workbench.domain.mutation import PageIndexTransition
 from pdf_workbench.services.page_coordinates import PageMetadata, PdfRect
 from pdf_workbench.services.pdf_renderer import (
     DocumentMetadata,
@@ -24,7 +25,7 @@ from pdf_workbench.services.pdf_renderer import (
     RenderResult,
     TextCharacterBox,
 )
-from pdf_workbench.ui.pdf_view import PdfView, PlaceholderState
+from pdf_workbench.ui.pdf_view import PdfView, PdfViewMutationSnapshot, PlaceholderState
 
 
 class FakeRenderService(QObject):
@@ -44,7 +45,9 @@ class FakeRenderService(QObject):
         self.render_requests: list[RenderRequest] = []
         self.close_calls: list[tuple[str, int]] = []
         self.generation_updates: list[tuple[str, int, DocumentRevision]] = []
-        self.cache_transitions: list[tuple[DocumentRevision, DocumentRevision, frozenset[int]]] = []
+        self.cache_transitions: list[
+            tuple[DocumentRevision, DocumentRevision, frozenset[int], PageIndexTransition | None]
+        ] = []
         self.shutdown_called = False
         self.text_requests: list[tuple[str, int, int, DocumentRevision]] = []
 
@@ -94,8 +97,11 @@ class FakeRenderService(QObject):
         new_revision: DocumentRevision,
         *,
         affected_pages: frozenset[int],
+        page_index_transition: PageIndexTransition | None = None,
     ) -> None:
-        self.cache_transitions.append((old_revision, new_revision, affected_pages))
+        self.cache_transitions.append(
+            (old_revision, new_revision, affected_pages, page_index_transition)
+        )
 
     def shutdown(self, timeout_ms: int = 3000) -> None:
         self.shutdown_called = True
@@ -786,6 +792,43 @@ def test_reload_after_working_copy_mutation_restores_snapshot_and_emits_completi
     assert view._search_query == "Alpha"
 
 
+def test_reload_after_working_copy_mutation_restores_mapped_snapshot_after_page_count_growth(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    document_path = create_pdf(tmp_path / "mutation-growth.pdf", 5)
+    service = FakeRenderService(create_metadata(document_path, 5))
+    view = PdfView(render_service=service, debounce_interval_ms=0)
+    _wrapper = show_view(qtbot, view)
+
+    view.open_document(document_path)
+    qtbot.waitUntil(lambda: view.page_count == 5)
+    view.set_zoom(1.75)
+    view._search_query = "Alpha"
+    original_snapshot = view.suspend_for_working_copy_mutation()
+    mapped_snapshot = PdfViewMutationSnapshot(
+        current_page_index=5,
+        selected_page_indexes=(2, 5),
+        logical_zoom=original_snapshot.logical_zoom,
+        search_query=original_snapshot.search_query,
+    )
+
+    updated_path = create_pdf(tmp_path / "mutation-growth-updated.pdf", 7)
+    document_path.write_bytes(updated_path.read_bytes())
+    service.metadata = create_metadata(document_path, 7)
+    completions: list[bool] = []
+    view.mutation_reload_completed.connect(completions.append)
+
+    assert view.reload_after_working_copy_mutation(mapped_snapshot) is True
+
+    qtbot.waitUntil(lambda: completions == [True])
+    assert view.page_count == 7
+    assert view.page_index == 5
+    assert view.selected_page_indexes == (2, 5)
+    assert view._logical_zoom == mapped_snapshot.logical_zoom
+    assert view._search_query == "Alpha"
+
+
 def test_reload_after_working_copy_mutation_clears_old_text_state_and_rebuilds_new_revision_matches(
     qtbot: QtBot,
     tmp_path: Path,
@@ -822,6 +865,39 @@ def test_reload_after_working_copy_mutation_clears_old_text_state_and_rebuilds_n
 
     service.emit_text_index(view._document_id, new_revision, 0, "Alpha", boxes)
     qtbot.waitUntil(lambda: view.search_state.total_count == 1)
+
+
+def test_transition_render_cache_forwards_page_index_transition(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    document_path = create_pdf(tmp_path / "transition-cache.pdf", 5)
+    service = FakeRenderService(create_metadata(document_path, 5))
+    view = PdfView(render_service=service, debounce_interval_ms=0)
+    _wrapper = show_view(qtbot, view)
+    old_revision = create_metadata(document_path, 5).revision
+    new_revision = DocumentRevision(
+        resolved_path=old_revision.resolved_path,
+        file_size=old_revision.file_size + 10,
+        mtime_ns=old_revision.mtime_ns + 1,
+    )
+    transition = PageIndexTransition(
+        old_page_count=5,
+        new_page_count=7,
+        cache_old_to_new=(0, 1, 3, 4, 6),
+        current_page_old_to_new=(0, 2, 3, 5, 6),
+    )
+
+    view.transition_render_cache(
+        old_revision,
+        new_revision,
+        affected_pages=frozenset({1, 3}),
+        page_index_transition=transition,
+    )
+
+    assert service.cache_transitions == [
+        (old_revision, new_revision, frozenset({1, 3}), transition)
+    ]
 
 
 def test_thumbnail_scale_uses_page_geometry_and_rotation(

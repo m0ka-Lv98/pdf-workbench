@@ -171,7 +171,7 @@ def test_apply_rotation_states_validates_candidate_before_replace(
 
     monkeypatch.setattr(
         service,
-        "_validate_candidate",
+        "_validate_rotation_candidate",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(PdfPageMutationError("validation failed")),
     )
 
