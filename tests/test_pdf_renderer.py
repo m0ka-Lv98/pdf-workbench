@@ -11,9 +11,12 @@ import pdf_workbench.services.pdf_renderer as pdf_renderer_module
 from pdf_workbench.services.page_coordinates import PageMetadata
 from pdf_workbench.services.pdf_renderer import (
     DocumentMetadata,
+    DocumentReleaseRequest,
+    DocumentReleaseResult,
     DocumentRevision,
     PageTextIndex,
     PdfiumDocumentBackend,
+    PdfRenderService,
     PdfRenderWorker,
     RenderCacheKey,
     RenderFailure,
@@ -169,6 +172,11 @@ class FailingRenderBackend(FakeBackend):
         raise RuntimeError(f"render failed {page_index}")
 
 
+class FailingCloseBackend(FakeBackend):
+    def close(self) -> None:
+        raise RuntimeError("close failed")
+
+
 class FakeRenderableImage:
     def __init__(
         self,
@@ -303,6 +311,212 @@ def test_render_cache_misses_when_file_revision_changes(tmp_path: Path) -> None:
     second_revision = make_revision(tmp_path, content=b"updated-content")
 
     assert cache.get(RenderCacheKey(second_revision, 0, 1.0, 0, 1.0)) is None
+
+
+def test_render_cache_transition_drops_only_affected_pages_and_rekeys_others(
+    tmp_path: Path,
+) -> None:
+    cache = RenderImageCache(max_bytes=1024 * 1024)
+    old_revision = make_revision(tmp_path, name="before.pdf", content=b"before")
+    new_revision = make_revision(tmp_path, name="after.pdf", content=b"after")
+    unaffected_key = RenderCacheKey(old_revision, 1, 1.5, 0, 1.0)
+    affected_key = RenderCacheKey(old_revision, 0, 1.5, 0, 1.0)
+    unrelated_revision = make_revision(tmp_path, name="other.pdf", content=b"other")
+    unrelated_key = RenderCacheKey(unrelated_revision, 0, 1.0, 0, 1.0)
+    unaffected_image = make_image()
+    affected_image = make_image(80, 80)
+    unrelated_image = make_image(48, 48)
+    expected_total = unaffected_image.sizeInBytes() + unrelated_image.sizeInBytes()
+
+    cache.put(unaffected_key, unaffected_image)
+    cache.put(affected_key, affected_image)
+    cache.put(unrelated_key, unrelated_image)
+
+    cache.transition_revision(old_revision, new_revision, affected_pages=frozenset({0}))
+
+    assert cache.get(affected_key) is None
+    assert cache.get(RenderCacheKey(new_revision, 1, 1.5, 0, 1.0)) is unaffected_image
+    assert cache.get(unrelated_key) is unrelated_image
+    assert cache.total_bytes == expected_total
+
+
+@pytest.mark.parametrize("old_first", [True, False])
+def test_render_cache_transition_prefers_existing_new_revision_entries_on_collision(
+    tmp_path: Path,
+    old_first: bool,
+) -> None:
+    cache = RenderImageCache(max_bytes=1024 * 1024)
+    old_revision = make_revision(tmp_path, name="before.pdf", content=b"before")
+    new_revision = make_revision(tmp_path, name="after.pdf", content=b"after")
+    old_main_key = RenderCacheKey(old_revision, 1, 1.5, 0, 1.0)
+    new_main_key = RenderCacheKey(new_revision, 1, 1.5, 0, 1.0)
+    old_thumb_key = RenderCacheKey(old_revision, 1, 0.25, 0, 1.0)
+    new_thumb_key = RenderCacheKey(new_revision, 1, 0.25, 0, 1.0)
+    old_main_image = make_image(80, 80)
+    new_main_image = make_image(81, 81)
+    old_thumb_image = make_image(40, 40)
+    new_thumb_image = make_image(41, 41)
+
+    if old_first:
+        cache.put(old_main_key, old_main_image)
+        cache.put(old_thumb_key, old_thumb_image)
+        cache.put(new_main_key, new_main_image)
+        cache.put(new_thumb_key, new_thumb_image)
+    else:
+        cache.put(new_main_key, new_main_image)
+        cache.put(new_thumb_key, new_thumb_image)
+        cache.put(old_main_key, old_main_image)
+        cache.put(old_thumb_key, old_thumb_image)
+
+    cache.transition_revision(old_revision, new_revision, affected_pages=frozenset())
+
+    assert cache.get(new_main_key) is new_main_image
+    assert cache.get(new_thumb_key) is new_thumb_image
+    assert cache.get(old_main_key) is None
+    assert cache.get(old_thumb_key) is None
+
+
+def test_render_service_release_document_waits_for_worker_close(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend("sample")
+    service = PdfRenderService(backend_factory=lambda _path: backend)
+    qtbot.waitUntil(service._thread.isRunning)
+    revision = make_revision(tmp_path)
+    document_path = tmp_path / "sample.pdf"
+
+    service.open_document("doc-1", document_path, 1, revision)
+    qtbot.waitUntil(lambda: "doc-1" in service._worker._documents)
+
+    result = service.release_document("doc-1", 1, timeout_ms=3000)
+    assert result.success is True
+    assert result.document_id == "doc-1"
+    assert result.requested_generation == 1
+    qtbot.waitUntil(lambda: backend.closed is True)
+    assert "doc-1" not in service._worker._documents
+    assert service.shutdown() is True
+
+
+def test_render_service_release_document_returns_failure_when_thread_is_not_running(
+    qtbot: QtBot,
+) -> None:
+    service = PdfRenderService()
+    qtbot.waitUntil(service._thread.isRunning)
+    assert service.shutdown() is True
+
+    result = service.release_document("doc-1", 1, timeout_ms=10)
+
+    assert result.success is False
+    assert result.request_id == "not-issued"
+    assert result.closed_generation is None
+    assert result.message == "renderer thread is not running"
+
+
+def test_render_worker_release_document_rejects_stale_generation(tmp_path: Path) -> None:
+    cache = RenderImageCache(max_bytes=1024 * 1024)
+    backend = FakeBackend("sample")
+    worker = PdfRenderWorker(lambda _path: backend, cache)
+    revision = make_revision(tmp_path)
+    worker.open_document("doc-1", tmp_path / "sample.pdf", 2, revision)
+    results: list[DocumentReleaseResult] = []
+    worker.document_released.connect(lambda result: results.append(result))
+
+    worker.release_document(DocumentReleaseRequest("req-1", "doc-1", 1))
+
+    assert results == [
+        DocumentReleaseResult(
+            request_id="req-1",
+            document_id="doc-1",
+            requested_generation=1,
+            closed_generation=2,
+            success=False,
+            message="stale generation",
+        )
+    ]
+    assert backend.closed is False
+
+
+def test_render_worker_release_document_returns_failure_on_close_exception(tmp_path: Path) -> None:
+    cache = RenderImageCache(max_bytes=1024 * 1024)
+    worker = PdfRenderWorker(lambda _path: FailingCloseBackend("broken"), cache)
+    revision = make_revision(tmp_path)
+    worker.open_document("doc-1", tmp_path / "sample.pdf", 1, revision)
+    results: list[DocumentReleaseResult] = []
+    worker.document_released.connect(lambda result: results.append(result))
+
+    worker.release_document(DocumentReleaseRequest("req-2", "doc-1", 1))
+
+    assert len(results) == 1
+    assert results[0].request_id == "req-2"
+    assert results[0].success is False
+    assert results[0].message == "close failed"
+    assert "doc-1" in worker._documents
+
+
+def test_render_worker_release_document_without_context_is_idempotent_success(
+    tmp_path: Path,
+) -> None:
+    cache = RenderImageCache(max_bytes=1024 * 1024)
+    worker = PdfRenderWorker(lambda _path: FakeBackend("unused"), cache)
+    results: list[DocumentReleaseResult] = []
+    worker.document_released.connect(lambda result: results.append(result))
+
+    worker.release_document(DocumentReleaseRequest("req-idempotent", "missing", 4))
+
+    assert results == [
+        DocumentReleaseResult(
+            request_id="req-idempotent",
+            document_id="missing",
+            requested_generation=4,
+            closed_generation=None,
+            success=True,
+        )
+    ]
+
+
+def test_render_worker_release_document_rejects_generation_mismatch(tmp_path: Path) -> None:
+    cache = RenderImageCache(max_bytes=1024 * 1024)
+    backend = FakeBackend("sample")
+    worker = PdfRenderWorker(lambda _path: backend, cache)
+    revision = make_revision(tmp_path)
+    worker.open_document("doc-1", tmp_path / "sample.pdf", 3, revision)
+    results: list[DocumentReleaseResult] = []
+    worker.document_released.connect(lambda result: results.append(result))
+
+    worker.release_document(DocumentReleaseRequest("req-mismatch", "doc-1", 4))
+
+    assert results == [
+        DocumentReleaseResult(
+            request_id="req-mismatch",
+            document_id="doc-1",
+            requested_generation=4,
+            closed_generation=3,
+            success=False,
+            message="generation mismatch",
+        )
+    ]
+    assert backend.closed is False
+
+
+def test_render_worker_open_document_reports_existing_backend_close_failure(tmp_path: Path) -> None:
+    cache = RenderImageCache(max_bytes=1024 * 1024)
+    first_backend = FailingCloseBackend("first")
+    second_backend = FakeBackend("second")
+    backends = [first_backend, second_backend]
+    worker = PdfRenderWorker(lambda _path: backends.pop(0), cache)
+    revision = make_revision(tmp_path)
+    failures: list[tuple[str, int, str]] = []
+    worker.document_failed.connect(
+        lambda document_id, generation, message: failures.append((document_id, generation, message))
+    )
+
+    worker.open_document("doc-1", tmp_path / "first.pdf", 1, revision)
+    worker.open_document("doc-1", tmp_path / "second.pdf", 2, revision)
+
+    assert failures == [("doc-1", 2, "close failed")]
+    assert worker._documents["doc-1"].backend is first_backend
+    assert second_backend.closed is False
 
 
 def test_pdfium_backend_sets_device_pixel_ratio(tmp_path: Path) -> None:

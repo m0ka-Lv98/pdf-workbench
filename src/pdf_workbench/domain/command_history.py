@@ -4,19 +4,29 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Literal
 
+from pdf_workbench.domain.mutation import WorkingCopyMutationResult
+
 
 @dataclass(frozen=True, slots=True)
 class CommandChange:
     affected_pages: frozenset[int] | None
+    requires_reload: bool = False
+    mutation_result: WorkingCopyMutationResult | None = None
 
     @classmethod
     def from_command(cls, command: DocumentCommand) -> CommandChange:
-        return cls(affected_pages=command.affected_pages)
+        return cls(
+            affected_pages=command.affected_pages,
+            requires_reload=bool(getattr(command, "requires_document_reload", False)),
+            mutation_result=getattr(command, "last_mutation_result", None),
+        )
 
 
 class DocumentCommand(ABC):
     description: str
     affected_pages: frozenset[int] | None
+    requires_document_reload: bool = False
+    mutates_working_copy: bool = False
 
     @abstractmethod
     def execute(self) -> CommandChange | None:
@@ -198,6 +208,18 @@ class CommandHistory:
         if not self.can_redo:
             return None
         return self._commands[self._cursor].description
+
+    @property
+    def undo_command(self) -> DocumentCommand | None:
+        if not self.can_undo:
+            return None
+        return self._commands[self._cursor - 1]
+
+    @property
+    def redo_command(self) -> DocumentCommand | None:
+        if not self.can_redo:
+            return None
+        return self._commands[self._cursor]
 
     @property
     def is_dirty(self) -> bool:

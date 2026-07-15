@@ -121,18 +121,24 @@ def test_command_history_execute_undo_and_redo_track_dirty_and_descriptions() ->
     assert history.is_dirty is True
     assert history.can_undo is True
     assert history.undo_description == "Rotate page 1"
+    assert history.undo_command is command
+    assert history.redo_command is None
 
     history.undo()
 
     assert history.is_dirty is False
     assert history.can_redo is True
     assert history.redo_description == "Rotate page 1"
+    assert history.undo_command is None
+    assert history.redo_command is command
 
     history.redo()
 
     assert history.is_dirty is True
     assert history.can_undo is True
     assert history.can_redo is False
+    assert history.undo_command is command
+    assert history.redo_command is None
 
 
 def test_command_history_tracks_clean_marker_across_save_and_undo_redo() -> None:

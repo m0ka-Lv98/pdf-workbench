@@ -15,6 +15,7 @@ from pdf_regression_utils import compatibility_fixture_dir, file_sha256
 from pdf_workbench.services.page_coordinates import PageMetadata, PdfRect
 from pdf_workbench.services.pdf_renderer import (
     DocumentMetadata,
+    DocumentReleaseResult,
     DocumentRevision,
     PageTextIndex,
     PdfRenderService,
@@ -43,6 +44,7 @@ class FakeRenderService(QObject):
         self.render_requests: list[RenderRequest] = []
         self.close_calls: list[tuple[str, int]] = []
         self.generation_updates: list[tuple[str, int, DocumentRevision]] = []
+        self.cache_transitions: list[tuple[DocumentRevision, DocumentRevision, frozenset[int]]] = []
         self.shutdown_called = False
         self.text_requests: list[tuple[str, int, int, DocumentRevision]] = []
 
@@ -62,6 +64,22 @@ class FakeRenderService(QObject):
     def close_document(self, document_id: str, generation: int) -> None:
         self.close_calls.append((document_id, generation))
 
+    def release_document(
+        self,
+        document_id: str,
+        generation: int,
+        timeout_ms: int = 3000,
+    ) -> DocumentReleaseResult:
+        _ = timeout_ms
+        self.close_calls.append((document_id, generation))
+        return DocumentReleaseResult(
+            request_id="fake",
+            document_id=document_id,
+            requested_generation=generation,
+            closed_generation=generation,
+            success=True,
+        )
+
     def update_document_generation(
         self,
         document_id: str,
@@ -69,6 +87,15 @@ class FakeRenderService(QObject):
         revision: DocumentRevision,
     ) -> None:
         self.generation_updates.append((document_id, generation, revision))
+
+    def transition_cache_revision(
+        self,
+        old_revision: DocumentRevision,
+        new_revision: DocumentRevision,
+        *,
+        affected_pages: frozenset[int],
+    ) -> None:
+        self.cache_transitions.append((old_revision, new_revision, affected_pages))
 
     def shutdown(self, timeout_ms: int = 3000) -> None:
         self.shutdown_called = True
@@ -672,6 +699,131 @@ def test_rotation_change_requests_new_thumbnail_keys_without_scrolling_organizer
     assert view.page_index == 0
 
 
+def test_suspend_for_working_copy_mutation_captures_state_and_blocks_new_requests(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    document_path = create_pdf(tmp_path / "mutation-suspend.pdf", 6)
+    service = FakeRenderService(create_metadata(document_path, 6))
+    view = PdfView(render_service=service, debounce_interval_ms=0)
+    _wrapper = show_view(qtbot, view)
+
+    view.open_document(document_path)
+    qtbot.waitUntil(lambda: view.page_count == 6)
+    qtbot.waitUntil(lambda: bool(view._page_organizer.visible_page_indexes))
+    view.set_zoom(2.0)
+    view._page_organizer.set_selected_page_indexes((1, 3), current_index=3)
+    view.set_page(3)
+    view._search_query = "Alpha"
+    service.render_requests.clear()
+
+    snapshot = view.suspend_for_working_copy_mutation()
+    view._schedule_visible_page_update()
+    qtbot.wait(20)
+
+    assert snapshot.current_page_index == 3
+    assert snapshot.selected_page_indexes == (1, 3)
+    assert snapshot.logical_zoom == view._logical_zoom
+    assert snapshot.search_query == "Alpha"
+    assert view._mutation_suspended is True
+    assert view._visible_timer.isActive() is False
+    assert view._desired_pages == set()
+    assert view._expected_main_render_keys == {}
+    assert view._page_organizer.desired_thumbnail_pages == ()
+    assert service.generation_updates[-1][1] == view._generation
+    assert service.render_requests == []
+
+
+def test_suspend_blocks_direct_main_and_thumbnail_request_methods(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    document_path = create_pdf(tmp_path / "mutation-guard-direct.pdf", 6)
+    service = FakeRenderService(create_metadata(document_path, 6))
+    view = PdfView(render_service=service, debounce_interval_ms=0)
+    _wrapper = show_view(qtbot, view)
+
+    view.open_document(document_path)
+    qtbot.waitUntil(lambda: view.page_count == 6)
+    qtbot.waitUntil(lambda: bool(view._page_organizer.visible_page_indexes))
+    snapshot = view.suspend_for_working_copy_mutation()
+    service.render_requests.clear()
+
+    view._request_visible_pages()
+    view._request_visible_thumbnails(create_metadata(document_path, 6).revision)
+
+    assert snapshot.selected_page_indexes == (0,)
+    assert service.render_requests == []
+
+
+def test_reload_after_working_copy_mutation_restores_snapshot_and_emits_completion(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    document_path = create_pdf(tmp_path / "mutation-reload.pdf", 5)
+    service = FakeRenderService(create_metadata(document_path, 5))
+    view = PdfView(render_service=service, debounce_interval_ms=0)
+    _wrapper = show_view(qtbot, view)
+
+    view.open_document(document_path)
+    qtbot.waitUntil(lambda: view.page_count == 5)
+    view.set_zoom(2.0)
+    view._page_organizer.set_selected_page_indexes((1, 4), current_index=4)
+    view.set_page(4)
+    view._search_query = "Alpha"
+    snapshot = view.suspend_for_working_copy_mutation()
+    completions: list[bool] = []
+    view.mutation_reload_completed.connect(completions.append)
+
+    assert view.reload_after_working_copy_mutation(snapshot) is True
+
+    qtbot.waitUntil(lambda: completions == [True])
+    assert view._mutation_suspended is False
+    assert view._mutation_reload_active is False
+    assert view.page_index == 4
+    assert view.selected_page_indexes == (1, 4)
+    assert view._logical_zoom == snapshot.logical_zoom
+    assert view._search_query == "Alpha"
+
+
+def test_reload_after_working_copy_mutation_clears_old_text_state_and_rebuilds_new_revision_matches(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    document_path = create_pdf(tmp_path / "mutation-search.pdf", 1)
+    service = FakeRenderService(create_metadata(document_path, 1))
+    view = PdfView(render_service=service, debounce_interval_ms=0)
+    _wrapper = show_view(qtbot, view)
+
+    view.open_document(document_path)
+    qtbot.waitUntil(lambda: view.page_count == 1)
+    old_revision = create_metadata(document_path, 1).revision
+    boxes = [
+        PdfRect(10.0 + index * 24.0, 10.0, 30.0 + index * 24.0, 20.0)
+        for index in range(len("Alpha"))
+    ]
+    service.emit_text_index(view._document_id, old_revision, 0, "Alpha", boxes)
+    qtbot.waitUntil(lambda: view.search("Alpha") == 1)
+    snapshot = view.suspend_for_working_copy_mutation()
+
+    updated_path = create_pdf(tmp_path / "updated-mutation-search.pdf", 1)
+    document_path.write_bytes(updated_path.read_bytes())
+    new_revision = create_metadata(document_path, 1).revision
+    service.metadata = create_metadata(document_path, 1)
+
+    assert view.reload_after_working_copy_mutation(snapshot) is True
+    qtbot.waitUntil(lambda: view._metadata is not None and view._metadata.revision == new_revision)
+    assert view.search_state.query == "Alpha"
+    assert view.search_state.total_count == 0
+    assert view.search_state.current_index == 0
+
+    service.emit_text_index(view._document_id, old_revision, 0, "Alpha", boxes)
+    assert view.search_state.total_count == 0
+
+    service.emit_text_index(view._document_id, new_revision, 0, "Alpha", boxes)
+    qtbot.waitUntil(lambda: view.search_state.total_count == 1)
+
+
 def test_thumbnail_scale_uses_page_geometry_and_rotation(
     qtbot: QtBot,
     tmp_path: Path,
@@ -849,6 +1001,31 @@ def test_revision_reload_clears_organizer_and_expected_render_state_before_reope
     assert view._page_organizer.expected_key_count == 0
     assert view._expected_main_render_keys == {}
     assert view._canvas.pages == []
+
+
+def test_reload_document_restores_page_and_organizer_selection(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    document_path = create_pdf(tmp_path / "reload-restore.pdf", 4)
+    service = FakeRenderService(create_metadata(document_path, 4))
+    view = PdfView(render_service=service, debounce_interval_ms=0)
+    _wrapper = show_view(qtbot, view)
+
+    view.open_document(document_path)
+    qtbot.waitUntil(lambda: view.page_count == 4)
+    view._page_organizer.set_selected_page_indexes((1, 3), current_index=3)
+    view.set_page(3)
+
+    assert view.reload_document(
+        restore_page_index=3,
+        restore_selected_page_indexes=(1, 3),
+        clear_query=False,
+    )
+
+    qtbot.waitUntil(lambda: view.page_index == 3)
+    assert view.selected_page_indexes == (1, 3)
+    assert view._page_organizer.current_page_index == 3
 
 
 def test_reload_failure_keeps_organizer_empty_and_rejects_late_results(

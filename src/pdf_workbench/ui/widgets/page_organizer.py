@@ -239,6 +239,9 @@ class PageOrganizerListView(QListView):
             self._last_emitted_pages = None
         self._schedule_visible_pages()
 
+    def stop_pending_visible_thumbnail_update(self) -> None:
+        self._visible_timer.stop()
+
     def _emit_visible_pages(self) -> None:
         model = self.model()
         if model is None:
@@ -604,6 +607,9 @@ class PageOrganizer(QWidget):
 
     def schedule_visible_thumbnail_update(self, *, force: bool = False) -> None:
         self._list.schedule_visible_thumbnail_update(force=force)
+
+    def stop_pending_thumbnail_updates(self) -> None:
+        self._list.stop_pending_visible_thumbnail_update()
 
     def set_desired_thumbnail_pages(self, page_indexes: tuple[int, ...]) -> tuple[int, ...]:
         valid_indexes = tuple(

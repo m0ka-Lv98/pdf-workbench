@@ -33,9 +33,11 @@ def test_document_toolbar_updates_state_and_emits_signals(qtbot: QtBot) -> None:
     assert toolbar.zoom_out_button.text() == ""
     assert toolbar.zoom_in_button.text() == ""
     assert toolbar.rotate_button.text() == ""
+    assert toolbar.rotate_button.accessibleName() == "Rotate selected pages clockwise"
     assert toolbar.previous_button.toolTip() == "前のページ"
     assert toolbar.zoom_out_button.toolTip() == "ズームを縮小"
     assert toolbar.zoom_in_button.toolTip() == "ズームを拡大"
+    assert toolbar.rotate_button.toolTip() == "選択したページを時計回りに90°回転"
     assert toolbar.height() == 54
     assert button_has_icon(toolbar.open_button)
     assert button_has_icon(toolbar.search_button)

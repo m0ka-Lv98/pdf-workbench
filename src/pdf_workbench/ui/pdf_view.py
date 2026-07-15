@@ -37,6 +37,7 @@ from pdf_workbench.services.page_coordinates import (
 )
 from pdf_workbench.services.pdf_renderer import (
     DocumentMetadata,
+    DocumentReleaseResult,
     DocumentRevision,
     NormalizedPageText,
     PageTextIndex,
@@ -366,6 +367,14 @@ class VisiblePageRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class PdfViewMutationSnapshot:
+    current_page_index: int
+    selected_page_indexes: tuple[int, ...]
+    logical_zoom: float
+    search_query: str
+
+
+@dataclass(frozen=True, slots=True)
 class PdfSearchState:
     query: str
     current_index: int
@@ -385,6 +394,7 @@ class PdfView(QWidget):
     search_state_changed = Signal()
     selection_changed = Signal()
     document_loaded = Signal()
+    mutation_reload_completed = Signal(bool)
     current_page_changed = Signal(int)
 
     def __init__(
@@ -423,6 +433,11 @@ class PdfView(QWidget):
         self._empty_text_page_indexes: set[int] = set()
         self._image_only_page_indexes: set[int] = set()
         self._search_top_inset = 24
+        self._pending_restore_page_index: int | None = None
+        self._pending_restore_selected_page_indexes: tuple[int, ...] | None = None
+        self._pending_restore_query: str | None = None
+        self._mutation_suspended = False
+        self._mutation_reload_active = False
 
         self._content = QWidget(self)
         self._content.setObjectName("pdfContent")
@@ -518,9 +533,21 @@ class PdfView(QWidget):
     def selected_page_indexes(self) -> tuple[int, ...]:
         return self._page_organizer.selected_page_indexes
 
+    @property
+    def document_id(self) -> str:
+        return self._document_id
+
+    @property
+    def generation(self) -> int:
+        return self._generation
+
     def open_document(self, path: Path) -> None:
         resolved_path = path.expanduser().resolve()
         self._path = resolved_path
+        self._pending_restore_page_index = None
+        self._pending_restore_selected_page_indexes = None
+        self._pending_restore_query = None
+        self._mutation_reload_active = False
         self._clear_document_render_state_for_reload(clear_query=True)
         self._bump_generation()
         self._show_status("PDFを読み込み中です")
@@ -534,6 +561,129 @@ class PdfView(QWidget):
             resolved_path,
             self._generation,
             revision,
+        )
+
+    def reload_document(
+        self,
+        *,
+        restore_page_index: int | None = None,
+        restore_selected_page_indexes: tuple[int, ...] | None = None,
+        clear_query: bool = False,
+    ) -> bool:
+        if self._path is None:
+            return False
+        resolved_path = self._path.expanduser().resolve()
+        target_page_index = (
+            self._current_page_index if restore_page_index is None else restore_page_index
+        )
+        selected_page_indexes = (
+            self.selected_page_indexes
+            if restore_selected_page_indexes is None
+            else tuple(restore_selected_page_indexes)
+        )
+        self._pending_restore_page_index = target_page_index
+        self._pending_restore_selected_page_indexes = selected_page_indexes
+        self._pending_restore_query = self._search_query if not clear_query else None
+        self._clear_document_render_state_for_reload(clear_query=clear_query)
+        self._bump_generation()
+        self._show_status("PDFを再読み込み中です")
+        try:
+            revision = DocumentRevision.from_path(resolved_path)
+        except OSError as exc:
+            self._pending_restore_page_index = None
+            self._pending_restore_selected_page_indexes = None
+            self._pending_restore_query = None
+            self._show_error(str(exc))
+            return False
+        self._render_service.open_document(
+            self._document_id,
+            resolved_path,
+            self._generation,
+            revision,
+        )
+        return True
+
+    def release_renderer_backend(self, timeout_ms: int = 3000) -> DocumentReleaseResult:
+        return self._render_service.release_document(
+            self._document_id,
+            self._generation,
+            timeout_ms,
+        )
+
+    def suspend_for_working_copy_mutation(self) -> PdfViewMutationSnapshot:
+        snapshot = PdfViewMutationSnapshot(
+            current_page_index=self._current_page_index,
+            selected_page_indexes=self.selected_page_indexes,
+            logical_zoom=self._logical_zoom,
+            search_query=self._search_query,
+        )
+        self._mutation_suspended = True
+        self._visible_timer.stop()
+        self._page_organizer.stop_pending_thumbnail_updates()
+        self._desired_pages.clear()
+        self._expected_main_render_keys.clear()
+        self._page_organizer.set_desired_thumbnail_pages(())
+        self._advance_render_generation()
+        return snapshot
+
+    def reload_after_working_copy_mutation(self, snapshot: PdfViewMutationSnapshot) -> bool:
+        if self._path is None:
+            self._mutation_suspended = False
+            self.mutation_reload_completed.emit(False)
+            return False
+        self._logical_zoom = snapshot.logical_zoom
+        self._mutation_reload_active = True
+        self._pending_restore_query = snapshot.search_query
+        reloaded = self.reload_document(
+            restore_page_index=snapshot.current_page_index,
+            restore_selected_page_indexes=snapshot.selected_page_indexes,
+            clear_query=False,
+        )
+        if not reloaded:
+            self._mutation_reload_active = False
+            self._mutation_suspended = False
+            self.mutation_reload_completed.emit(False)
+            return False
+        return True
+
+    def resume_after_failed_working_copy_mutation(
+        self,
+        snapshot: PdfViewMutationSnapshot,
+    ) -> None:
+        self._logical_zoom = snapshot.logical_zoom
+        self._search_query = snapshot.search_query
+        self._pending_restore_query = None
+        self._mutation_reload_active = False
+        self._mutation_suspended = False
+        if self._metadata is not None and self.page_count > 0:
+            clamped_page_index = _clamp(snapshot.current_page_index, 0, self.page_count - 1)
+            self.set_page(clamped_page_index)
+            self._page_organizer.set_selected_page_indexes(
+                tuple(
+                    page_index
+                    for page_index in snapshot.selected_page_indexes
+                    if 0 <= page_index < self.page_count
+                )
+                or (clamped_page_index,),
+                current_index=clamped_page_index,
+            )
+            self._schedule_visible_page_update()
+            self._page_organizer.schedule_visible_thumbnail_update(force=True)
+        self._refresh_page_overlays()
+        self.search_state_changed.emit()
+        self.state_changed.emit()
+
+    def transition_render_cache(
+        self,
+        old_revision: DocumentRevision,
+        new_revision: DocumentRevision,
+        *,
+        affected_pages: frozenset[int],
+    ) -> None:
+        self._render_service.transition_cache_revision(
+            old_revision,
+            new_revision,
+            affected_pages=affected_pages,
         )
 
     def _advance_render_generation(self) -> None:
@@ -678,18 +828,30 @@ class PdfView(QWidget):
         self._canvas.set_pages(pages)
         self._page_organizer.set_document(metadata.pages)
         self._set_current_page_index(0, emit=False)
+        self._apply_pending_reload_restore()
         self._status_label.hide()
         self._canvas.show()
         self._content.adjustSize()
         self._schedule_visible_page_update()
         self._page_organizer.schedule_visible_thumbnail_update(force=True)
         self._refresh_page_overlays()
+        self._mutation_suspended = False
+        if self._mutation_reload_active:
+            self._mutation_reload_active = False
+            self.mutation_reload_completed.emit(True)
         self.document_loaded.emit()
         self.state_changed.emit()
 
     def _on_document_failed(self, document_id: object, generation: int, message: str) -> None:
         if document_id != self._document_id or generation != self._generation or self._closed:
             return
+        self._pending_restore_page_index = None
+        self._pending_restore_selected_page_indexes = None
+        self._pending_restore_query = None
+        self._mutation_suspended = False
+        if self._mutation_reload_active:
+            self._mutation_reload_active = False
+            self.mutation_reload_completed.emit(False)
         self._show_error(message)
 
     def _on_render_succeeded(self, result: object) -> None:
@@ -1236,7 +1398,7 @@ class PdfView(QWidget):
         return math.hypot(dx, dy)
 
     def _schedule_visible_page_update(self) -> None:
-        if self._metadata is None or self._closed:
+        if self._metadata is None or self._closed or self._mutation_suspended:
             return
         self._visible_timer.start()
 
@@ -1248,11 +1410,47 @@ class PdfView(QWidget):
         self._page_organizer.clear()
         self._canvas.set_pages([])
         self._metadata = None
+        self._clear_text_state(clear_query=clear_query)
         if clear_query:
-            self._clear_text_state(clear_query=True)
+            self._pending_restore_query = None
+
+    def _apply_pending_reload_restore(self) -> None:
+        if self.page_count <= 0:
+            self._pending_restore_page_index = None
+            self._pending_restore_selected_page_indexes = None
+            self._pending_restore_query = None
+            return
+        if self._pending_restore_page_index is None:
+            return
+        clamped_page_index = _clamp(self._pending_restore_page_index, 0, self.page_count - 1)
+        selected_page_indexes = self._pending_restore_selected_page_indexes or ()
+        self._pending_restore_page_index = None
+        self._pending_restore_selected_page_indexes = None
+        if self._pending_restore_query is not None:
+            self._search_query = self._pending_restore_query
+        self._pending_restore_query = None
+        self.set_page(clamped_page_index)
+        valid_selection = tuple(
+            sorted(
+                {
+                    page_index
+                    for page_index in selected_page_indexes
+                    if 0 <= page_index < self.page_count
+                }
+            )
+        )
+        if not valid_selection:
+            valid_selection = (clamped_page_index,)
+        current_selection_index = (
+            clamped_page_index if clamped_page_index in valid_selection else valid_selection[-1]
+        )
+        self._page_organizer.set_selected_page_indexes(
+            valid_selection,
+            current_index=current_selection_index,
+        )
 
     def _request_visible_pages(self) -> None:
-        if self._metadata is None or self._path is None or self._closed:
+        if self._mutation_suspended or self._metadata is None or self._path is None or self._closed:
             return
         try:
             revision = DocumentRevision.from_path(self._path)
@@ -1417,6 +1615,8 @@ class PdfView(QWidget):
         self.state_changed.emit()
 
     def _on_visible_thumbnail_pages_changed(self, page_indexes: object) -> None:
+        if self._mutation_suspended:
+            return
         if not isinstance(page_indexes, tuple):
             return
         desired_page_indexes = self._page_organizer.set_desired_thumbnail_pages(page_indexes)
@@ -1426,7 +1626,7 @@ class PdfView(QWidget):
             self._request_visible_thumbnails(self._metadata.revision)
 
     def _request_visible_thumbnails(self, revision: DocumentRevision) -> None:
-        if self._metadata is None:
+        if self._mutation_suspended or self._metadata is None:
             return
         desired_page_indexes = self._page_organizer.desired_thumbnail_pages
         if not desired_page_indexes:

@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import sys
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC
@@ -11,7 +12,7 @@ from enum import StrEnum
 from functools import partial
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QMimeData, QObject, QRect, QSettings, Qt, QTimer
+from PySide6.QtCore import QEvent, QEventLoop, QMimeData, QObject, QRect, QSettings, Qt, QTimer
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
@@ -49,6 +50,8 @@ from pdf_workbench.domain.command_history import (
     DocumentCommand,
 )
 from pdf_workbench.domain.document_session import DocumentSession, SourceStatus
+from pdf_workbench.domain.page_commands import RotatePagesCommand
+from pdf_workbench.services.pdf_page_mutation import PdfPageMutationService
 from pdf_workbench.services.pdf_renderer import PdfRenderService
 from pdf_workbench.services.pdf_save_service import (
     PdfSaveError,
@@ -69,7 +72,7 @@ from pdf_workbench.services.source_change_monitor import (
     SourceCheckResult,
 )
 from pdf_workbench.ui.icon_provider import IconName, IconProvider, IconTone
-from pdf_workbench.ui.pdf_view import PdfView
+from pdf_workbench.ui.pdf_view import PdfView, PdfViewMutationSnapshot
 from pdf_workbench.ui.widgets.document_toolbar import DocumentToolbar, ToolbarState
 from pdf_workbench.ui.widgets.empty_state import EmptyState
 from pdf_workbench.ui.widgets.search_bar import SearchBar, SearchBarState
@@ -86,6 +89,8 @@ class DocumentTab:
     session: DocumentSession
     view: PdfView
     command_history: CommandHistory
+    mutation_in_progress: bool = False
+    mutation_operation_id: int = 0
 
 
 class RestoreSessionResult(StrEnum):
@@ -125,6 +130,7 @@ class MainWindow(QMainWindow):
             workspace_manager if workspace_manager is not None else SessionWorkspaceManager()
         )
         self._save_service = save_service if save_service is not None else PdfSaveService()
+        self._page_mutation_service = PdfPageMutationService()
         self._recovery_service = (
             recovery_service
             if recovery_service is not None
@@ -465,6 +471,8 @@ class MainWindow(QMainWindow):
             return False
 
         document = self._documents[index]
+        if document.mutation_in_progress:
+            return False
         if document.session.is_modified:
             result = QMessageBox.question(
                 self,
@@ -510,6 +518,9 @@ class MainWindow(QMainWindow):
         return True
 
     def close_current_document(self) -> bool:
+        document = self._current_document()
+        if document is not None and document.mutation_in_progress:
+            return False
         return self.close_document_at(self._tabs.currentIndex())
 
     def _previous_page(self) -> None:
@@ -542,12 +553,18 @@ class MainWindow(QMainWindow):
 
     def _rotate_page(self) -> None:
         document = self._current_document()
-        if document is None:
+        if document is None or document.mutation_in_progress:
             return
-        rotation = (document.view.rotation + 90) % 360
-        document.view.set_rotation(rotation)
-        self._sync_toolbar(document)
-        self._update_status()
+        page_indexes = document.view.selected_page_indexes
+        if not page_indexes:
+            return
+        self.execute_document_command(
+            RotatePagesCommand(
+                document.session.document_path,
+                page_indexes,
+                self._page_mutation_service,
+            )
+        )
 
     def open_search_bar(self) -> bool:
         document = self._current_document()
@@ -600,8 +617,16 @@ class MainWindow(QMainWindow):
 
     def execute_document_command(self, command: DocumentCommand) -> bool:
         document = self._current_document()
-        if document is None or document.session.is_saving:
+        if document is None or document.session.is_saving or document.mutation_in_progress:
             return False
+        if command.mutates_working_copy:
+            return self._run_document_command_operation(
+                document,
+                command=command,
+                operation=lambda: document.command_history.execute(command),
+                failure_title="編集に失敗しました",
+                success_description=command.description,
+            )
         try:
             change = document.command_history.execute(command)
         except CommandExecutionError as exc:
@@ -631,11 +656,25 @@ class MainWindow(QMainWindow):
 
     def _undo_current_command(self) -> bool:
         document = self._current_document()
-        if document is None or document.session.is_saving or not document.command_history.can_undo:
+        if (
+            document is None
+            or document.session.is_saving
+            or document.mutation_in_progress
+            or not document.command_history.can_undo
+        ):
             return False
         description = document.command_history.undo_description
+        undo_command = document.command_history.undo_command
         if description is None:
             return False
+        if undo_command is not None and undo_command.mutates_working_copy:
+            return self._run_document_command_operation(
+                document,
+                command=undo_command,
+                operation=document.command_history.undo,
+                failure_title="元に戻せませんでした",
+                success_description=f"Undo: {description}",
+            )
         try:
             change = document.command_history.undo()
         except CommandUndoError as exc:
@@ -651,11 +690,25 @@ class MainWindow(QMainWindow):
 
     def _redo_current_command(self) -> bool:
         document = self._current_document()
-        if document is None or document.session.is_saving or not document.command_history.can_redo:
+        if (
+            document is None
+            or document.session.is_saving
+            or document.mutation_in_progress
+            or not document.command_history.can_redo
+        ):
             return False
         description = document.command_history.redo_description
+        redo_command = document.command_history.redo_command
         if description is None:
             return False
+        if redo_command is not None and redo_command.mutates_working_copy:
+            return self._run_document_command_operation(
+                document,
+                command=redo_command,
+                operation=document.command_history.redo,
+                failure_title="やり直せませんでした",
+                success_description=f"Redo: {description}",
+            )
         try:
             change = document.command_history.redo()
         except CommandRedoError as exc:
@@ -677,7 +730,7 @@ class MainWindow(QMainWindow):
 
     def _save_current_document_as(self) -> bool:
         document = self._current_document()
-        if document is None:
+        if document is None or document.session.is_saving or document.mutation_in_progress:
             return False
         target_path = self._choose_save_as_path(document)
         if target_path is None:
@@ -691,7 +744,7 @@ class MainWindow(QMainWindow):
         target_path: Path | None = None,
     ) -> bool:
         session = document.session
-        if session.is_saving:
+        if session.is_saving or document.mutation_in_progress:
             return False
         intent = SaveIntent.SAVE if target_path is None else SaveIntent.SAVE_AS
         source_check_result: SourceCheckResult | None = None
@@ -952,16 +1005,20 @@ class MainWindow(QMainWindow):
                 text_selected = False
         document = self._current_document()
         document_selection = bool(document and document.view.selected_text)
-        self.close_action.setEnabled(has_document)
+        mutation_blocked = bool(document and document.mutation_in_progress)
+        self.close_action.setEnabled(has_document and not mutation_blocked)
         self._update_undo_redo_actions(document)
         self.save_action.setEnabled(
             bool(
                 document
                 and not document.session.is_saving
+                and not document.mutation_in_progress
                 and (document.session.is_modified or document.session.requires_save_as)
             )
         )
-        self.save_as_action.setEnabled(bool(document and not document.session.is_saving))
+        self.save_as_action.setEnabled(
+            bool(document and not document.session.is_saving and not document.mutation_in_progress)
+        )
         self.previous_action.setEnabled(has_document)
         self.next_action.setEnabled(has_document)
         self.zoom_in_action.setEnabled(has_document)
@@ -1385,11 +1442,13 @@ class MainWindow(QMainWindow):
         *,
         description: str,
         change: CommandChange,
+        apply_change: bool = True,
     ) -> None:
         document.session.set_modified(document.command_history.is_dirty)
         document.session.record_operation(description)
         self._persist_recovery_metadata(document.session)
-        self._apply_command_change(document, change)
+        if apply_change:
+            self._apply_command_change(document, change)
         index = self._find_document_index(document.session.source_path)
         if index is not None:
             self._tabs.setTabText(index, self._tab_title(document))
@@ -1399,9 +1458,132 @@ class MainWindow(QMainWindow):
         self._update_status()
 
     def _apply_command_change(self, document: DocumentTab, change: CommandChange) -> None:
-        # Issue #9 only wires the invalidation seam. Concrete editing commands will decide
-        # whether page-level or whole-document refresh is necessary in later milestones.
-        _ = (document, change)
+        if change.mutation_result is not None:
+            document.view.transition_render_cache(
+                change.mutation_result.old_revision,
+                change.mutation_result.new_revision,
+                affected_pages=change.mutation_result.affected_pages,
+            )
+        if not change.requires_reload:
+            return
+        restored_page_index = document.session.current_page_index
+        restored_selection = document.view.selected_page_indexes
+        reloaded = document.view.reload_document(
+            restore_page_index=restored_page_index,
+            restore_selected_page_indexes=restored_selection,
+            clear_query=False,
+        )
+        if not reloaded:
+            self._report_error(
+                "再読み込みに失敗しました",
+                "変更後のPDFを再読み込みできませんでした。タブを閉じずに状態を確認してください。",
+            )
+
+    def _run_document_command_operation(
+        self,
+        document: DocumentTab,
+        *,
+        command: DocumentCommand,
+        operation: Callable[[], CommandChange],
+        failure_title: str,
+        success_description: str,
+    ) -> bool:
+        snapshot = document.view.suspend_for_working_copy_mutation()
+        self._set_document_mutation_state(document, True)
+        release_result = document.view.release_renderer_backend()
+        if not release_result.success:
+            document.view.resume_after_failed_working_copy_mutation(snapshot)
+            self._set_document_mutation_state(document, False)
+            self._report_error(
+                failure_title,
+                release_result.message or "PDFレンダラーの解放に失敗しました",
+            )
+            return False
+        try:
+            change = operation()
+        except (CommandExecutionError, CommandUndoError, CommandRedoError) as exc:
+            logger.exception("Mutating command failed: %s", exc.command.description)
+            self._reload_after_mutation(document, snapshot)
+            self._report_error(failure_title, str(exc.cause))
+            return False
+        reload_succeeded = self._reload_after_mutation(document, snapshot, change=change)
+        self._finalize_successful_command(
+            document,
+            description=success_description,
+            change=change,
+            apply_change=False,
+        )
+        if not reload_succeeded:
+            self._report_error(
+                "再読み込みに失敗しました",
+                "変更後のPDFを再読み込みできませんでした。タブを閉じずに状態を確認してください。",
+            )
+        return True
+
+    def _reload_after_mutation(
+        self,
+        document: DocumentTab,
+        snapshot: PdfViewMutationSnapshot,
+        *,
+        change: CommandChange | None = None,
+        timeout_ms: int = 5000,
+    ) -> bool:
+        if change is not None and change.mutation_result is not None:
+            document.view.transition_render_cache(
+                change.mutation_result.old_revision,
+                change.mutation_result.new_revision,
+                affected_pages=change.mutation_result.affected_pages,
+            )
+        event_loop = QEventLoop(self)
+        success = False
+        timed_out = False
+        document.mutation_operation_id += 1
+        operation_id = document.mutation_operation_id
+        timeout = QTimer(self)
+        timeout.setSingleShot(True)
+
+        def handle_completed(reloaded: bool) -> None:
+            nonlocal success
+            if operation_id != document.mutation_operation_id:
+                return
+            success = reloaded
+            timeout.stop()
+            event_loop.quit()
+
+        def handle_timeout() -> None:
+            nonlocal timed_out
+            if operation_id != document.mutation_operation_id:
+                return
+            timed_out = True
+            event_loop.quit()
+
+        document.view.mutation_reload_completed.connect(handle_completed)
+        timeout.timeout.connect(handle_timeout)
+        started = document.view.reload_after_working_copy_mutation(snapshot)
+        if not started:
+            self._set_document_mutation_state(document, False)
+            with suppress(RuntimeError, TypeError):
+                document.view.mutation_reload_completed.disconnect(handle_completed)
+            with suppress(RuntimeError, TypeError):
+                timeout.timeout.disconnect(handle_timeout)
+            return False
+        timeout.start(timeout_ms)
+        event_loop.exec()
+        if timed_out:
+            document.view.resume_after_failed_working_copy_mutation(snapshot)
+            success = False
+        self._set_document_mutation_state(document, False)
+        with suppress(RuntimeError, TypeError):
+            document.view.mutation_reload_completed.disconnect(handle_completed)
+        with suppress(RuntimeError, TypeError):
+            timeout.timeout.disconnect(handle_timeout)
+        return success
+
+    def _set_document_mutation_state(self, document: DocumentTab, active: bool) -> None:
+        document.mutation_in_progress = active
+        self._update_actions()
+        if self._current_document() is document:
+            self._sync_toolbar(document)
 
     def _update_undo_redo_actions(self, document: DocumentTab | None) -> None:
         if document is None:
@@ -1413,10 +1595,14 @@ class MainWindow(QMainWindow):
         undo_description = document.command_history.undo_description
         redo_description = document.command_history.redo_description
         self.undo_action.setEnabled(
-            not document.session.is_saving and document.command_history.can_undo
+            not document.session.is_saving
+            and not document.mutation_in_progress
+            and document.command_history.can_undo
         )
         self.redo_action.setEnabled(
-            not document.session.is_saving and document.command_history.can_redo
+            not document.session.is_saving
+            and not document.mutation_in_progress
+            and document.command_history.can_redo
         )
         self.undo_action.setText(
             f"元に戻す: {undo_description}" if undo_description is not None else "元に戻す"
@@ -1463,6 +1649,11 @@ class MainWindow(QMainWindow):
                 page_index=document.view.page_index,
                 page_count=document.view.page_count,
                 zoom_factor=document.session.zoom_factor,
+                can_rotate=bool(
+                    document.view.selected_page_indexes
+                    and not document.session.is_saving
+                    and not document.mutation_in_progress
+                ),
             )
         )
         self._sync_search_bar(document)

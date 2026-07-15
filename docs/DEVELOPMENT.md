@@ -66,6 +66,7 @@ PDF-writing PR の最低限の回帰チェック:
 - byte equality は要求しない
 - fixture 追加・更新時は provenance、license、SHA-256、manifest expectation を更新
 - Phase A では物理実機、Acrobat、Edge、Chrome による手動確認を要求しない
+- working copy を mutate する command では、少なくとも execute / undo / redo の3経路と、reopen validation failure 時に original working copy が維持される経路を追加で確認する
 
 ## ブランチ
 
