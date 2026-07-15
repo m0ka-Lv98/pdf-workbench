@@ -481,10 +481,11 @@ class RenderImageCache:
                     self._total_bytes -= self._image_bytes(image)
             return
 
-        updated: OrderedDict[RenderCacheKey, QImage] = OrderedDict()
+        updated: OrderedDict[RenderCacheKey, tuple[QImage, bool]] = OrderedDict()
         total_bytes = 0
         for key, image in self._items.items():
             next_key = key
+            from_new_revision = key.revision != old_revision
             if key.revision == old_revision:
                 if key.page_index in affected_pages:
                     continue
@@ -495,12 +496,19 @@ class RenderImageCache:
                     rotation=key.rotation,
                     device_pixel_ratio=key.device_pixel_ratio,
                 )
-            if next_key in updated:
-                total_bytes -= self._image_bytes(updated[next_key])
-                updated.pop(next_key)
-            updated[next_key] = image
+            existing = updated.get(next_key)
+            if existing is not None:
+                _, existing_from_new_revision = existing
+                if existing_from_new_revision and not from_new_revision:
+                    continue
+                if not existing_from_new_revision and from_new_revision:
+                    total_bytes -= self._image_bytes(existing[0])
+                    updated.pop(next_key)
+                else:
+                    continue
+            updated[next_key] = (image, from_new_revision)
             total_bytes += self._image_bytes(image)
-        self._items = updated
+        self._items = OrderedDict((key, value[0]) for key, value in updated.items())
         self._total_bytes = total_bytes
         self._evict_if_needed()
 
@@ -562,9 +570,13 @@ class PdfRenderWorker(QObject):
         if not isinstance(revision, DocumentRevision):
             raise TypeError("revision must be DocumentRevision")
 
-        self._close_document_backend(document_id)
         self._drop_pending_render_for_document(document_id)
         self._drop_pending_text_for_document(document_id)
+        try:
+            self._close_document_backend(document_id)
+        except Exception as exc:
+            self.document_failed.emit(document_id, generation, str(exc))
+            return
 
         backend: PdfDocumentBackend | None = None
         try:
@@ -978,10 +990,11 @@ class PdfRenderWorker(QObject):
                 self._failed_text_pages.pop(key, None)
 
     def _close_document_backend(self, document_id: str) -> None:
-        context = self._documents.pop(document_id, None)
+        context = self._documents.get(document_id)
         if context is None:
             return
         context.backend.close()
+        self._documents.pop(document_id, None)
 
     @staticmethod
     def _request_key(
@@ -1073,7 +1086,11 @@ class PdfRenderService(QObject):
         generation: int,
         revision: DocumentRevision,
     ) -> None:
-        if self._shutdown_requested_once or not self._thread.isRunning():
+        if self._shutdown_requested_once:
+            self.document_failed.emit(document_id, generation, "renderer is shutting down")
+            return
+        if not self._thread.isRunning():
+            self.document_failed.emit(document_id, generation, "renderer thread is not running")
             return
         self._open_requested.emit(document_id, path, generation, revision)
 
@@ -1095,11 +1112,12 @@ class PdfRenderService(QObject):
     ) -> DocumentReleaseResult:
         if self._shutdown_requested_once or not self._thread.isRunning():
             return DocumentReleaseResult(
-                request_id="shutdown",
+                request_id="not-issued",
                 document_id=document_id,
                 requested_generation=generation,
                 closed_generation=None,
-                success=True,
+                success=False,
+                message="renderer thread is not running",
             )
 
         event_loop = QEventLoop(self)

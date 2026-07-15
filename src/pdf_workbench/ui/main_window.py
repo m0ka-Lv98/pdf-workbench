@@ -90,6 +90,7 @@ class DocumentTab:
     view: PdfView
     command_history: CommandHistory
     mutation_in_progress: bool = False
+    mutation_operation_id: int = 0
 
 
 class RestoreSessionResult(StrEnum):
@@ -729,7 +730,7 @@ class MainWindow(QMainWindow):
 
     def _save_current_document_as(self) -> bool:
         document = self._current_document()
-        if document is None:
+        if document is None or document.session.is_saving or document.mutation_in_progress:
             return False
         target_path = self._choose_save_as_path(document)
         if target_path is None:
@@ -1488,11 +1489,11 @@ class MainWindow(QMainWindow):
         success_description: str,
     ) -> bool:
         snapshot = document.view.suspend_for_working_copy_mutation()
-        document.mutation_in_progress = True
-        self._update_actions()
+        self._set_document_mutation_state(document, True)
         release_result = document.view.release_renderer_backend()
         if not release_result.success:
-            self._reload_after_mutation(document, snapshot)
+            document.view.resume_after_failed_working_copy_mutation(snapshot)
+            self._set_document_mutation_state(document, False)
             self._report_error(
                 failure_title,
                 release_result.message or "PDFレンダラーの解放に失敗しました",
@@ -1525,6 +1526,7 @@ class MainWindow(QMainWindow):
         snapshot: PdfViewMutationSnapshot,
         *,
         change: CommandChange | None = None,
+        timeout_ms: int = 5000,
     ) -> bool:
         if change is not None and change.mutation_result is not None:
             document.view.transition_render_cache(
@@ -1534,26 +1536,54 @@ class MainWindow(QMainWindow):
             )
         event_loop = QEventLoop(self)
         success = False
+        timed_out = False
+        document.mutation_operation_id += 1
+        operation_id = document.mutation_operation_id
+        timeout = QTimer(self)
+        timeout.setSingleShot(True)
 
         def handle_completed(reloaded: bool) -> None:
             nonlocal success
+            if operation_id != document.mutation_operation_id:
+                return
             success = reloaded
-            document.mutation_in_progress = False
-            self._update_actions()
+            timeout.stop()
+            event_loop.quit()
+
+        def handle_timeout() -> None:
+            nonlocal timed_out
+            if operation_id != document.mutation_operation_id:
+                return
+            timed_out = True
             event_loop.quit()
 
         document.view.mutation_reload_completed.connect(handle_completed)
+        timeout.timeout.connect(handle_timeout)
         started = document.view.reload_after_working_copy_mutation(snapshot)
         if not started:
-            document.mutation_in_progress = False
-            self._update_actions()
+            self._set_document_mutation_state(document, False)
             with suppress(RuntimeError, TypeError):
                 document.view.mutation_reload_completed.disconnect(handle_completed)
+            with suppress(RuntimeError, TypeError):
+                timeout.timeout.disconnect(handle_timeout)
             return False
+        timeout.start(timeout_ms)
         event_loop.exec()
+        if timed_out:
+            document.view.resume_after_failed_working_copy_mutation(snapshot)
+            success = False
+        self._set_document_mutation_state(document, False)
         with suppress(RuntimeError, TypeError):
             document.view.mutation_reload_completed.disconnect(handle_completed)
+        with suppress(RuntimeError, TypeError):
+            timeout.timeout.disconnect(handle_timeout)
         return success
+
+    def _set_document_mutation_state(self, document: DocumentTab, active: bool) -> None:
+        document.mutation_in_progress = active
+        self._update_actions()
+        if self._current_document() is document:
+            self._sync_toolbar(document)
 
     def _update_undo_redo_actions(self, document: DocumentTab | None) -> None:
         if document is None:

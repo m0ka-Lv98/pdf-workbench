@@ -51,6 +51,40 @@ def create_inherited_rotation_fixture(path: Path) -> Path:
     return path
 
 
+def create_direct_rotate_fixture(path: Path, rotate_literal: str) -> Path:
+    objects = [
+        b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n",
+        b"2 0 obj << /Type /Pages /Count 1 /Kids [3 0 R] >> endobj\n",
+        (
+            "3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] "
+            "/Resources << >> /Rotate "
+            f"{rotate_literal} >> endobj\n"
+        ).encode("ascii")
+        if rotate_literal not in {"(90)"}
+        else (
+            b"3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] "
+            b"/Resources << >> /Rotate (90) >> endobj\n"
+        ),
+    ]
+    pdf = bytearray(b"%PDF-1.4\n")
+    offsets = [0]
+    for obj in objects:
+        offsets.append(len(pdf))
+        pdf.extend(obj)
+    xref_start = len(pdf)
+    pdf.extend(f"xref\n0 {len(offsets)}\n".encode("ascii"))
+    pdf.extend(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        pdf.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
+    pdf.extend(
+        (
+            f"trailer << /Size {len(offsets)} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n"
+        ).encode("ascii")
+    )
+    path.write_bytes(pdf)
+    return path
+
+
 def page_rotate_values(path: Path) -> tuple[object | None, ...]:
     with pikepdf.open(str(path)) as pdf:
         return tuple(page.obj.get("/Rotate", None) for page in pdf.pages)
@@ -167,5 +201,45 @@ def test_read_rotation_states_rejects_non_right_angle_rotation(tmp_path: Path) -
 
     with pytest.raises(PdfPageRotationValidationError, match="90度単位"):
         service.read_rotation_states(document_path, (0,))
+
+    assert document_path.read_bytes() == original_bytes
+
+
+@pytest.mark.parametrize("rotate_literal", ["90.0", "90.5", "(90)", "null", "true"])
+def test_read_rotation_states_rejects_non_integral_direct_rotate_values(
+    tmp_path: Path,
+    rotate_literal: str,
+) -> None:
+    document_path = create_direct_rotate_fixture(
+        tmp_path / f"invalid-{rotate_literal}.pdf",
+        rotate_literal,
+    )
+    service = PdfPageMutationService()
+    original_bytes = document_path.read_bytes()
+
+    with pytest.raises(PdfPageRotationValidationError, match="不正"):
+        service.read_rotation_states(document_path, (0,))
+
+    assert document_path.read_bytes() == original_bytes
+
+
+def test_apply_rotation_states_preserves_working_copy_bytes_when_source_rotation_is_invalid(
+    tmp_path: Path,
+) -> None:
+    document_path = create_direct_rotate_fixture(tmp_path / "invalid-source-rotate.pdf", "null")
+    original_bytes = document_path.read_bytes()
+
+    with pytest.raises(PdfPageRotationValidationError, match="不正"):
+        PdfPageMutationService().apply_rotation_states(
+            document_path,
+            (
+                PageRotationState(
+                    page_index=0,
+                    direct_rotate_present=True,
+                    direct_rotate_value=90,
+                    effective_rotation=90,
+                ),
+            ),
+        )
 
     assert document_path.read_bytes() == original_bytes

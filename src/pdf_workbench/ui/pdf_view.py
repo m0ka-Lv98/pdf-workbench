@@ -646,6 +646,33 @@ class PdfView(QWidget):
             return False
         return True
 
+    def resume_after_failed_working_copy_mutation(
+        self,
+        snapshot: PdfViewMutationSnapshot,
+    ) -> None:
+        self._logical_zoom = snapshot.logical_zoom
+        self._search_query = snapshot.search_query
+        self._pending_restore_query = None
+        self._mutation_reload_active = False
+        self._mutation_suspended = False
+        if self._metadata is not None and self.page_count > 0:
+            clamped_page_index = _clamp(snapshot.current_page_index, 0, self.page_count - 1)
+            self.set_page(clamped_page_index)
+            self._page_organizer.set_selected_page_indexes(
+                tuple(
+                    page_index
+                    for page_index in snapshot.selected_page_indexes
+                    if 0 <= page_index < self.page_count
+                )
+                or (clamped_page_index,),
+                current_index=clamped_page_index,
+            )
+            self._schedule_visible_page_update()
+            self._page_organizer.schedule_visible_thumbnail_update(force=True)
+        self._refresh_page_overlays()
+        self.search_state_changed.emit()
+        self.state_changed.emit()
+
     def transition_render_cache(
         self,
         old_revision: DocumentRevision,
@@ -1383,8 +1410,8 @@ class PdfView(QWidget):
         self._page_organizer.clear()
         self._canvas.set_pages([])
         self._metadata = None
+        self._clear_text_state(clear_query=clear_query)
         if clear_query:
-            self._clear_text_state(clear_query=True)
             self._pending_restore_query = None
 
     def _apply_pending_reload_restore(self) -> None:
@@ -1423,7 +1450,7 @@ class PdfView(QWidget):
         )
 
     def _request_visible_pages(self) -> None:
-        if self._metadata is None or self._path is None or self._closed:
+        if self._mutation_suspended or self._metadata is None or self._path is None or self._closed:
             return
         try:
             revision = DocumentRevision.from_path(self._path)
@@ -1599,7 +1626,7 @@ class PdfView(QWidget):
             self._request_visible_thumbnails(self._metadata.revision)
 
     def _request_visible_thumbnails(self, revision: DocumentRevision) -> None:
-        if self._metadata is None:
+        if self._mutation_suspended or self._metadata is None:
             return
         desired_page_indexes = self._page_organizer.desired_thumbnail_pages
         if not desired_page_indexes:

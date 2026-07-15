@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import os
+import subprocess
 import sys
 import time
 from collections.abc import Callable
@@ -24,6 +27,7 @@ from PySide6.QtWidgets import (
 )
 from pytestqt.qtbot import QtBot
 
+from pdf_regression_utils import file_sha256
 from pdf_test_utils import (
     copy_pdf_fixture,
     create_blank_pdf,
@@ -222,6 +226,8 @@ def create_real_main_window(
         workspace_manager=create_workspace_manager(tmp_path),
         save_service=PdfSaveService(),
     )
+    service.setParent(window)
+    window.destroyed.connect(lambda *_args, _service=service: _service.shutdown())
     qtbot.addWidget(window)
     window.show()
     qtbot.waitUntil(window.isVisible)
@@ -1626,6 +1632,8 @@ def test_main_window_rotate_selected_pages_persists_into_working_copy_and_restor
     window.open_document(document_path)
     qtbot.waitUntil(lambda: window._documents[0].view.page_count == 3)
     document = window._documents[0]
+    source_before = file_sha256(document_path)
+    working_copy_before = file_sha256(document.session.document_path)
     document.view._page_organizer.set_selected_page_indexes((0, 2), current_index=2)
     document.view.set_page(2)
     qtbot.waitUntil(lambda: document.session.current_page_index == 2)
@@ -1636,12 +1644,14 @@ def test_main_window_rotate_selected_pages_persists_into_working_copy_and_restor
     qtbot.waitUntil(lambda: document.view.page_index == 2)
     assert document.view.selected_page_indexes == (0, 2)
     assert working_copy_effective_rotations(document.session.document_path) == (90, 0, 90)
-    assert document.session.source_path.read_bytes() == document_path.read_bytes()
+    assert file_sha256(document_path) == source_before
+    assert file_sha256(document.session.document_path) != working_copy_before
     assert document.session.is_modified is True
     assert document.session.operation_history[-1] == "2ページを時計回りに回転"
 
+    render_service = window._render_service
     window.close()
-    qtbot.waitUntil(lambda: not window._render_service._thread.isRunning())
+    qtbot.waitUntil(lambda: not render_service._thread.isRunning())
 
 
 def test_main_window_rotate_page_noops_when_selection_is_empty(
@@ -1673,8 +1683,9 @@ def test_main_window_rotate_page_noops_when_selection_is_empty(
     assert document.command_history.can_undo is False
     assert working_copy_effective_rotations(document.session.document_path) == (0, 0, 0)
 
+    render_service = window._render_service
     window.close()
-    qtbot.waitUntil(lambda: not window._render_service._thread.isRunning())
+    qtbot.waitUntil(lambda: not render_service._thread.isRunning())
 
 
 def test_main_window_mutation_flag_blocks_same_document_actions_until_reload_completes(
@@ -1683,6 +1694,11 @@ def test_main_window_mutation_flag_blocks_same_document_actions_until_reload_com
     tmp_path: Path,
 ) -> None:
     patch_pdf_open(monkeypatch)
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
     window = MainWindow(
         create_settings(tmp_path),
         workspace_manager=create_workspace_manager(tmp_path),
@@ -1744,6 +1760,9 @@ def test_main_window_mutation_flag_blocks_same_document_actions_until_reload_com
     assert lifecycle_states == [(True, False, False, False, False)]
     assert document.mutation_in_progress is False
 
+    assert window._render_service.shutdown() is True
+    window.deleteLater()
+
 
 def test_main_window_mutation_flag_blocks_close_save_undo_redo(
     monkeypatch: pytest.MonkeyPatch,
@@ -1776,6 +1795,130 @@ def test_main_window_mutation_flag_blocks_close_save_undo_redo(
     assert window.save_action.isEnabled() is False
     assert window.save_as_action.isEnabled() is False
     assert window.close_action.isEnabled() is False
+
+    document.mutation_in_progress = False
+    assert window._render_service.shutdown() is True
+    window.deleteLater()
+
+
+def test_main_window_save_as_does_not_open_dialog_during_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    document_path = create_blank_pdf(tmp_path / "mutation-save-as.pdf", 1)
+    window.open_document(document_path)
+    document = window._documents[0]
+    document.mutation_in_progress = True
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        QFileDialog,
+        "getSaveFileName",
+        lambda *args, **kwargs: calls.append(args) or ("", ""),
+    )
+
+    assert window._save_current_document_as() is False
+    assert calls == []
+
+    assert window._render_service.shutdown() is True
+    window.deleteLater()
+
+
+def test_main_window_reload_after_mutation_times_out_and_ignores_late_completion(
+    tmp_path: Path,
+) -> None:
+    script_path = tmp_path / "mutation_timeout_probe.py"
+    document_path = tmp_path / "mutation-timeout.pdf"
+    script_path.write_text(
+        """
+from pathlib import Path
+import json
+
+from PySide6.QtCore import QSettings
+from PySide6.QtWidgets import QApplication
+from pypdf import PdfWriter
+
+from pdf_workbench.services.session_workspace import SessionWorkspaceManager
+from pdf_workbench.ui.main_window import MainWindow
+from pdf_workbench.ui.pdf_view import PdfView
+from pdf_workbench.services.pdf_renderer import DocumentMetadata, DocumentRevision
+from pdf_workbench.services.page_coordinates import PageMetadata
+
+app = QApplication([])
+
+def fake_open_document(self: PdfView, path: Path) -> None:
+    self._path = path
+    self._current_page_index = 0
+    self._metadata = DocumentMetadata(
+        revision=DocumentRevision.from_path(path),
+        pages=(PageMetadata.from_size(144.0, 144.0),),
+    )
+    self.state_changed.emit()
+
+PdfView.open_document = fake_open_document
+
+writer = PdfWriter()
+writer.add_blank_page(width=144, height=144)
+document_path = Path(r\"\"\""""
+        + str(document_path)
+        + """\"\"\")
+with document_path.open("wb") as stream:
+    writer.write(stream)
+
+settings = QSettings(str(Path(r\"\"\""""
+        + str(tmp_path / "settings.ini")
+        + """\"\"\")), QSettings.Format.IniFormat)
+window = MainWindow(
+    settings,
+    workspace_manager=SessionWorkspaceManager(Path(r\"\"\""""
+        + str(tmp_path / "sessions")
+        + """\"\"\")),
+)
+window.show()
+window.open_document(document_path)
+document = window._documents[0]
+snapshot = document.view.suspend_for_working_copy_mutation()
+document.mutation_in_progress = True
+window._update_actions()
+document.view.reload_after_working_copy_mutation = lambda _snapshot: True
+
+result = window._reload_after_mutation(document, snapshot, timeout_ms=10)
+payload = {
+    "result": result,
+    "mutation_in_progress": document.mutation_in_progress,
+    "close_enabled": window.close_action.isEnabled(),
+    "operation_id": document.mutation_operation_id,
+}
+print(json.dumps(payload))
+window.close()
+app.quit()
+""",
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [sys.executable, str(script_path)],
+        cwd=Path(__file__).resolve().parent.parent,
+        env={"QT_QPA_PLATFORM": "offscreen", **os.environ},
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(completed.stdout.strip())
+    assert payload["result"] is False
+    assert payload["mutation_in_progress"] is False
+    assert payload["close_enabled"] is True
+    assert payload["operation_id"] == 1
 
 
 def test_main_window_rotate_command_undo_and_redo_restore_working_copy(

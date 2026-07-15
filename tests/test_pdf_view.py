@@ -734,6 +734,28 @@ def test_suspend_for_working_copy_mutation_captures_state_and_blocks_new_request
     assert service.render_requests == []
 
 
+def test_suspend_blocks_direct_main_and_thumbnail_request_methods(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    document_path = create_pdf(tmp_path / "mutation-guard-direct.pdf", 6)
+    service = FakeRenderService(create_metadata(document_path, 6))
+    view = PdfView(render_service=service, debounce_interval_ms=0)
+    _wrapper = show_view(qtbot, view)
+
+    view.open_document(document_path)
+    qtbot.waitUntil(lambda: view.page_count == 6)
+    qtbot.waitUntil(lambda: bool(view._page_organizer.visible_page_indexes))
+    snapshot = view.suspend_for_working_copy_mutation()
+    service.render_requests.clear()
+
+    view._request_visible_pages()
+    view._request_visible_thumbnails(create_metadata(document_path, 6).revision)
+
+    assert snapshot.selected_page_indexes == (0,)
+    assert service.render_requests == []
+
+
 def test_reload_after_working_copy_mutation_restores_snapshot_and_emits_completion(
     qtbot: QtBot,
     tmp_path: Path,
@@ -762,6 +784,44 @@ def test_reload_after_working_copy_mutation_restores_snapshot_and_emits_completi
     assert view.selected_page_indexes == (1, 4)
     assert view._logical_zoom == snapshot.logical_zoom
     assert view._search_query == "Alpha"
+
+
+def test_reload_after_working_copy_mutation_clears_old_text_state_and_rebuilds_new_revision_matches(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    document_path = create_pdf(tmp_path / "mutation-search.pdf", 1)
+    service = FakeRenderService(create_metadata(document_path, 1))
+    view = PdfView(render_service=service, debounce_interval_ms=0)
+    _wrapper = show_view(qtbot, view)
+
+    view.open_document(document_path)
+    qtbot.waitUntil(lambda: view.page_count == 1)
+    old_revision = create_metadata(document_path, 1).revision
+    boxes = [
+        PdfRect(10.0 + index * 24.0, 10.0, 30.0 + index * 24.0, 20.0)
+        for index in range(len("Alpha"))
+    ]
+    service.emit_text_index(view._document_id, old_revision, 0, "Alpha", boxes)
+    qtbot.waitUntil(lambda: view.search("Alpha") == 1)
+    snapshot = view.suspend_for_working_copy_mutation()
+
+    updated_path = create_pdf(tmp_path / "updated-mutation-search.pdf", 1)
+    document_path.write_bytes(updated_path.read_bytes())
+    new_revision = create_metadata(document_path, 1).revision
+    service.metadata = create_metadata(document_path, 1)
+
+    assert view.reload_after_working_copy_mutation(snapshot) is True
+    qtbot.waitUntil(lambda: view._metadata is not None and view._metadata.revision == new_revision)
+    assert view.search_state.query == "Alpha"
+    assert view.search_state.total_count == 0
+    assert view.search_state.current_index == 0
+
+    service.emit_text_index(view._document_id, old_revision, 0, "Alpha", boxes)
+    assert view.search_state.total_count == 0
+
+    service.emit_text_index(view._document_id, new_revision, 0, "Alpha", boxes)
+    qtbot.waitUntil(lambda: view.search_state.total_count == 1)
 
 
 def test_thumbnail_scale_uses_page_geometry_and_rotation(

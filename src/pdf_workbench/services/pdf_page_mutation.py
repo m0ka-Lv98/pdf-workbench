@@ -4,6 +4,7 @@ import logging
 import os
 import tempfile
 from dataclasses import dataclass
+from numbers import Integral
 from pathlib import Path
 from typing import Any, cast
 
@@ -161,8 +162,9 @@ class PdfPageMutationService:
         return validated
 
     def _rotation_state_for_page(self, page_object: Any, page_index: int) -> PageRotationState:
-        direct_rotate = page_object.get(NameObject("/Rotate"), None)
-        if direct_rotate is not None:
+        rotate_key = NameObject("/Rotate")
+        if rotate_key in page_object:
+            direct_rotate = page_object[rotate_key]
             direct_rotate_value = self._parse_raw_rotation(
                 direct_rotate,
                 page_index=page_index,
@@ -199,8 +201,9 @@ class PdfPageMutationService:
                 raise PdfPageRotationValidationError("ページツリーの回転継承を解決できません")
             if objgen is not None:
                 visited.add(objgen)
-            rotate = parent.get("/Rotate", None)
-            if rotate is not None:
+            rotate_key = NameObject("/Rotate")
+            if rotate_key in parent:
+                rotate = parent[rotate_key]
                 raw_rotation = self._parse_raw_rotation(
                     rotate,
                     page_index=page_index,
@@ -234,20 +237,11 @@ class PdfPageMutationService:
         page_index: int,
         label: str,
     ) -> int:
-        if isinstance(value, bool):
+        if isinstance(value, bool) or not isinstance(value, Integral):
             raise PdfPageRotationValidationError(
                 f"{page_index + 1}ページ目の{label}回転値が不正です"
             )
-        try:
-            raw_rotation = (
-                int(cast(Any, value).as_int())
-                if hasattr(value, "as_int")
-                else int(cast(Any, value))
-            )
-        except Exception as exc:
-            raise PdfPageRotationValidationError(
-                f"{page_index + 1}ページ目の{label}回転値が不正です"
-            ) from exc
+        raw_rotation = int(value)
         if raw_rotation % 90 != 0:
             raise PdfPageRotationValidationError(
                 f"{page_index + 1}ページ目の{label}回転値は90度単位である必要があります"
