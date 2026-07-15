@@ -91,3 +91,5 @@ test(redaction): verify removed text is not extractable
 - PDFを書き換える変更は構造検査と再オープン検査を追加
 - UI変更は少なくともCIまたはreview artifactで確認し、必要に応じてmacOSまたはWindowsで追加確認する
 - セキュリティ上の制約をREADMEまたはIssueへ記録
+
+Page organizerのような一覧UIでは、1000ページ級テストでも`QWidget`を大量生成せず、`QListView` + model + delegateを優先する。thumbnailはvisible rowsと近傍だけを要求し、main viewerと同じPDFium document contextを共有したまま、低解像度の別`RenderCacheKey`で描画する。

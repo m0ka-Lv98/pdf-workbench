@@ -1309,6 +1309,7 @@ def test_main_window_search_toolbar_starts_hidden(
 
 
 def test_main_window_restores_page_after_async_document_load(
+    monkeypatch: pytest.MonkeyPatch,
     qtbot: QtBot,
     tmp_path: Path,
 ) -> None:
@@ -1323,6 +1324,12 @@ def test_main_window_restores_page_after_async_document_load(
     )
     qtbot.addWidget(window)
     show_window(qtbot, window)
+    persist_calls: list[int] = []
+    monkeypatch.setattr(
+        window,
+        "_schedule_recovery_metadata_persist",
+        lambda restored_session: persist_calls.append(restored_session.current_page_index),
+    )
 
     document_path = create_blank_pdf(tmp_path / "restore-page.pdf", 3)
     session = workspace_manager.create_session(document_path)
@@ -1335,9 +1342,14 @@ def test_main_window_restores_page_after_async_document_load(
     qtbot.waitUntil(lambda: window._documents[0].view.page_index == 2)
     assert window._documents[0].session.current_page_index == 2
     assert window._documents[0].session.zoom_factor == pytest.approx(1.25)
+    assert window._documents[0].view._page_organizer.current_page_index == 2
+    assert window._toolbar_widget.page_field.value() == 3
+    assert "3 / 3" in window._status_summary.text()
+    assert persist_calls == [2]
 
 
 def test_main_window_clamps_restored_page_after_async_document_load(
+    monkeypatch: pytest.MonkeyPatch,
     qtbot: QtBot,
     tmp_path: Path,
 ) -> None:
@@ -1352,6 +1364,12 @@ def test_main_window_clamps_restored_page_after_async_document_load(
     )
     qtbot.addWidget(window)
     show_window(qtbot, window)
+    persist_calls: list[int] = []
+    monkeypatch.setattr(
+        window,
+        "_schedule_recovery_metadata_persist",
+        lambda restored_session: persist_calls.append(restored_session.current_page_index),
+    )
 
     document_path = create_blank_pdf(tmp_path / "restore-clamp.pdf", 3)
     session = workspace_manager.create_session(document_path)
@@ -1363,6 +1381,7 @@ def test_main_window_clamps_restored_page_after_async_document_load(
     qtbot.waitUntil(lambda: window._documents[0].view.page_count == 3)
     qtbot.waitUntil(lambda: window._documents[0].view.page_index == 2)
     assert window._documents[0].session.current_page_index == 2
+    assert persist_calls == [2]
 
 
 def test_main_window_restores_page_only_once_for_synchronous_load(
@@ -1398,6 +1417,7 @@ def test_main_window_restores_page_only_once_for_synchronous_load(
     def tracking_set_page(self: PdfView, page_index: int) -> None:
         page_apply_calls.append(page_index)
         self._current_page_index = page_index
+        self.current_page_changed.emit(page_index)
 
     monkeypatch.setattr(PdfView, "open_document", fake_open_document)
     monkeypatch.setattr(PdfView, "set_page", tracking_set_page)
@@ -1412,6 +1432,151 @@ def test_main_window_restores_page_only_once_for_synchronous_load(
     assert result is RestoreSessionResult.ATTACHED
     assert page_apply_calls == [2]
     assert metadata_persist_calls == [2]
+
+
+def test_main_window_restoring_page_zero_does_not_schedule_duplicate_persist(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    settings = create_settings(tmp_path)
+    workspace_manager = create_workspace_manager(tmp_path)
+    render_service = PdfRenderService()
+    window = MainWindow(
+        settings,
+        render_service=render_service,
+        workspace_manager=workspace_manager,
+        save_service=PdfSaveService(),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    persist_calls: list[int] = []
+    monkeypatch.setattr(
+        window,
+        "_schedule_recovery_metadata_persist",
+        lambda restored_session: persist_calls.append(restored_session.current_page_index),
+    )
+
+    document_path = create_blank_pdf(tmp_path / "restore-zero.pdf", 2)
+    session = workspace_manager.create_session(document_path)
+    session.set_navigation_state(page_index=0, zoom_factor=1.0)
+
+    assert window.restore_session(session) is RestoreSessionResult.ATTACHED
+    qtbot.waitUntil(lambda: window._documents[0].view.page_count == 2)
+    QTest.qWait(20)
+
+    assert window._documents[0].session.current_page_index == 0
+    assert persist_calls == []
+
+
+def test_main_window_view_navigation_updates_session_and_toolbar(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    settings = create_settings(tmp_path)
+    workspace_manager = create_workspace_manager(tmp_path)
+    render_service = PdfRenderService()
+    window = MainWindow(
+        settings,
+        render_service=render_service,
+        workspace_manager=workspace_manager,
+        save_service=PdfSaveService(),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = create_blank_pdf(tmp_path / "session-sync.pdf", 3)
+    window.open_document(document_path)
+    qtbot.waitUntil(lambda: window._documents[0].view.page_count == 3)
+
+    document = window._documents[0]
+    document.view.set_page(2)
+    qtbot.waitUntil(lambda: document.session.current_page_index == 2)
+
+    assert window._toolbar_widget.page_field.value() == 3
+    assert "3 / 3" in window._status_summary.text()
+    assert document.view._page_organizer.current_page_index == 2
+    assert document.command_history.can_undo is False
+
+    window.close()
+    qtbot.waitUntil(lambda: not render_service._thread.isRunning())
+
+
+def test_main_window_page_organizer_selection_does_not_dirty_session_or_history(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    settings = create_settings(tmp_path)
+    workspace_manager = create_workspace_manager(tmp_path)
+    render_service = PdfRenderService()
+    window = MainWindow(
+        settings,
+        render_service=render_service,
+        workspace_manager=workspace_manager,
+        save_service=PdfSaveService(),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = create_blank_pdf(tmp_path / "organizer-selection.pdf", 4)
+    window.open_document(document_path)
+    qtbot.waitUntil(lambda: window._documents[0].view.page_count == 4)
+    document = window._documents[0]
+
+    document.view._page_organizer.set_selected_page_indexes((0, 2), current_index=0)
+
+    assert document.view.selected_page_indexes == (0, 2)
+    assert document.session.is_modified is False
+    assert document.command_history.can_undo is False
+    assert window.save_action.isEnabled() is False
+
+    window.close()
+    qtbot.waitUntil(lambda: not render_service._thread.isRunning())
+
+
+def test_main_window_page_organizer_navigation_updates_session_once(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    settings = create_settings(tmp_path)
+    workspace_manager = create_workspace_manager(tmp_path)
+    render_service = PdfRenderService()
+    window = MainWindow(
+        settings,
+        render_service=render_service,
+        workspace_manager=workspace_manager,
+        save_service=PdfSaveService(),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    document_path = create_blank_pdf(tmp_path / "organizer-nav.pdf", 4)
+    window.open_document(document_path)
+    qtbot.waitUntil(lambda: window._documents[0].view.page_count == 4)
+    document = window._documents[0]
+    persist_calls: list[int] = []
+    monkeypatch.setattr(
+        window,
+        "_schedule_recovery_metadata_persist",
+        lambda session: persist_calls.append(session.current_page_index),
+    )
+
+    index = document.view._page_organizer.list_view.model().index(2, 0)
+    rect = document.view._page_organizer.list_view.visualRect(index)
+    QTest.mouseClick(
+        document.view._page_organizer.list_view.viewport(),
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+        rect.center(),
+    )
+    qtbot.waitUntil(lambda: document.session.current_page_index == 2)
+
+    assert persist_calls == [2]
+    assert window._toolbar_widget.page_field.value() == 3
+
+    window.close()
+    qtbot.waitUntil(lambda: not render_service._thread.isRunning())
 
 
 def test_main_window_toolbar_search_button_opens_search_ui(

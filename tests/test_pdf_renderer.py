@@ -7,6 +7,7 @@ import pytest
 from PySide6.QtGui import QImage
 from pytestqt.qtbot import QtBot
 
+import pdf_workbench.services.pdf_renderer as pdf_renderer_module
 from pdf_workbench.services.page_coordinates import PageMetadata
 from pdf_workbench.services.pdf_renderer import (
     DocumentMetadata,
@@ -15,6 +16,7 @@ from pdf_workbench.services.pdf_renderer import (
     PdfiumDocumentBackend,
     PdfRenderWorker,
     RenderCacheKey,
+    RenderFailure,
     RenderImageCache,
     RenderRequest,
     TextCharacterBox,
@@ -154,6 +156,92 @@ class BlockingBackend(FakeBackend):
     def close(self) -> None:
         self.close_call_count += 1
         super().close()
+
+
+class FailingRenderBackend(FakeBackend):
+    def render_page(
+        self,
+        page_index: int,
+        logical_zoom: float,
+        rotation: int,
+        device_pixel_ratio: float,
+    ) -> QImage:
+        raise RuntimeError(f"render failed {page_index}")
+
+
+class FakeRenderableImage:
+    def __init__(
+        self,
+        *,
+        name: str,
+        converted: object | None = None,
+        fail_convert: bool = False,
+    ) -> None:
+        self.name = name
+        self.converted = converted
+        self.fail_convert = fail_convert
+        self.close_call_count = 0
+
+    def convert(self, _mode: str) -> object:
+        if self.fail_convert:
+            raise RuntimeError(f"{self.name} convert failed")
+        if self.converted is None:
+            raise RuntimeError(f"{self.name} missing converted image")
+        return self.converted
+
+    def close(self) -> None:
+        self.close_call_count += 1
+
+
+class FakeBitmapResource:
+    def __init__(self, *, source_image: object | None = None, fail_to_pil: bool = False) -> None:
+        self.source_image = source_image
+        self.fail_to_pil = fail_to_pil
+        self.close_call_count = 0
+
+    def to_pil(self) -> object:
+        if self.fail_to_pil:
+            raise RuntimeError("to_pil failed")
+        if self.source_image is None:
+            raise RuntimeError("missing source image")
+        return self.source_image
+
+    def close(self) -> None:
+        self.close_call_count += 1
+
+
+class FakePdfiumPage:
+    def __init__(self, *, bitmap: object | None = None, fail_render: bool = False) -> None:
+        self.bitmap = bitmap
+        self.fail_render = fail_render
+        self.close_call_count = 0
+
+    def render(self, *, scale: float, rotation: int) -> object:
+        _ = (scale, rotation)
+        if self.fail_render:
+            raise RuntimeError("render failed")
+        if self.bitmap is None:
+            raise RuntimeError("missing bitmap")
+        return self.bitmap
+
+    def close(self) -> None:
+        self.close_call_count += 1
+
+
+class FakePdfiumDocument:
+    def __init__(self, page: FakePdfiumPage) -> None:
+        self.page = page
+
+    def __getitem__(self, page_index: int) -> FakePdfiumPage:
+        assert page_index == 0
+        return self.page
+
+
+def create_fake_pdfium_backend(page: FakePdfiumPage) -> PdfiumDocumentBackend:
+    backend = PdfiumDocumentBackend.__new__(PdfiumDocumentBackend)
+    backend._document = FakePdfiumDocument(page)  # type: ignore[attr-defined]
+    backend._reader = object()  # type: ignore[attr-defined]
+    return backend
 
 
 def test_render_cache_hits_existing_entry(tmp_path: Path) -> None:
@@ -297,6 +385,90 @@ def test_pdfium_backend_rejects_invalid_render_inputs(
         backend.close()
 
 
+def test_render_request_cache_key_distinguishes_main_and_thumbnail_revision(
+    tmp_path: Path,
+) -> None:
+    revision = make_revision(tmp_path)
+    main_request = RenderRequest("doc-1", 1, 0, 1.5, 0, 1.0, 0, revision)
+    thumbnail_request = RenderRequest("doc-1", 1, 0, 0.25, 0, 1.0, 10, revision)
+
+    assert main_request.cache_key != thumbnail_request.cache_key
+
+
+def test_pdfium_backend_closes_render_resources_on_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    converted = FakeRenderableImage(name="rgba")
+    source = FakeRenderableImage(name="source", converted=converted)
+    bitmap = FakeBitmapResource(source_image=source)
+    page = FakePdfiumPage(bitmap=bitmap)
+    backend = create_fake_pdfium_backend(page)
+    monkeypatch.setattr(
+        pdf_renderer_module,
+        "ImageQt",
+        lambda _image: QImage(12, 16, QImage.Format.Format_ARGB32),
+    )
+
+    image = backend.render_page(0, logical_zoom=1.0, rotation=0, device_pixel_ratio=2.0)
+
+    assert image.width() == 12
+    assert image.height() == 16
+    assert image.devicePixelRatio() == 2.0
+    assert page.close_call_count == 1
+    assert bitmap.close_call_count == 1
+    assert source.close_call_count == 1
+    assert converted.close_call_count == 1
+
+
+def test_pdfium_backend_closes_resources_when_to_pil_fails() -> None:
+    bitmap = FakeBitmapResource(fail_to_pil=True)
+    page = FakePdfiumPage(bitmap=bitmap)
+    backend = create_fake_pdfium_backend(page)
+
+    with pytest.raises(RuntimeError, match="to_pil failed"):
+        backend.render_page(0, logical_zoom=1.0, rotation=0, device_pixel_ratio=1.0)
+
+    assert page.close_call_count == 1
+    assert bitmap.close_call_count == 1
+
+
+def test_pdfium_backend_closes_resources_when_convert_fails() -> None:
+    source = FakeRenderableImage(name="source", fail_convert=True)
+    bitmap = FakeBitmapResource(source_image=source)
+    page = FakePdfiumPage(bitmap=bitmap)
+    backend = create_fake_pdfium_backend(page)
+
+    with pytest.raises(RuntimeError, match="source convert failed"):
+        backend.render_page(0, logical_zoom=1.0, rotation=0, device_pixel_ratio=1.0)
+
+    assert page.close_call_count == 1
+    assert bitmap.close_call_count == 1
+    assert source.close_call_count == 1
+
+
+def test_pdfium_backend_closes_resources_when_qimage_conversion_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    converted = FakeRenderableImage(name="rgba")
+    source = FakeRenderableImage(name="source", converted=converted)
+    bitmap = FakeBitmapResource(source_image=source)
+    page = FakePdfiumPage(bitmap=bitmap)
+    backend = create_fake_pdfium_backend(page)
+    monkeypatch.setattr(
+        pdf_renderer_module,
+        "ImageQt",
+        lambda _image: (_ for _ in ()).throw(RuntimeError("imageqt failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="imageqt failed"):
+        backend.render_page(0, logical_zoom=1.0, rotation=0, device_pixel_ratio=1.0)
+
+    assert page.close_call_count == 1
+    assert bitmap.close_call_count == 1
+    assert source.close_call_count == 1
+    assert converted.close_call_count == 1
+
+
 def test_render_worker_closes_only_target_document_and_keeps_others(tmp_path: Path) -> None:
     cache = RenderImageCache(max_bytes=1024 * 1024)
     backends: dict[str, FakeBackend] = {}
@@ -434,6 +606,47 @@ def test_render_worker_deduplicates_identical_requests_per_document(tmp_path: Pa
     assert len(worker._pending_requests) == 1
 
 
+def test_render_worker_processes_main_page_requests_before_thumbnail_requests(
+    tmp_path: Path,
+) -> None:
+    cache = RenderImageCache(max_bytes=1024 * 1024)
+    backend = FakeBackend("sample")
+    worker = PdfRenderWorker(lambda _path: backend, cache)
+    revision = make_revision(tmp_path)
+    path = tmp_path / "sample.pdf"
+
+    worker.open_document("doc-1", path, 1, revision)
+    worker.enqueue_render(
+        RenderRequest(
+            document_id="doc-1",
+            generation=1,
+            page_index=1,
+            logical_zoom=0.25,
+            rotation=0,
+            device_pixel_ratio=1.0,
+            priority=10,
+            revision=revision,
+        )
+    )
+    worker.enqueue_render(
+        RenderRequest(
+            document_id="doc-1",
+            generation=1,
+            page_index=0,
+            logical_zoom=1.5,
+            rotation=0,
+            device_pixel_ratio=1.0,
+            priority=0,
+            revision=revision,
+        )
+    )
+
+    worker._process_next()
+    worker._process_next()
+
+    assert backend.render_calls == [0, 1]
+
+
 def test_worker_updates_generation_without_reopening_backend(tmp_path: Path) -> None:
     cache = RenderImageCache(max_bytes=1024 * 1024)
     backend = FakeBackend("sample")
@@ -532,6 +745,7 @@ def test_generation_update_does_not_affect_other_document(tmp_path: Path) -> Non
         priority=0,
         revision=revision_b,
     )
+
     worker.enqueue_render(request_a)
     worker.enqueue_render(request_b)
 
@@ -544,6 +758,37 @@ def test_generation_update_does_not_affect_other_document(tmp_path: Path) -> Non
     worker._process_next()
 
     assert backends["b"].render_calls == [0]
+
+
+def test_render_worker_failure_includes_cache_key(tmp_path: Path) -> None:
+    cache = RenderImageCache(max_bytes=1024 * 1024)
+    backend = FailingRenderBackend("failing")
+    worker = PdfRenderWorker(lambda _path: backend, cache)
+    revision = make_revision(tmp_path)
+    path = tmp_path / "sample.pdf"
+    failures: list[RenderFailure] = []
+    worker.render_failed.connect(lambda failure: failures.append(failure))
+
+    worker.open_document("doc-1", path, 1, revision)
+    request = RenderRequest(
+        document_id="doc-1",
+        generation=1,
+        page_index=1,
+        logical_zoom=0.25,
+        rotation=90,
+        device_pixel_ratio=2.0,
+        priority=10,
+        revision=revision,
+    )
+    worker.enqueue_render(request)
+    worker._process_next()
+
+    assert len(failures) == 1
+    assert failures[0].document_id == "doc-1"
+    assert failures[0].generation == 1
+    assert failures[0].cache_key == request.cache_key
+    assert failures[0].page_index == 1
+    assert failures[0].message == "render failed 1"
 
 
 def test_worker_closes_backend_when_metadata_read_fails(tmp_path: Path) -> None:

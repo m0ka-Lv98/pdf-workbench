@@ -117,6 +117,15 @@ class RenderResult:
     cache_key: RenderCacheKey
 
 
+@dataclass(frozen=True, slots=True)
+class RenderFailure:
+    document_id: str
+    generation: int
+    page_index: int
+    cache_key: RenderCacheKey
+    message: str
+
+
 @dataclass(slots=True)
 class WorkerDocumentContext:
     backend: PdfDocumentBackend
@@ -235,16 +244,33 @@ class PdfiumDocumentBackend:
             raise ValueError("rotation must be one of 0, 90, 180, 270")
 
         page = self._document[page_index]
+        bitmap: Any | None = None
+        source_image: Any | None = None
+        rgba_image: Any | None = None
         try:
             scale = logical_zoom * device_pixel_ratio
             bitmap = page.render(scale=scale, rotation=rotation)
-            pil_image = bitmap.to_pil().convert("RGBA")
-            qimage = QImage(ImageQt(pil_image)).copy()
+            source_image = bitmap.to_pil()
+            rgba_image = source_image.convert("RGBA")
+            qimage = QImage(ImageQt(rgba_image)).copy()
         finally:
-            page.close()
+            self._close_render_resource(rgba_image, "temporary RGBA PIL image")
+            self._close_render_resource(source_image, "temporary source PIL image")
+            self._close_render_resource(bitmap, "temporary PDFium bitmap")
+            self._close_render_resource(page, "PDFium page")
 
         qimage.setDevicePixelRatio(device_pixel_ratio)
         return qimage
+
+    @staticmethod
+    def _close_render_resource(resource: object | None, label: str) -> None:
+        if resource is None:
+            return
+        try:
+            close = resource.close  # type: ignore[attr-defined]
+            close()
+        except Exception:
+            logger.exception("Failed to close %s after PDF render", label)
 
     def extract_text_page(
         self,
@@ -424,7 +450,7 @@ class PdfRenderWorker(QObject):
     document_loaded = Signal(object, int, object)
     document_failed = Signal(object, int, str)
     render_succeeded = Signal(object)
-    render_failed = Signal(object, int, int, str)
+    render_failed = Signal(object)
     text_page_indexed = Signal(object, object, object)
     text_index_progress = Signal(object, object, int, int, int)
     text_index_completed = Signal(object, object, int, int)
@@ -712,10 +738,13 @@ class PdfRenderWorker(QObject):
         except Exception as exc:
             if self._is_request_current(next_request):
                 self.render_failed.emit(
-                    next_request.document_id,
-                    next_request.generation,
-                    next_request.page_index,
-                    str(exc),
+                    RenderFailure(
+                        document_id=next_request.document_id,
+                        generation=next_request.generation,
+                        page_index=next_request.page_index,
+                        cache_key=next_request.cache_key,
+                        message=str(exc),
+                    )
                 )
         else:
             if self._is_request_current(next_request):
@@ -830,7 +859,7 @@ class PdfRenderService(QObject):
     document_loaded = Signal(object, int, object)
     document_failed = Signal(object, int, str)
     render_succeeded = Signal(object)
-    render_failed = Signal(object, int, int, str)
+    render_failed = Signal(object)
     text_page_indexed = Signal(object, object, object)
     text_index_progress = Signal(object, object, int, int, int)
     text_index_completed = Signal(object, object, int, int)

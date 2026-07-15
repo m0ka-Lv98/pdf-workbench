@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QScrollArea,
     QSizePolicy,
+    QSplitter,
     QVBoxLayout,
     QWidget,
 )
@@ -40,10 +41,13 @@ from pdf_workbench.services.pdf_renderer import (
     NormalizedPageText,
     PageTextIndex,
     PdfRenderServiceProtocol,
+    RenderCacheKey,
+    RenderFailure,
     RenderRequest,
     SearchMatch,
     TextCharacterBox,
 )
+from pdf_workbench.ui.widgets.page_organizer import PageOrganizer
 
 
 def _clamp(value: int, minimum: int, maximum: int) -> int:
@@ -57,6 +61,11 @@ _MAX_USER_ZOOM = 5.0
 _BASE_RENDER_SCALE = 1.5
 _MIN_LOGICAL_ZOOM = _BASE_RENDER_SCALE * _MIN_USER_ZOOM
 _MAX_LOGICAL_ZOOM = _BASE_RENDER_SCALE * _MAX_USER_ZOOM
+_THUMBNAIL_TARGET_WIDTH = 140.0
+_THUMBNAIL_TARGET_HEIGHT = 182.0
+_THUMBNAIL_MAX_LOGICAL_ZOOM = 0.25
+_THUMBNAIL_PRIORITY_VISIBLE = 10
+_THUMBNAIL_PRIORITY_PREFETCH = 11
 _MATCH_COLOR = QColor(255, 214, 51, 120)
 _CURRENT_MATCH_COLOR = QColor(255, 167, 38, 160)
 _SELECTION_COLOR = QColor(33, 150, 243, 96)
@@ -376,6 +385,7 @@ class PdfView(QWidget):
     search_state_changed = Signal()
     selection_changed = Signal()
     document_loaded = Signal()
+    current_page_changed = Signal(int)
 
     def __init__(
         self,
@@ -396,6 +406,7 @@ class PdfView(QWidget):
         self._rotation = 0
         self._closed = False
         self._desired_pages: set[int] = set()
+        self._expected_main_render_keys: dict[int, RenderCacheKey] = {}
         self._text_indexes: dict[int, PageTextIndex] = {}
         self._search_query: str = ""
         self._search_matches: list[SearchMatch] = []
@@ -439,9 +450,26 @@ class PdfView(QWidget):
             self._schedule_visible_page_update
         )
 
+        self._page_organizer = PageOrganizer(self)
+        self._page_organizer.page_requested.connect(self._on_organizer_page_requested)
+        self._page_organizer.page_selection_changed.connect(self._on_organizer_selection_changed)
+        self._page_organizer.visible_thumbnail_pages_changed.connect(
+            self._on_visible_thumbnail_pages_changed
+        )
+
+        self._workspace_splitter = QSplitter(Qt.Orientation.Horizontal, self)
+        self._workspace_splitter.setObjectName("documentWorkspaceSplitter")
+        self._workspace_splitter.addWidget(self._page_organizer)
+        self._workspace_splitter.addWidget(self._scroll_area)
+        self._workspace_splitter.setStretchFactor(0, 0)
+        self._workspace_splitter.setStretchFactor(1, 1)
+        self._workspace_splitter.setCollapsible(0, False)
+        self._workspace_splitter.setCollapsible(1, False)
+        self._workspace_splitter.setSizes([208, 892])
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self._scroll_area)
+        layout.addWidget(self._workspace_splitter)
 
         self._visible_timer = QTimer(self)
         self._visible_timer.setSingleShot(True)
@@ -486,12 +514,14 @@ class PdfView(QWidget):
     def path(self) -> Path | None:
         return self._path
 
+    @property
+    def selected_page_indexes(self) -> tuple[int, ...]:
+        return self._page_organizer.selected_page_indexes
+
     def open_document(self, path: Path) -> None:
         resolved_path = path.expanduser().resolve()
         self._path = resolved_path
-        self._current_page_index = 0
-        self._metadata = None
-        self._clear_text_state(clear_query=True)
+        self._clear_document_render_state_for_reload(clear_query=True)
         self._bump_generation()
         self._show_status("PDFを読み込み中です")
         try:
@@ -520,7 +550,8 @@ class PdfView(QWidget):
             return
         target = _clamp(page_index, 0, self.page_count - 1)
         self._scroll_to_page(target)
-        self._current_page_index = target
+        self._set_current_page_index(target)
+        self._page_organizer.set_current_page(target)
         self._schedule_visible_page_update()
         self.state_changed.emit()
 
@@ -533,6 +564,8 @@ class PdfView(QWidget):
             return
         self._logical_zoom = max(_MIN_LOGICAL_ZOOM, min(scale, _MAX_LOGICAL_ZOOM))
         self._desired_pages.clear()
+        self._expected_main_render_keys.clear()
+        self._page_organizer.set_desired_thumbnail_pages(())
         self._advance_render_generation()
         for index, page in enumerate(self._canvas.pages):
             page.configure(
@@ -544,6 +577,7 @@ class PdfView(QWidget):
             page.clear_pixmap("待機中")
         self._content.adjustSize()
         self._schedule_visible_page_update()
+        self._page_organizer.schedule_visible_thumbnail_update(force=True)
         self.state_changed.emit()
 
     def set_rotation(self, rotation: int) -> None:
@@ -555,6 +589,8 @@ class PdfView(QWidget):
         if self._metadata is None:
             return
         self._desired_pages.clear()
+        self._expected_main_render_keys.clear()
+        self._page_organizer.set_desired_thumbnail_pages(())
         self._advance_render_generation()
         for index, page in enumerate(self._canvas.pages):
             page.configure(
@@ -566,6 +602,7 @@ class PdfView(QWidget):
             page.clear_pixmap("待機中")
         self._content.adjustSize()
         self._schedule_visible_page_update()
+        self._page_organizer.schedule_visible_thumbnail_update(force=True)
         self.state_changed.emit()
 
     def set_search_overlay_inset(self, inset: int) -> None:
@@ -589,9 +626,7 @@ class PdfView(QWidget):
         if self._closed:
             return
         self._path = None
-        self._desired_pages.clear()
-        self._clear_text_state(clear_query=True)
-        self._metadata = None
+        self._clear_document_render_state_for_reload(clear_query=True)
         self._bump_generation()
         self._render_service.close_document(self._document_id, self._generation)
         self._show_status("PDFを開いてください")
@@ -615,8 +650,7 @@ class PdfView(QWidget):
         self.state_changed.emit()
 
     def _show_error(self, message: str) -> None:
-        self._release_mouse_grab()
-        self._metadata = None
+        self._clear_document_render_state_for_reload(clear_query=True)
         self._show_status(message, render_state="error")
         self.error_occurred.emit(message)
 
@@ -642,10 +676,13 @@ class PdfView(QWidget):
             page.mouse_selection_changed.connect(self._update_selection)
             page.mouse_selection_finished.connect(self._finish_selection)
         self._canvas.set_pages(pages)
+        self._page_organizer.set_document(metadata.pages)
+        self._set_current_page_index(0, emit=False)
         self._status_label.hide()
         self._canvas.show()
         self._content.adjustSize()
         self._schedule_visible_page_update()
+        self._page_organizer.schedule_visible_thumbnail_update(force=True)
         self._refresh_page_overlays()
         self.document_loaded.emit()
         self.state_changed.emit()
@@ -665,35 +702,47 @@ class PdfView(QWidget):
             or result.generation != self._generation
             or self._closed
             or self._metadata is None
-            or result.page_index not in self._desired_pages
-            or not 0 <= result.page_index < len(self._canvas.pages)
         ):
             return
-        placeholder = self._canvas.pages[result.page_index]
-        pixmap = QPixmap.fromImage(result.image)
-        placeholder.set_pixmap(pixmap)
-        self._refresh_page_overlays(result.page_index)
-        self._update_current_page()
-        self.state_changed.emit()
+        if self._expected_main_render_keys.get(
+            result.page_index
+        ) == result.cache_key and 0 <= result.page_index < len(self._canvas.pages):
+            placeholder = self._canvas.pages[result.page_index]
+            pixmap = QPixmap.fromImage(result.image)
+            placeholder.set_pixmap(pixmap)
+            self._refresh_page_overlays(result.page_index)
+            self._update_current_page()
+            self.state_changed.emit()
+            return
+        if self._page_organizer.apply_thumbnail(result.page_index, result.cache_key, result.image):
+            self.state_changed.emit()
 
-    def _on_render_failed(
-        self,
-        document_id: object,
-        generation: int,
-        page_index: int,
-        message: str,
-    ) -> None:
+    def _on_render_failed(self, failure: object) -> None:
+        if not isinstance(failure, RenderFailure):
+            raise TypeError("failure must be RenderFailure")
         if (
-            document_id != self._document_id
-            or generation != self._generation
+            failure.document_id != self._document_id
+            or failure.generation != self._generation
             or self._closed
             or self._metadata is None
-            or not 0 <= page_index < len(self._canvas.pages)
         ):
             return
-        self._canvas.pages[page_index].set_state(PlaceholderState.ERROR, message)
-        self.error_occurred.emit(message)
-        self.state_changed.emit()
+        if self._expected_main_render_keys.get(
+            failure.page_index
+        ) == failure.cache_key and 0 <= failure.page_index < len(self._canvas.pages):
+            self._canvas.pages[failure.page_index].set_state(
+                PlaceholderState.ERROR,
+                failure.message,
+            )
+            self.error_occurred.emit(failure.message)
+            self.state_changed.emit()
+            return
+        if self._page_organizer.apply_thumbnail_failure(
+            failure.page_index,
+            failure.cache_key,
+            failure.message,
+        ):
+            self.state_changed.emit()
 
     def _on_text_index_ready(
         self,
@@ -868,7 +917,8 @@ class PdfView(QWidget):
         if not 0 <= match_index < len(self._search_matches):
             return
         match = self._search_matches[match_index]
-        self._current_page_index = match.page_index
+        self._set_current_page_index(match.page_index)
+        self._page_organizer.set_current_page(match.page_index)
         content_rect = self._match_rect_in_content(match)
         if content_rect is None:
             self._scroll_to_page(match.page_index)
@@ -1190,6 +1240,17 @@ class PdfView(QWidget):
             return
         self._visible_timer.start()
 
+    def _clear_document_render_state_for_reload(self, *, clear_query: bool) -> None:
+        self._release_mouse_grab()
+        self._set_current_page_index(0, emit=False)
+        self._desired_pages.clear()
+        self._expected_main_render_keys.clear()
+        self._page_organizer.clear()
+        self._canvas.set_pages([])
+        self._metadata = None
+        if clear_query:
+            self._clear_text_state(clear_query=True)
+
     def _request_visible_pages(self) -> None:
         if self._metadata is None or self._path is None or self._closed:
             return
@@ -1199,8 +1260,7 @@ class PdfView(QWidget):
             self._show_error(str(exc))
             return
         if revision != self._metadata.revision:
-            self._clear_text_state(clear_query=True)
-            self._metadata = None
+            self._clear_document_render_state_for_reload(clear_query=True)
             self._bump_generation()
             self._show_status("PDFを再読み込み中です")
             self._render_service.open_document(
@@ -1213,8 +1273,14 @@ class PdfView(QWidget):
 
         requests = self._visible_page_requests()
         if not requests:
+            self._page_organizer.set_desired_thumbnail_pages(())
             return
         self._desired_pages = {request.page_index for request in requests}
+        self._expected_main_render_keys = {
+            page_index: key
+            for page_index, key in self._expected_main_render_keys.items()
+            if page_index in self._desired_pages
+        }
         for request in requests:
             page = self._canvas.pages[request.page_index]
             if page.state is PlaceholderState.DISPLAYED:
@@ -1223,6 +1289,14 @@ class PdfView(QWidget):
                 page.set_state(PlaceholderState.QUEUED)
             else:
                 page.set_state(PlaceholderState.RENDERING)
+            cache_key = RenderCacheKey(
+                revision=revision,
+                page_index=request.page_index,
+                logical_zoom=self._logical_zoom,
+                rotation=self._rotation,
+                device_pixel_ratio=self.devicePixelRatioF(),
+            )
+            self._expected_main_render_keys[request.page_index] = cache_key
             self._render_service.request_render(
                 RenderRequest(
                     document_id=self._document_id,
@@ -1235,6 +1309,7 @@ class PdfView(QWidget):
                     revision=revision,
                 )
             )
+        self._request_visible_thumbnails(revision)
         self._update_current_page()
         self.state_changed.emit()
 
@@ -1277,7 +1352,7 @@ class PdfView(QWidget):
 
     def _update_current_page(self) -> None:
         if self._metadata is None or not self._canvas.pages:
-            self._current_page_index = 0
+            self._set_current_page_index(0)
             return
         scroll_value = self._scroll_area.verticalScrollBar().value()
         viewport_height = self._scroll_area.viewport().height()
@@ -1300,7 +1375,8 @@ class PdfView(QWidget):
                 best_page = page.page_index
                 best_area = area
                 best_center_distance = center_distance
-        self._current_page_index = best_page
+        self._set_current_page_index(best_page)
+        self._page_organizer.set_current_page(best_page)
 
     def _scroll_to_page(self, page_index: int) -> None:
         if not 0 <= page_index < len(self._canvas.pages):
@@ -1320,6 +1396,96 @@ class PdfView(QWidget):
 
     def _bump_generation(self) -> None:
         self._generation += 1
+
+    def _set_current_page_index(self, page_index: int, *, emit: bool = True) -> bool:
+        if self._metadata is None:
+            if page_index != 0:
+                raise ValueError("page index must be zero before document metadata is available")
+        elif not 0 <= page_index < self.page_count:
+            raise ValueError("page index is out of range")
+        if page_index == self._current_page_index:
+            return False
+        self._current_page_index = page_index
+        if emit:
+            self.current_page_changed.emit(page_index)
+        return True
+
+    def _on_organizer_page_requested(self, page_index: int) -> None:
+        self.set_page(page_index)
+
+    def _on_organizer_selection_changed(self, _page_indexes: object) -> None:
+        self.state_changed.emit()
+
+    def _on_visible_thumbnail_pages_changed(self, page_indexes: object) -> None:
+        if not isinstance(page_indexes, tuple):
+            return
+        desired_page_indexes = self._page_organizer.set_desired_thumbnail_pages(page_indexes)
+        if self._metadata is None or self._path is None:
+            return
+        if desired_page_indexes:
+            self._request_visible_thumbnails(self._metadata.revision)
+
+    def _request_visible_thumbnails(self, revision: DocumentRevision) -> None:
+        if self._metadata is None:
+            return
+        desired_page_indexes = self._page_organizer.desired_thumbnail_pages
+        if not desired_page_indexes:
+            return
+        visible_pages = set(self._page_organizer.visible_page_indexes)
+        for page_index in desired_page_indexes:
+            logical_zoom = self._thumbnail_logical_zoom(page_index)
+            cache_key = RenderCacheKey(
+                revision=revision,
+                page_index=page_index,
+                logical_zoom=logical_zoom,
+                rotation=self._rotation,
+                device_pixel_ratio=self.devicePixelRatioF(),
+            )
+            needs_request = self._page_organizer.prepare_thumbnail_request(
+                page_index,
+                cache_key,
+                rendering=page_index in visible_pages,
+            )
+            if not needs_request:
+                continue
+            self._render_service.request_render(
+                RenderRequest(
+                    document_id=self._document_id,
+                    generation=self._generation,
+                    page_index=page_index,
+                    logical_zoom=logical_zoom,
+                    rotation=self._rotation,
+                    device_pixel_ratio=self.devicePixelRatioF(),
+                    priority=(
+                        _THUMBNAIL_PRIORITY_VISIBLE
+                        if page_index in visible_pages
+                        else _THUMBNAIL_PRIORITY_PREFETCH
+                    ),
+                    revision=revision,
+                )
+            )
+
+    def _thumbnail_logical_zoom(self, page_index: int) -> float:
+        if self._metadata is None:
+            return _THUMBNAIL_MAX_LOGICAL_ZOOM
+        metadata = self._metadata.pages[page_index]
+        mapper = PageCoordinateMapper(
+            geometry=metadata.geometry,
+            additional_rotation=self._rotation,
+            logical_zoom=1.0,
+            device_pixel_ratio=1.0,
+        )
+        base_size = mapper.view_size
+        width = max(1.0, base_size.width())
+        height = max(1.0, base_size.height())
+        logical_zoom = min(
+            _THUMBNAIL_MAX_LOGICAL_ZOOM,
+            _THUMBNAIL_TARGET_WIDTH / width,
+            _THUMBNAIL_TARGET_HEIGHT / height,
+        )
+        if not math.isfinite(logical_zoom) or logical_zoom <= 0:
+            return _THUMBNAIL_MAX_LOGICAL_ZOOM
+        return logical_zoom
 
     def _clear_text_state(self, *, clear_query: bool) -> None:
         self._release_mouse_grab()

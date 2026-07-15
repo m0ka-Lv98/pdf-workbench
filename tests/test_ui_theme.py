@@ -23,7 +23,7 @@ class _ThemeRenderService(QObject):
     document_loaded = Signal(object, int, object)
     document_failed = Signal(object, int, str)
     render_succeeded = Signal(object)
-    render_failed = Signal(object, int, int, str)
+    render_failed = Signal(object)
 
     def open_document(self, *args, **kwargs) -> None:
         return None

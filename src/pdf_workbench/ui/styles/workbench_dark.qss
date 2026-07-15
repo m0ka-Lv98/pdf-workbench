@@ -55,6 +55,39 @@ QWidget#searchToolbar {
   background: transparent;
 }
 
+QSplitter#documentWorkspaceSplitter::handle {
+  background: #30343b;
+  width: 1px;
+}
+
+QWidget#pageOrganizer {
+  background: #202329;
+  border-right: 1px solid #3a3f47;
+}
+
+QWidget#pageOrganizerHeader {
+  background: transparent;
+  border-bottom: 1px solid #3a3f47;
+}
+
+QLabel#pageOrganizerTitle {
+  color: #f2f4f7;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+QLabel#pageOrganizerCount {
+  color: #9aa3b2;
+  font-size: 12px;
+}
+
+QListView#pageOrganizerList {
+  background: transparent;
+  border: none;
+  outline: none;
+  padding: 12px 10px;
+}
+
 QWidget#sourceChangeBanner {
   background: #3c2f19;
   border-top: 1px solid #7c5c20;
