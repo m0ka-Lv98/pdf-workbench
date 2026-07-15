@@ -14,6 +14,7 @@ from pdf_workbench.services.pdf_renderer import (
     DocumentRevision,
     PageTextIndex,
     PdfiumDocumentBackend,
+    PdfRenderService,
     PdfRenderWorker,
     RenderCacheKey,
     RenderFailure,
@@ -303,6 +304,52 @@ def test_render_cache_misses_when_file_revision_changes(tmp_path: Path) -> None:
     second_revision = make_revision(tmp_path, content=b"updated-content")
 
     assert cache.get(RenderCacheKey(second_revision, 0, 1.0, 0, 1.0)) is None
+
+
+def test_render_cache_transition_drops_only_affected_pages_and_rekeys_others(
+    tmp_path: Path,
+) -> None:
+    cache = RenderImageCache(max_bytes=1024 * 1024)
+    old_revision = make_revision(tmp_path, name="before.pdf", content=b"before")
+    new_revision = make_revision(tmp_path, name="after.pdf", content=b"after")
+    unaffected_key = RenderCacheKey(old_revision, 1, 1.5, 0, 1.0)
+    affected_key = RenderCacheKey(old_revision, 0, 1.5, 0, 1.0)
+    unrelated_revision = make_revision(tmp_path, name="other.pdf", content=b"other")
+    unrelated_key = RenderCacheKey(unrelated_revision, 0, 1.0, 0, 1.0)
+    unaffected_image = make_image()
+    affected_image = make_image(80, 80)
+    unrelated_image = make_image(48, 48)
+    expected_total = unaffected_image.sizeInBytes() + unrelated_image.sizeInBytes()
+
+    cache.put(unaffected_key, unaffected_image)
+    cache.put(affected_key, affected_image)
+    cache.put(unrelated_key, unrelated_image)
+
+    cache.transition_revision(old_revision, new_revision, affected_pages=frozenset({0}))
+
+    assert cache.get(affected_key) is None
+    assert cache.get(RenderCacheKey(new_revision, 1, 1.5, 0, 1.0)) is unaffected_image
+    assert cache.get(unrelated_key) is unrelated_image
+    assert cache.total_bytes == expected_total
+
+
+def test_render_service_release_document_waits_for_worker_close(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend("sample")
+    service = PdfRenderService(backend_factory=lambda _path: backend)
+    qtbot.waitUntil(service._thread.isRunning)
+    revision = make_revision(tmp_path)
+    document_path = tmp_path / "sample.pdf"
+
+    service.open_document("doc-1", document_path, 1, revision)
+    qtbot.waitUntil(lambda: "doc-1" in service._worker._documents)
+
+    assert service.release_document("doc-1", 1, timeout_ms=3000) is True
+    qtbot.waitUntil(lambda: backend.closed is True)
+    assert "doc-1" not in service._worker._documents
+    assert service.shutdown() is True
 
 
 def test_pdfium_backend_sets_device_pixel_ratio(tmp_path: Path) -> None:

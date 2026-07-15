@@ -49,6 +49,8 @@ from pdf_workbench.domain.command_history import (
     DocumentCommand,
 )
 from pdf_workbench.domain.document_session import DocumentSession, SourceStatus
+from pdf_workbench.domain.page_commands import RotatePagesCommand
+from pdf_workbench.services.pdf_page_mutation import PdfPageMutationService
 from pdf_workbench.services.pdf_renderer import PdfRenderService
 from pdf_workbench.services.pdf_save_service import (
     PdfSaveError,
@@ -125,6 +127,7 @@ class MainWindow(QMainWindow):
             workspace_manager if workspace_manager is not None else SessionWorkspaceManager()
         )
         self._save_service = save_service if save_service is not None else PdfSaveService()
+        self._page_mutation_service = PdfPageMutationService()
         self._recovery_service = (
             recovery_service
             if recovery_service is not None
@@ -544,10 +547,15 @@ class MainWindow(QMainWindow):
         document = self._current_document()
         if document is None:
             return
-        rotation = (document.view.rotation + 90) % 360
-        document.view.set_rotation(rotation)
-        self._sync_toolbar(document)
-        self._update_status()
+        page_indexes = document.view.selected_page_indexes or (document.view.page_index,)
+        self.execute_document_command(
+            RotatePagesCommand(
+                document.session.document_path,
+                page_indexes,
+                self._page_mutation_service,
+                prepare_mutation=partial(self._prepare_document_mutation, document),
+            )
+        )
 
     def open_search_bar(self) -> bool:
         document = self._current_document()
@@ -605,6 +613,8 @@ class MainWindow(QMainWindow):
         try:
             change = document.command_history.execute(command)
         except CommandExecutionError as exc:
+            if exc.command.mutates_working_copy:
+                self._recover_document_after_failed_mutation(document)
             logger.exception("Failed to execute command: %s", exc.command.description)
             self._report_error("編集に失敗しました", str(exc.cause))
             return False
@@ -634,11 +644,14 @@ class MainWindow(QMainWindow):
         if document is None or document.session.is_saving or not document.command_history.can_undo:
             return False
         description = document.command_history.undo_description
+        undo_command = document.command_history.undo_command
         if description is None:
             return False
         try:
             change = document.command_history.undo()
         except CommandUndoError as exc:
+            if undo_command is not None and undo_command.mutates_working_copy:
+                self._recover_document_after_failed_mutation(document)
             logger.exception("Failed to undo command: %s", exc.command.description)
             self._report_error("元に戻せませんでした", str(exc.cause))
             return False
@@ -654,11 +667,14 @@ class MainWindow(QMainWindow):
         if document is None or document.session.is_saving or not document.command_history.can_redo:
             return False
         description = document.command_history.redo_description
+        redo_command = document.command_history.redo_command
         if description is None:
             return False
         try:
             change = document.command_history.redo()
         except CommandRedoError as exc:
+            if redo_command is not None and redo_command.mutates_working_copy:
+                self._recover_document_after_failed_mutation(document)
             logger.exception("Failed to redo command: %s", exc.command.description)
             self._report_error("やり直せませんでした", str(exc.cause))
             return False
@@ -1399,9 +1415,42 @@ class MainWindow(QMainWindow):
         self._update_status()
 
     def _apply_command_change(self, document: DocumentTab, change: CommandChange) -> None:
-        # Issue #9 only wires the invalidation seam. Concrete editing commands will decide
-        # whether page-level or whole-document refresh is necessary in later milestones.
-        _ = (document, change)
+        if change.mutation_result is not None:
+            document.view.transition_render_cache(
+                change.mutation_result.old_revision,
+                change.mutation_result.new_revision,
+                affected_pages=change.mutation_result.affected_pages,
+            )
+        if not change.requires_reload:
+            return
+        restored_page_index = document.session.current_page_index
+        restored_selection = document.view.selected_page_indexes
+        reloaded = document.view.reload_document(
+            restore_page_index=restored_page_index,
+            restore_selected_page_indexes=restored_selection,
+            clear_query=False,
+        )
+        if not reloaded:
+            self._report_error(
+                "再読み込みに失敗しました",
+                "変更後のPDFを再読み込みできませんでした。タブを閉じずに状態を確認してください。",
+            )
+
+    def _prepare_document_mutation(self, document: DocumentTab) -> None:
+        if not document.view.release_renderer_backend():
+            raise RuntimeError("PDFレンダラーの解放に失敗しました")
+
+    def _recover_document_after_failed_mutation(self, document: DocumentTab) -> None:
+        reloaded = document.view.reload_document(
+            restore_page_index=document.session.current_page_index,
+            restore_selected_page_indexes=document.view.selected_page_indexes,
+            clear_query=False,
+        )
+        if not reloaded:
+            self._report_error(
+                "再読み込みに失敗しました",
+                "変更に失敗したため現在の作業コピーを再読み込みしようとしましたが、復旧できませんでした。",
+            )
 
     def _update_undo_redo_actions(self, document: DocumentTab | None) -> None:
         if document is None:

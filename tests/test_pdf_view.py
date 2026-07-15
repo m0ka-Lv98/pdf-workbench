@@ -43,6 +43,7 @@ class FakeRenderService(QObject):
         self.render_requests: list[RenderRequest] = []
         self.close_calls: list[tuple[str, int]] = []
         self.generation_updates: list[tuple[str, int, DocumentRevision]] = []
+        self.cache_transitions: list[tuple[DocumentRevision, DocumentRevision, frozenset[int]]] = []
         self.shutdown_called = False
         self.text_requests: list[tuple[str, int, int, DocumentRevision]] = []
 
@@ -62,6 +63,11 @@ class FakeRenderService(QObject):
     def close_document(self, document_id: str, generation: int) -> None:
         self.close_calls.append((document_id, generation))
 
+    def release_document(self, document_id: str, generation: int, timeout_ms: int = 3000) -> bool:
+        _ = timeout_ms
+        self.close_calls.append((document_id, generation))
+        return True
+
     def update_document_generation(
         self,
         document_id: str,
@@ -69,6 +75,15 @@ class FakeRenderService(QObject):
         revision: DocumentRevision,
     ) -> None:
         self.generation_updates.append((document_id, generation, revision))
+
+    def transition_cache_revision(
+        self,
+        old_revision: DocumentRevision,
+        new_revision: DocumentRevision,
+        *,
+        affected_pages: frozenset[int],
+    ) -> None:
+        self.cache_transitions.append((old_revision, new_revision, affected_pages))
 
     def shutdown(self, timeout_ms: int = 3000) -> None:
         self.shutdown_called = True
@@ -849,6 +864,31 @@ def test_revision_reload_clears_organizer_and_expected_render_state_before_reope
     assert view._page_organizer.expected_key_count == 0
     assert view._expected_main_render_keys == {}
     assert view._canvas.pages == []
+
+
+def test_reload_document_restores_page_and_organizer_selection(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    document_path = create_pdf(tmp_path / "reload-restore.pdf", 4)
+    service = FakeRenderService(create_metadata(document_path, 4))
+    view = PdfView(render_service=service, debounce_interval_ms=0)
+    _wrapper = show_view(qtbot, view)
+
+    view.open_document(document_path)
+    qtbot.waitUntil(lambda: view.page_count == 4)
+    view._page_organizer.set_selected_page_indexes((1, 3), current_index=3)
+    view.set_page(3)
+
+    assert view.reload_document(
+        restore_page_index=3,
+        restore_selected_page_indexes=(1, 3),
+        clear_query=False,
+    )
+
+    qtbot.waitUntil(lambda: view.page_index == 3)
+    assert view.selected_page_indexes == (1, 3)
+    assert view._page_organizer.current_page_index == 3
 
 
 def test_reload_failure_keeps_organizer_empty_and_rejects_late_results(

@@ -4,6 +4,7 @@ import sys
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 
 import pikepdf
@@ -35,7 +36,9 @@ from pdf_workbench.domain.command_history import (
     DocumentCommand,
 )
 from pdf_workbench.domain.document_session import DocumentSession, FileFingerprint, SourceStatus
+from pdf_workbench.domain.page_commands import RotatePagesCommand
 from pdf_workbench.services.page_coordinates import PageMetadata
+from pdf_workbench.services.pdf_page_mutation import PdfPageMutationService
 from pdf_workbench.services.pdf_renderer import (
     DocumentMetadata,
     DocumentRevision,
@@ -50,9 +53,15 @@ from pdf_workbench.services.pdf_save_service import (
     TargetChangedError,
     TargetSnapshot,
 )
-from pdf_workbench.services.session_recovery import RecoveryMetadataError, SessionRecoveryService
+from pdf_workbench.services.session_recovery import (
+    RecoveryMetadataError,
+    SessionRecoveryService,
+)
 from pdf_workbench.services.session_workspace import SessionWorkspaceManager
-from pdf_workbench.services.source_change_monitor import SourceChangeMonitor, SourceCheckResult
+from pdf_workbench.services.source_change_monitor import (
+    SourceChangeMonitor,
+    SourceCheckResult,
+)
 from pdf_workbench.ui.main_window import DocumentTab, MainWindow, RestoreSessionResult
 from pdf_workbench.ui.pdf_view import PdfView
 from pdf_workbench.ui.widgets.search_bar import SearchBar, SearchInputSurface
@@ -1577,6 +1586,152 @@ def test_main_window_page_organizer_navigation_updates_session_once(
 
     window.close()
     qtbot.waitUntil(lambda: not render_service._thread.isRunning())
+
+
+def working_copy_effective_rotations(path: Path) -> tuple[int, ...]:
+    with pikepdf.open(str(path)) as pdf:
+        inherited = int(pdf.Root.Pages.get("/Rotate", 0))
+        rotations: list[int] = []
+        for page in pdf.pages:
+            direct = page.obj.get("/Rotate", None)
+            rotations.append((int(direct) if direct is not None else inherited) % 360)
+        return tuple(rotations)
+
+
+def test_main_window_rotate_selected_pages_persists_into_working_copy_and_restores_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    window = create_real_main_window(qtbot, tmp_path)
+    document_path = create_blank_pdf(tmp_path / "rotate-selected.pdf", 3)
+    window.open_document(document_path)
+    qtbot.waitUntil(lambda: window._documents[0].view.page_count == 3)
+    document = window._documents[0]
+    document.view._page_organizer.set_selected_page_indexes((0, 2), current_index=2)
+    document.view.set_page(2)
+    qtbot.waitUntil(lambda: document.session.current_page_index == 2)
+
+    window._rotate_page()
+
+    qtbot.waitUntil(lambda: document.command_history.can_undo)
+    qtbot.waitUntil(lambda: document.view.page_index == 2)
+    assert document.view.selected_page_indexes == (0, 2)
+    assert working_copy_effective_rotations(document.session.document_path) == (90, 0, 90)
+    assert document.session.source_path.read_bytes() == document_path.read_bytes()
+    assert document.session.is_modified is True
+    assert document.session.operation_history[-1] == "2ページを時計回りに回転"
+
+    window.close()
+    qtbot.waitUntil(lambda: not window._render_service._thread.isRunning())
+
+
+def test_main_window_rotate_command_undo_and_redo_restore_working_copy(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    window = create_real_main_window(qtbot, tmp_path)
+    document_path = create_blank_pdf(tmp_path / "rotate-undo-redo.pdf", 2)
+    window.open_document(document_path)
+    qtbot.waitUntil(lambda: window._documents[0].view.page_count == 2)
+    document = window._documents[0]
+    document.view._page_organizer.set_selected_page_indexes((1,), current_index=1)
+
+    assert window.execute_document_command(
+        RotatePagesCommand(
+            document.session.document_path,
+            (1,),
+            PdfPageMutationService(),
+            prepare_mutation=partial(window._prepare_document_mutation, document),
+        )
+    )
+    qtbot.waitUntil(
+        lambda: working_copy_effective_rotations(document.session.document_path) == (0, 90)
+    )
+
+    assert window._undo_current_command() is True
+    qtbot.waitUntil(
+        lambda: working_copy_effective_rotations(document.session.document_path) == (0, 0)
+    )
+
+    assert window._redo_current_command() is True
+    qtbot.waitUntil(
+        lambda: working_copy_effective_rotations(document.session.document_path) == (0, 90)
+    )
+
+    window.close()
+    qtbot.waitUntil(lambda: not window._render_service._thread.isRunning())
+
+
+def test_main_window_recovers_view_after_failed_persistent_rotation(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    window = create_real_main_window(qtbot, tmp_path)
+    document_path = create_blank_pdf(tmp_path / "rotate-failure.pdf", 2)
+    window.open_document(document_path)
+    qtbot.waitUntil(lambda: window._documents[0].view.page_count == 2)
+    document = window._documents[0]
+    document.view._page_organizer.set_selected_page_indexes((1,), current_index=1)
+    document.view.set_page(1)
+    qtbot.waitUntil(lambda: document.session.current_page_index == 1)
+    reload_calls: list[tuple[int, tuple[int, ...]]] = []
+    original_reload = document.view.reload_document
+
+    def tracking_reload(**kwargs: object) -> bool:
+        restore_page_index = kwargs.get("restore_page_index", document.view.page_index)
+        restore_selected = kwargs.get(
+            "restore_selected_page_indexes",
+            document.view.selected_page_indexes,
+        )
+        reload_calls.append((int(restore_page_index), tuple(restore_selected)))
+        return original_reload(**kwargs)
+
+    monkeypatch.setattr(document.view, "reload_document", tracking_reload)
+    errors: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        window,
+        "_report_error",
+        lambda title, message: errors.append((title, message)),
+    )
+    original_apply = window._page_mutation_service.apply_rotation_states
+
+    def fail_apply(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("mutation failed")
+
+    monkeypatch.setattr(window._page_mutation_service, "apply_rotation_states", fail_apply)
+
+    window._rotate_page()
+
+    qtbot.waitUntil(lambda: len(reload_calls) >= 1)
+    qtbot.waitUntil(lambda: document.view.page_index == 1)
+    assert document.command_history.can_undo is False
+    assert document.session.is_modified is False
+    assert document.view.page_index == 1
+    assert document.view.selected_page_indexes == (1,)
+    assert reload_calls[-1] == (1, (1,))
+    assert errors and errors[-1][1] == "mutation failed"
+    monkeypatch.setattr(window._page_mutation_service, "apply_rotation_states", original_apply)
+
+    window.close()
+    qtbot.waitUntil(lambda: not window._render_service._thread.isRunning())
 
 
 def test_main_window_toolbar_search_button_opens_search_ui(

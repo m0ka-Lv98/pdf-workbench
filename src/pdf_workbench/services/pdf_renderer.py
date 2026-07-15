@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import math
 from collections import OrderedDict
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -10,7 +11,7 @@ from typing import Any, Protocol
 import pypdfium2 as pdfium  # type: ignore[import-untyped]
 from PIL.ImageQt import ImageQt
 from pypdf import PdfReader
-from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QEventLoop, QObject, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QImage
 
 from pdf_workbench.services.page_coordinates import PageGeometry, PageMetadata, PdfRect
@@ -186,6 +187,21 @@ class PdfRenderServiceProtocol(Protocol):
     def request_render(self, request: RenderRequest) -> None: ...
 
     def close_document(self, document_id: str, generation: int) -> None: ...
+
+    def release_document(
+        self,
+        document_id: str,
+        generation: int,
+        timeout_ms: int = 3000,
+    ) -> bool: ...
+
+    def transition_cache_revision(
+        self,
+        old_revision: DocumentRevision,
+        new_revision: DocumentRevision,
+        *,
+        affected_pages: frozenset[int],
+    ) -> None: ...
 
     def update_document_generation(
         self,
@@ -433,6 +449,43 @@ class RenderImageCache:
         self._total_bytes += image_bytes
         self._evict_if_needed()
 
+    def transition_revision(
+        self,
+        old_revision: DocumentRevision,
+        new_revision: DocumentRevision,
+        *,
+        affected_pages: frozenset[int],
+    ) -> None:
+        if old_revision == new_revision:
+            for key in list(self._items):
+                if key.revision == old_revision and key.page_index in affected_pages:
+                    image = self._items.pop(key)
+                    self._total_bytes -= self._image_bytes(image)
+            return
+
+        updated: OrderedDict[RenderCacheKey, QImage] = OrderedDict()
+        total_bytes = 0
+        for key, image in self._items.items():
+            next_key = key
+            if key.revision == old_revision:
+                if key.page_index in affected_pages:
+                    continue
+                next_key = RenderCacheKey(
+                    revision=new_revision,
+                    page_index=key.page_index,
+                    logical_zoom=key.logical_zoom,
+                    rotation=key.rotation,
+                    device_pixel_ratio=key.device_pixel_ratio,
+                )
+            if next_key in updated:
+                total_bytes -= self._image_bytes(updated[next_key])
+                updated.pop(next_key)
+            updated[next_key] = image
+            total_bytes += self._image_bytes(image)
+        self._items = updated
+        self._total_bytes = total_bytes
+        self._evict_if_needed()
+
     def _evict_if_needed(self) -> None:
         while len(self._items) > 1 and self._total_bytes > self._max_bytes:
             _, image = self._items.popitem(last=False)
@@ -455,6 +508,7 @@ class PdfRenderWorker(QObject):
     text_index_progress = Signal(object, object, int, int, int)
     text_index_completed = Signal(object, object, int, int)
     text_index_failed = Signal(object, object, int, str)
+    document_closed = Signal(str, int)
     shutdown_completed = Signal()
 
     def __init__(
@@ -580,12 +634,15 @@ class PdfRenderWorker(QObject):
     def close_document(self, document_id: str, generation: int) -> None:
         context = self._documents.get(document_id)
         if context is None:
+            self.document_closed.emit(document_id, generation)
             return
         if generation < context.generation:
+            self.document_closed.emit(document_id, context.generation)
             return
         self._drop_pending_render_for_document(document_id)
         self._drop_pending_text_for_document(document_id)
         self._close_document_backend(document_id)
+        self.document_closed.emit(document_id, generation)
 
     @Slot(str, int, object)
     def update_document_generation(
@@ -609,6 +666,25 @@ class PdfRenderWorker(QObject):
 
         self._drop_pending_render_for_document(document_id)
         context.generation = generation
+
+    @Slot(object, object, object)
+    def transition_cache_revision(
+        self,
+        old_revision: object,
+        new_revision: object,
+        affected_pages: object,
+    ) -> None:
+        if not isinstance(old_revision, DocumentRevision):
+            raise TypeError("old_revision must be DocumentRevision")
+        if not isinstance(new_revision, DocumentRevision):
+            raise TypeError("new_revision must be DocumentRevision")
+        if not isinstance(affected_pages, frozenset):
+            raise TypeError("affected_pages must be frozenset[int]")
+        self._cache.transition_revision(
+            old_revision,
+            new_revision,
+            affected_pages=affected_pages,
+        )
 
     @Slot()
     def shutdown(self) -> None:
@@ -868,6 +944,7 @@ class PdfRenderService(QObject):
     _render_requested = Signal(object)
     _close_requested = Signal(str, int)
     _update_generation_requested = Signal(str, int, object)
+    _transition_cache_requested = Signal(object, object, object)
     _shutdown_requested = Signal()
 
     def __init__(
@@ -900,6 +977,7 @@ class PdfRenderService(QObject):
         self._render_requested.connect(self._worker.enqueue_render)
         self._close_requested.connect(self._worker.close_document)
         self._update_generation_requested.connect(self._worker.update_document_generation)
+        self._transition_cache_requested.connect(self._worker.transition_cache_revision)
         self._shutdown_requested.connect(self._worker.shutdown)
         self._thread.start()
         self._shutdown_requested_once = False
@@ -925,6 +1003,35 @@ class PdfRenderService(QObject):
             return
         self._close_requested.emit(document_id, generation)
 
+    def release_document(self, document_id: str, generation: int, timeout_ms: int = 3000) -> bool:
+        if self._shutdown_requested_once or not self._thread.isRunning():
+            return True
+
+        event_loop = QEventLoop(self)
+        timeout = QTimer(self)
+        timeout.setSingleShot(True)
+        timed_out = False
+
+        def handle_closed(closed_document_id: str, _closed_generation: int) -> None:
+            if closed_document_id != document_id:
+                return
+            timeout.stop()
+            event_loop.quit()
+
+        def handle_timeout() -> None:
+            nonlocal timed_out
+            timed_out = True
+            event_loop.quit()
+
+        self._worker.document_closed.connect(handle_closed)
+        timeout.timeout.connect(handle_timeout)
+        timeout.start(timeout_ms)
+        self._close_requested.emit(document_id, generation)
+        event_loop.exec()
+        with suppress(RuntimeError, TypeError):
+            self._worker.document_closed.disconnect(handle_closed)
+        return not timed_out
+
     def update_document_generation(
         self,
         document_id: str,
@@ -934,6 +1041,17 @@ class PdfRenderService(QObject):
         if self._shutdown_requested_once or not self._thread.isRunning():
             return
         self._update_generation_requested.emit(document_id, generation, revision)
+
+    def transition_cache_revision(
+        self,
+        old_revision: DocumentRevision,
+        new_revision: DocumentRevision,
+        *,
+        affected_pages: frozenset[int],
+    ) -> None:
+        if self._shutdown_requested_once or not self._thread.isRunning():
+            return
+        self._transition_cache_requested.emit(old_revision, new_revision, affected_pages)
 
     def shutdown(self, timeout_ms: int = 3000) -> bool:
         if not self._thread.isRunning():

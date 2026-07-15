@@ -184,7 +184,7 @@ class DocumentToolbar(QWidget):
 
         self.rotate_button = self._icon_button(
             "Rotate clockwise",
-            "時計回りに回転",
+            "選択したページを時計回りに90°回転",
             object_name="rotateClockwiseButton",
         )
         self.rotate_button.clicked.connect(self.rotate_requested.emit)

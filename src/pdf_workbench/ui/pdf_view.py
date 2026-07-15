@@ -423,6 +423,8 @@ class PdfView(QWidget):
         self._empty_text_page_indexes: set[int] = set()
         self._image_only_page_indexes: set[int] = set()
         self._search_top_inset = 24
+        self._pending_restore_page_index: int | None = None
+        self._pending_restore_selected_page_indexes: tuple[int, ...] | None = None
 
         self._content = QWidget(self)
         self._content.setObjectName("pdfContent")
@@ -518,9 +520,19 @@ class PdfView(QWidget):
     def selected_page_indexes(self) -> tuple[int, ...]:
         return self._page_organizer.selected_page_indexes
 
+    @property
+    def document_id(self) -> str:
+        return self._document_id
+
+    @property
+    def generation(self) -> int:
+        return self._generation
+
     def open_document(self, path: Path) -> None:
         resolved_path = path.expanduser().resolve()
         self._path = resolved_path
+        self._pending_restore_page_index = None
+        self._pending_restore_selected_page_indexes = None
         self._clear_document_render_state_for_reload(clear_query=True)
         self._bump_generation()
         self._show_status("PDFを読み込み中です")
@@ -534,6 +546,64 @@ class PdfView(QWidget):
             resolved_path,
             self._generation,
             revision,
+        )
+
+    def reload_document(
+        self,
+        *,
+        restore_page_index: int | None = None,
+        restore_selected_page_indexes: tuple[int, ...] | None = None,
+        clear_query: bool = False,
+    ) -> bool:
+        if self._path is None:
+            return False
+        resolved_path = self._path.expanduser().resolve()
+        target_page_index = (
+            self._current_page_index if restore_page_index is None else restore_page_index
+        )
+        selected_page_indexes = (
+            self.selected_page_indexes
+            if restore_selected_page_indexes is None
+            else tuple(restore_selected_page_indexes)
+        )
+        self._pending_restore_page_index = target_page_index
+        self._pending_restore_selected_page_indexes = selected_page_indexes
+        self._clear_document_render_state_for_reload(clear_query=clear_query)
+        self._bump_generation()
+        self._show_status("PDFを再読み込み中です")
+        try:
+            revision = DocumentRevision.from_path(resolved_path)
+        except OSError as exc:
+            self._pending_restore_page_index = None
+            self._pending_restore_selected_page_indexes = None
+            self._show_error(str(exc))
+            return False
+        self._render_service.open_document(
+            self._document_id,
+            resolved_path,
+            self._generation,
+            revision,
+        )
+        return True
+
+    def release_renderer_backend(self, timeout_ms: int = 3000) -> bool:
+        return self._render_service.release_document(
+            self._document_id,
+            self._generation,
+            timeout_ms,
+        )
+
+    def transition_render_cache(
+        self,
+        old_revision: DocumentRevision,
+        new_revision: DocumentRevision,
+        *,
+        affected_pages: frozenset[int],
+    ) -> None:
+        self._render_service.transition_cache_revision(
+            old_revision,
+            new_revision,
+            affected_pages=affected_pages,
         )
 
     def _advance_render_generation(self) -> None:
@@ -678,6 +748,7 @@ class PdfView(QWidget):
         self._canvas.set_pages(pages)
         self._page_organizer.set_document(metadata.pages)
         self._set_current_page_index(0, emit=False)
+        self._apply_pending_reload_restore()
         self._status_label.hide()
         self._canvas.show()
         self._content.adjustSize()
@@ -690,6 +761,8 @@ class PdfView(QWidget):
     def _on_document_failed(self, document_id: object, generation: int, message: str) -> None:
         if document_id != self._document_id or generation != self._generation or self._closed:
             return
+        self._pending_restore_page_index = None
+        self._pending_restore_selected_page_indexes = None
         self._show_error(message)
 
     def _on_render_succeeded(self, result: object) -> None:
@@ -1250,6 +1323,37 @@ class PdfView(QWidget):
         self._metadata = None
         if clear_query:
             self._clear_text_state(clear_query=True)
+
+    def _apply_pending_reload_restore(self) -> None:
+        if self.page_count <= 0:
+            self._pending_restore_page_index = None
+            self._pending_restore_selected_page_indexes = None
+            return
+        if self._pending_restore_page_index is None:
+            return
+        clamped_page_index = _clamp(self._pending_restore_page_index, 0, self.page_count - 1)
+        selected_page_indexes = self._pending_restore_selected_page_indexes or ()
+        self._pending_restore_page_index = None
+        self._pending_restore_selected_page_indexes = None
+        self.set_page(clamped_page_index)
+        valid_selection = tuple(
+            sorted(
+                {
+                    page_index
+                    for page_index in selected_page_indexes
+                    if 0 <= page_index < self.page_count
+                }
+            )
+        )
+        if not valid_selection:
+            valid_selection = (clamped_page_index,)
+        current_selection_index = (
+            clamped_page_index if clamped_page_index in valid_selection else valid_selection[-1]
+        )
+        self._page_organizer.set_selected_page_indexes(
+            valid_selection,
+            current_index=current_selection_index,
+        )
 
     def _request_visible_pages(self) -> None:
         if self._metadata is None or self._path is None or self._closed:
