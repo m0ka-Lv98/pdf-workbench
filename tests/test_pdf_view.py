@@ -15,6 +15,7 @@ from pdf_regression_utils import compatibility_fixture_dir, file_sha256
 from pdf_workbench.services.page_coordinates import PageMetadata, PdfRect
 from pdf_workbench.services.pdf_renderer import (
     DocumentMetadata,
+    DocumentReleaseResult,
     DocumentRevision,
     PageTextIndex,
     PdfRenderService,
@@ -63,10 +64,21 @@ class FakeRenderService(QObject):
     def close_document(self, document_id: str, generation: int) -> None:
         self.close_calls.append((document_id, generation))
 
-    def release_document(self, document_id: str, generation: int, timeout_ms: int = 3000) -> bool:
+    def release_document(
+        self,
+        document_id: str,
+        generation: int,
+        timeout_ms: int = 3000,
+    ) -> DocumentReleaseResult:
         _ = timeout_ms
         self.close_calls.append((document_id, generation))
-        return True
+        return DocumentReleaseResult(
+            request_id="fake",
+            document_id=document_id,
+            requested_generation=generation,
+            closed_generation=generation,
+            success=True,
+        )
 
     def update_document_generation(
         self,
@@ -685,6 +697,71 @@ def test_rotation_change_requests_new_thumbnail_keys_without_scrolling_organizer
     )
     assert view.selected_page_indexes == (0,)
     assert view.page_index == 0
+
+
+def test_suspend_for_working_copy_mutation_captures_state_and_blocks_new_requests(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    document_path = create_pdf(tmp_path / "mutation-suspend.pdf", 6)
+    service = FakeRenderService(create_metadata(document_path, 6))
+    view = PdfView(render_service=service, debounce_interval_ms=0)
+    _wrapper = show_view(qtbot, view)
+
+    view.open_document(document_path)
+    qtbot.waitUntil(lambda: view.page_count == 6)
+    qtbot.waitUntil(lambda: bool(view._page_organizer.visible_page_indexes))
+    view.set_zoom(2.0)
+    view._page_organizer.set_selected_page_indexes((1, 3), current_index=3)
+    view.set_page(3)
+    view._search_query = "Alpha"
+    service.render_requests.clear()
+
+    snapshot = view.suspend_for_working_copy_mutation()
+    view._schedule_visible_page_update()
+    qtbot.wait(20)
+
+    assert snapshot.current_page_index == 3
+    assert snapshot.selected_page_indexes == (1, 3)
+    assert snapshot.logical_zoom == view._logical_zoom
+    assert snapshot.search_query == "Alpha"
+    assert view._mutation_suspended is True
+    assert view._visible_timer.isActive() is False
+    assert view._desired_pages == set()
+    assert view._expected_main_render_keys == {}
+    assert view._page_organizer.desired_thumbnail_pages == ()
+    assert service.generation_updates[-1][1] == view._generation
+    assert service.render_requests == []
+
+
+def test_reload_after_working_copy_mutation_restores_snapshot_and_emits_completion(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    document_path = create_pdf(tmp_path / "mutation-reload.pdf", 5)
+    service = FakeRenderService(create_metadata(document_path, 5))
+    view = PdfView(render_service=service, debounce_interval_ms=0)
+    _wrapper = show_view(qtbot, view)
+
+    view.open_document(document_path)
+    qtbot.waitUntil(lambda: view.page_count == 5)
+    view.set_zoom(2.0)
+    view._page_organizer.set_selected_page_indexes((1, 4), current_index=4)
+    view.set_page(4)
+    view._search_query = "Alpha"
+    snapshot = view.suspend_for_working_copy_mutation()
+    completions: list[bool] = []
+    view.mutation_reload_completed.connect(completions.append)
+
+    assert view.reload_after_working_copy_mutation(snapshot) is True
+
+    qtbot.waitUntil(lambda: completions == [True])
+    assert view._mutation_suspended is False
+    assert view._mutation_reload_active is False
+    assert view.page_index == 4
+    assert view.selected_page_indexes == (1, 4)
+    assert view._logical_zoom == snapshot.logical_zoom
+    assert view._search_query == "Alpha"
 
 
 def test_thumbnail_scale_uses_page_geometry_and_rotation(

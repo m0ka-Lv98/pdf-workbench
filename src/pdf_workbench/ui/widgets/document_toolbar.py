@@ -28,6 +28,7 @@ class ToolbarState:
     page_index: int
     page_count: int
     zoom_factor: float
+    can_rotate: bool = True
 
 
 class ChevronComboBox(QComboBox):
@@ -183,7 +184,7 @@ class DocumentToolbar(QWidget):
         self._root.addWidget(self._separator(), 0, Qt.AlignmentFlag.AlignVCenter)
 
         self.rotate_button = self._icon_button(
-            "Rotate clockwise",
+            "Rotate selected pages clockwise",
             "選択したページを時計回りに90°回転",
             object_name="rotateClockwiseButton",
         )
@@ -202,7 +203,7 @@ class DocumentToolbar(QWidget):
         self.search_button.setEnabled(state.has_document)
         self.previous_button.setEnabled(state.has_document and state.page_index > 0)
         self.next_button.setEnabled(state.has_document and state.page_index + 1 < state.page_count)
-        self.rotate_button.setEnabled(state.has_document)
+        self.rotate_button.setEnabled(state.has_document and state.can_rotate)
         self.zoom_out_button.setEnabled(state.has_document)
         self.zoom_in_button.setEnabled(state.has_document)
         self.page_field.setEnabled(state.has_document)

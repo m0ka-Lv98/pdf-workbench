@@ -64,14 +64,18 @@ def raw_page_rotate_values(path: Path) -> tuple[object | None, ...]:
     return tuple(kid.get_object().get("/Rotate", None) for kid in root_pages["/Kids"])
 
 
+def set_direct_rotate(path: Path, page_index: int, rotation: int) -> None:
+    with pikepdf.open(str(path), allow_overwriting_input=True) as pdf:
+        pdf.pages[page_index].obj["/Rotate"] = rotation
+        pdf.save(str(path))
+
+
 def test_rotate_pages_command_executes_undoes_and_redoes(tmp_path: Path) -> None:
     document_path = create_command_fixture(tmp_path / "rotate-command.pdf")
-    events: list[str] = []
     command = RotatePagesCommand(
         document_path,
         (0, 1),
         PdfPageMutationService(),
-        prepare_mutation=lambda: events.append("prepare"),
     )
 
     execute_change = command.execute()
@@ -88,7 +92,6 @@ def test_rotate_pages_command_executes_undoes_and_redoes(tmp_path: Path) -> None
     redo_change = command.redo()
     assert redo_change.requires_reload is True
     assert effective_rotations(document_path) == (180, 270, 180)
-    assert events == ["prepare", "prepare", "prepare"]
 
 
 def test_rotate_pages_command_exposes_latest_mutation_result(tmp_path: Path) -> None:
@@ -124,3 +127,26 @@ def test_rotate_pages_command_rejects_out_of_range_indexes_on_execute(tmp_path: 
 
     with pytest.raises(ValueError, match="out of range"):
         command.execute()
+
+
+@pytest.mark.parametrize("raw_value", [-90, 0, 360, 450])
+def test_rotate_pages_command_undo_restores_exact_direct_rotate_value(
+    tmp_path: Path,
+    raw_value: int,
+) -> None:
+    document_path = create_blank_pdf(tmp_path / f"rotate-{raw_value}.pdf", 1)
+    set_direct_rotate(document_path, 0, raw_value)
+    command = RotatePagesCommand(document_path, (0,), PdfPageMutationService())
+
+    command.execute()
+    command.undo()
+
+    assert raw_page_rotate_values(document_path) == (raw_value,)
+
+
+def test_rotate_pages_command_rejects_non_integer_indexes(tmp_path: Path) -> None:
+    document_path = create_blank_pdf(tmp_path / "rotate-non-integer.pdf", 1)
+    service = PdfPageMutationService()
+
+    with pytest.raises(TypeError, match="integers"):
+        RotatePagesCommand(document_path, (1.9,), service)

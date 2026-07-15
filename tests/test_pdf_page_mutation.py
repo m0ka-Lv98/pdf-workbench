@@ -62,6 +62,27 @@ def raw_page_rotate_values(path: Path) -> tuple[object | None, ...]:
     return tuple(kid.get_object().get("/Rotate", None) for kid in root_pages["/Kids"])
 
 
+@pytest.mark.parametrize(
+    ("raw_value", "expected_effective"),
+    [(-90, 270), (360, 0), (450, 90)],
+)
+def test_read_rotation_states_preserves_raw_direct_values(
+    tmp_path: Path,
+    raw_value: int,
+    expected_effective: int,
+) -> None:
+    document_path = create_blank_pdf(tmp_path / f"raw-{raw_value}.pdf", 1)
+    with pikepdf.open(str(document_path), allow_overwriting_input=True) as pdf:
+        pdf.pages[0].obj["/Rotate"] = raw_value
+        pdf.save(str(document_path))
+
+    state = PdfPageMutationService().read_rotation_states(document_path, (0,))[0]
+
+    assert state.direct_rotate_present is True
+    assert state.direct_rotate_value == raw_value
+    assert state.effective_rotation == expected_effective
+
+
 def test_read_rotation_states_reports_direct_and_inherited_rotation(tmp_path: Path) -> None:
     document_path = create_inherited_rotation_fixture(tmp_path / "rotation-states.pdf")
     service = PdfPageMutationService()

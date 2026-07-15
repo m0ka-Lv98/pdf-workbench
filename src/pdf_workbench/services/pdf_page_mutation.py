@@ -7,10 +7,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
+import pikepdf
 import pypdfium2 as pdfium  # type: ignore[import-untyped]
 from pypdf import PdfReader, PdfWriter
 from pypdf.generic import NameObject, NumberObject
 
+from pdf_workbench.domain.mutation import WorkingCopyMutationResult
 from pdf_workbench.services.pdf_document_validator import (
     PdfDocumentValidationError,
     PdfDocumentValidator,
@@ -37,11 +39,12 @@ class PageRotationState:
 
 
 @dataclass(frozen=True, slots=True)
-class PageMutationResult:
-    old_revision: DocumentRevision
-    new_revision: DocumentRevision
-    page_count: int
-    affected_pages: frozenset[int]
+class PageBoxState:
+    media_box: tuple[float, float, float, float]
+    crop_box: tuple[float, float, float, float] | None
+    trim_box: tuple[float, float, float, float] | None
+    bleed_box: tuple[float, float, float, float] | None
+    art_box: tuple[float, float, float, float] | None
 
 
 class PdfPageMutationService:
@@ -77,43 +80,57 @@ class PdfPageMutationService:
         self,
         path: Path,
         states: tuple[PageRotationState, ...],
-    ) -> PageMutationResult:
+    ) -> WorkingCopyMutationResult:
         if not states:
             raise ValueError("states must not be empty")
         resolved_path = path.expanduser().resolve()
         candidate_path: Path | None = None
         primary_error: BaseException | None = None
-        old_revision = DocumentRevision.from_path(resolved_path)
 
         try:
+            old_revision = DocumentRevision.from_path(resolved_path)
+            with pikepdf.open(resolved_path) as pdf:
+                pages = list(pdf.pages)
+                page_count = len(pages)
+                self._validate_page_indexes(
+                    tuple(state.page_index for state in states),
+                    page_count,
+                )
+                state_map = {state.page_index: state for state in states}
+                self._validate_states(states)
+                rotation_snapshot = self.read_rotation_states(
+                    resolved_path,
+                    tuple(range(page_count)),
+                )
+                box_snapshot = tuple(self._page_box_state(page) for page in pages)
             writer = PdfWriter(clone_from=str(resolved_path))
-            root_pages = cast(Any, writer._root_object["/Pages"]).get_object()
+            root_pages = cast(Any, writer.root_object["/Pages"]).get_object()
             page_objects = self._collect_page_objects(root_pages)
-            page_count = len(page_objects)
-            self._validate_page_indexes(tuple(state.page_index for state in states), page_count)
-            self._validate_states(states)
             candidate_path = self._create_candidate_path(resolved_path)
-            for state in states:
-                page_object = cast(dict[object, object], page_objects[state.page_index])
-                rotate_key = NameObject("/Rotate")
+            for page_index, original_state in enumerate(rotation_snapshot):
+                state = state_map.get(page_index, original_state)
+                page_object = cast(dict[object, object], page_objects[page_index])
                 if state.direct_rotate_present:
                     if state.direct_rotate_value is None:
                         raise PdfPageMutationError("回転値が不正です")
-                    page_object[rotate_key] = NumberObject(state.direct_rotate_value)
+                    page_object[NameObject("/Rotate")] = NumberObject(state.direct_rotate_value)
                 else:
-                    page_object.pop(rotate_key, None)
+                    page_object.pop(NameObject("/Rotate"), None)
             with candidate_path.open("wb") as output_stream:
                 writer.write(output_stream)
+
             self._fsync_file(candidate_path)
             self._validate_candidate(
                 candidate_path,
                 expected_page_count=page_count,
                 expected_states=states,
+                original_rotation_snapshot=rotation_snapshot,
+                original_box_snapshot=box_snapshot,
             )
+            new_revision = self._build_revision_from_candidate(candidate_path, resolved_path)
             self._replace_atomically(candidate_path, resolved_path)
             self._fsync_parent_directory(resolved_path.parent)
-            new_revision = DocumentRevision.from_path(resolved_path)
-            return PageMutationResult(
+            return WorkingCopyMutationResult(
                 old_revision=old_revision,
                 new_revision=new_revision,
                 page_count=page_count,
@@ -143,99 +160,113 @@ class PdfPageMutationService:
                 raise ValueError("page index is out of range")
         return validated
 
-    def _rotation_state_for_page(
-        self,
-        page_object: object,
-        page_index: int,
-    ) -> PageRotationState:
-        typed_page_object = cast(dict[object, object], page_object)
-        rotate_key = NameObject("/Rotate")
-        direct_rotate_present = rotate_key in typed_page_object
-        direct_rotate_value: int | None = None
-        if direct_rotate_present:
-            direct_rotate_value = self._normalize_rotation(
-                typed_page_object[rotate_key],
+    def _rotation_state_for_page(self, page_object: Any, page_index: int) -> PageRotationState:
+        direct_rotate = page_object.get(NameObject("/Rotate"), None)
+        if direct_rotate is not None:
+            direct_rotate_value = self._parse_raw_rotation(
+                direct_rotate,
                 page_index=page_index,
                 label="direct",
             )
-            effective_rotation = direct_rotate_value
-        else:
-            effective_rotation = self._resolve_inherited_rotation(
-                typed_page_object,
+            return PageRotationState(
                 page_index=page_index,
+                direct_rotate_present=True,
+                direct_rotate_value=direct_rotate_value,
+                effective_rotation=self._normalize_effective_rotation(
+                    direct_rotate_value,
+                    page_index=page_index,
+                    label="direct",
+                ),
             )
+        inherited_rotate = self._resolve_inherited_rotation(page_object, page_index=page_index)
         return PageRotationState(
             page_index=page_index,
-            direct_rotate_present=direct_rotate_present,
-            direct_rotate_value=direct_rotate_value,
-            effective_rotation=effective_rotation,
+            direct_rotate_present=False,
+            direct_rotate_value=None,
+            effective_rotation=inherited_rotate,
         )
 
-    def _resolve_inherited_rotation(self, page_object: object, *, page_index: int) -> int:
-        current: Any = cast(dict[object, object], page_object)
-        visited: set[int] = set()
+    def _resolve_inherited_rotation(self, page_object: Any, *, page_index: int) -> int:
+        current: Any = page_object
+        visited: set[tuple[int, int]] = set()
         while current is not None:
-            object_id = id(current)
-            if object_id in visited:
+            parent_ref = current.get("/Parent", None)
+            if parent_ref is None:
+                return 0
+            parent = self._dereference(parent_ref)
+            objgen = getattr(parent, "objgen", None)
+            if objgen in visited:
                 raise PdfPageRotationValidationError("ページツリーの回転継承を解決できません")
-            visited.add(object_id)
-            if getattr(current, "get", None) is None:
-                break
-            parent_reference = current.get("/Parent", None)
-            if parent_reference is None:
-                break
-            parent = parent_reference.get_object()
-            if parent is None:
-                break
-            rotate_key = NameObject("/Rotate")
-            rotate = parent.get(rotate_key, None)
+            if objgen is not None:
+                visited.add(objgen)
+            rotate = parent.get("/Rotate", None)
             if rotate is not None:
-                return self._normalize_rotation(
+                raw_rotation = self._parse_raw_rotation(
                     rotate,
+                    page_index=page_index,
+                    label="inherited",
+                )
+                return self._normalize_effective_rotation(
+                    raw_rotation,
                     page_index=page_index,
                     label="inherited",
                 )
             current = parent
         return 0
 
-    def _normalize_rotation(
+    def _collect_page_objects(self, pages_node: Any) -> list[Any]:
+        page_objects: list[Any] = []
+        self._append_page_objects(pages_node, page_objects)
+        return page_objects
+
+    def _append_page_objects(self, node: Any, page_objects: list[Any]) -> None:
+        node_type = str(node.get(NameObject("/Type"), ""))
+        if node_type == "/Page":
+            page_objects.append(node)
+            return
+        for kid in node.get(NameObject("/Kids"), []):
+            self._append_page_objects(self._dereference(kid), page_objects)
+
+    def _parse_raw_rotation(
         self,
         value: object,
         *,
         page_index: int,
         label: str,
     ) -> int:
+        if isinstance(value, bool):
+            raise PdfPageRotationValidationError(
+                f"{page_index + 1}ページ目の{label}回転値が不正です"
+            )
         try:
-            rotation = int(cast(Any, value))
+            raw_rotation = (
+                int(cast(Any, value).as_int())
+                if hasattr(value, "as_int")
+                else int(cast(Any, value))
+            )
         except Exception as exc:
             raise PdfPageRotationValidationError(
                 f"{page_index + 1}ページ目の{label}回転値が不正です"
             ) from exc
-        if rotation % 90 != 0:
+        if raw_rotation % 90 != 0:
             raise PdfPageRotationValidationError(
                 f"{page_index + 1}ページ目の{label}回転値は90度単位である必要があります"
             )
-        normalized = rotation % 360
+        return int(raw_rotation)
+
+    def _normalize_effective_rotation(
+        self,
+        raw_rotation: int,
+        *,
+        page_index: int,
+        label: str,
+    ) -> int:
+        normalized = raw_rotation % 360
         if normalized not in {0, 90, 180, 270}:
             raise PdfPageRotationValidationError(
                 f"{page_index + 1}ページ目の{label}回転値が不正です"
             )
         return int(normalized)
-
-    def _collect_page_objects(self, pages_object: object) -> list[object]:
-        page_objects: list[object] = []
-        self._append_page_objects(cast(dict[object, object], pages_object), page_objects)
-        return page_objects
-
-    def _append_page_objects(self, node: dict[object, object], page_objects: list[object]) -> None:
-        node_type = str(node.get(NameObject("/Type"), ""))
-        if node_type == "/Page":
-            page_objects.append(node)
-            return
-        kids = cast(list[object], node.get(NameObject("/Kids"), []))
-        for kid in kids:
-            child = cast(Any, kid).get_object()
-            self._append_page_objects(cast(dict[object, object], child), page_objects)
 
     def _validate_states(self, states: tuple[PageRotationState, ...]) -> None:
         for state in states:
@@ -246,8 +277,32 @@ class PdfPageMutationService:
             if state.direct_rotate_present:
                 if state.direct_rotate_value is None:
                     raise PdfPageRotationValidationError("回転値が不正です")
-                if state.direct_rotate_value not in {0, 90, 180, 270}:
-                    raise PdfPageRotationValidationError("回転値が不正です")
+                self._normalize_effective_rotation(
+                    state.direct_rotate_value,
+                    page_index=state.page_index,
+                    label="direct",
+                )
+
+    def _page_box_state(self, page: pikepdf.Page) -> PageBoxState:
+        return PageBoxState(
+            media_box=self._normalize_box(page.mediabox),
+            crop_box=self._optional_box(page.obj.get("/CropBox", None)),
+            trim_box=self._optional_box(page.obj.get("/TrimBox", None)),
+            bleed_box=self._optional_box(page.obj.get("/BleedBox", None)),
+            art_box=self._optional_box(page.obj.get("/ArtBox", None)),
+        )
+
+    @staticmethod
+    def _normalize_box(box: Any) -> tuple[float, float, float, float]:
+        values = tuple(float(value) for value in box)
+        if len(values) != 4:
+            raise PdfPageMutationError("ページボックスが不正です")
+        return values
+
+    def _optional_box(self, value: object) -> tuple[float, float, float, float] | None:
+        if value is None:
+            return None
+        return self._normalize_box(value)
 
     def _create_candidate_path(self, target_path: Path) -> Path:
         prefix = f".{target_path.stem}.mutation."
@@ -273,17 +328,32 @@ class PdfPageMutationService:
         *,
         expected_page_count: int,
         expected_states: tuple[PageRotationState, ...],
+        original_rotation_snapshot: tuple[PageRotationState, ...],
+        original_box_snapshot: tuple[PageBoxState, ...],
     ) -> None:
         try:
             self._validator.validate(str(path), expected_page_count=expected_page_count)
         except PdfDocumentValidationError as exc:
             raise PdfPageMutationError(str(exc)) from exc
-        candidate_states = self.read_rotation_states(
-            path,
-            tuple(state.page_index for state in expected_states),
-        )
-        if candidate_states != expected_states:
-            raise PdfPageMutationError("更新後のページ回転検証に失敗しました")
+
+        with pikepdf.open(path) as pdf:
+            pages = list(pdf.pages)
+            if len(pages) != expected_page_count:
+                raise PdfPageMutationError("更新後のページ数検証に失敗しました")
+            current_rotation_snapshot = self.read_rotation_states(path, tuple(range(len(pages))))
+            if len(current_rotation_snapshot) != len(original_rotation_snapshot):
+                raise PdfPageMutationError("更新後のページ数検証に失敗しました")
+            expected_state_map = {state.page_index: state for state in expected_states}
+            for page_index, current_state in enumerate(current_rotation_snapshot):
+                if page_index in expected_state_map:
+                    if current_state != expected_state_map[page_index]:
+                        raise PdfPageMutationError("更新後のページ回転検証に失敗しました")
+                elif current_state != original_rotation_snapshot[page_index]:
+                    raise PdfPageMutationError("非対象ページの回転状態が変化しました")
+            current_box_snapshot = tuple(self._page_box_state(page) for page in pages)
+            if current_box_snapshot != original_box_snapshot:
+                raise PdfPageMutationError("ページボックスの検証に失敗しました")
+
         self._render_affected_pages(path, expected_states)
 
     def _render_affected_pages(
@@ -320,6 +390,18 @@ class PdfPageMutationService:
         finally:
             if document is not None:
                 document.close()
+
+    def _build_revision_from_candidate(
+        self,
+        candidate_path: Path,
+        destination_path: Path,
+    ) -> DocumentRevision:
+        stat_result = candidate_path.stat()
+        return DocumentRevision(
+            resolved_path=str(destination_path.expanduser().resolve()),
+            file_size=stat_result.st_size,
+            mtime_ns=stat_result.st_mtime_ns,
+        )
 
     def _replace_atomically(self, source_path: Path, destination_path: Path) -> None:
         try:
@@ -371,3 +453,7 @@ class PdfPageMutationService:
                     type(primary_error).__name__,
                     exc,
                 )
+
+    @staticmethod
+    def _dereference(value: Any) -> Any:
+        return value.get_object() if hasattr(value, "get_object") else value

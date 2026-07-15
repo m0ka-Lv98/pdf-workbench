@@ -4,14 +4,14 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Literal
 
-from pdf_workbench.services.pdf_page_mutation import PageMutationResult
+from pdf_workbench.domain.mutation import WorkingCopyMutationResult
 
 
 @dataclass(frozen=True, slots=True)
 class CommandChange:
     affected_pages: frozenset[int] | None
     requires_reload: bool = False
-    mutation_result: PageMutationResult | None = None
+    mutation_result: WorkingCopyMutationResult | None = None
 
     @classmethod
     def from_command(cls, command: DocumentCommand) -> CommandChange:

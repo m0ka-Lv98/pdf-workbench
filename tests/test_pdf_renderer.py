@@ -11,6 +11,8 @@ import pdf_workbench.services.pdf_renderer as pdf_renderer_module
 from pdf_workbench.services.page_coordinates import PageMetadata
 from pdf_workbench.services.pdf_renderer import (
     DocumentMetadata,
+    DocumentReleaseRequest,
+    DocumentReleaseResult,
     DocumentRevision,
     PageTextIndex,
     PdfiumDocumentBackend,
@@ -168,6 +170,11 @@ class FailingRenderBackend(FakeBackend):
         device_pixel_ratio: float,
     ) -> QImage:
         raise RuntimeError(f"render failed {page_index}")
+
+
+class FailingCloseBackend(FakeBackend):
+    def close(self) -> None:
+        raise RuntimeError("close failed")
 
 
 class FakeRenderableImage:
@@ -346,10 +353,54 @@ def test_render_service_release_document_waits_for_worker_close(
     service.open_document("doc-1", document_path, 1, revision)
     qtbot.waitUntil(lambda: "doc-1" in service._worker._documents)
 
-    assert service.release_document("doc-1", 1, timeout_ms=3000) is True
+    result = service.release_document("doc-1", 1, timeout_ms=3000)
+    assert result.success is True
+    assert result.document_id == "doc-1"
+    assert result.requested_generation == 1
     qtbot.waitUntil(lambda: backend.closed is True)
     assert "doc-1" not in service._worker._documents
     assert service.shutdown() is True
+
+
+def test_render_worker_release_document_rejects_stale_generation(tmp_path: Path) -> None:
+    cache = RenderImageCache(max_bytes=1024 * 1024)
+    backend = FakeBackend("sample")
+    worker = PdfRenderWorker(lambda _path: backend, cache)
+    revision = make_revision(tmp_path)
+    worker.open_document("doc-1", tmp_path / "sample.pdf", 2, revision)
+    results: list[DocumentReleaseResult] = []
+    worker.document_released.connect(lambda result: results.append(result))
+
+    worker.release_document(DocumentReleaseRequest("req-1", "doc-1", 1))
+
+    assert results == [
+        DocumentReleaseResult(
+            request_id="req-1",
+            document_id="doc-1",
+            requested_generation=1,
+            closed_generation=2,
+            success=False,
+            message="stale generation",
+        )
+    ]
+    assert backend.closed is False
+
+
+def test_render_worker_release_document_returns_failure_on_close_exception(tmp_path: Path) -> None:
+    cache = RenderImageCache(max_bytes=1024 * 1024)
+    worker = PdfRenderWorker(lambda _path: FailingCloseBackend("broken"), cache)
+    revision = make_revision(tmp_path)
+    worker.open_document("doc-1", tmp_path / "sample.pdf", 1, revision)
+    results: list[DocumentReleaseResult] = []
+    worker.document_released.connect(lambda result: results.append(result))
+
+    worker.release_document(DocumentReleaseRequest("req-2", "doc-1", 1))
+
+    assert len(results) == 1
+    assert results[0].request_id == "req-2"
+    assert results[0].success is False
+    assert results[0].message == "close failed"
+    assert "doc-1" in worker._documents
 
 
 def test_pdfium_backend_sets_device_pixel_ratio(tmp_path: Path) -> None:

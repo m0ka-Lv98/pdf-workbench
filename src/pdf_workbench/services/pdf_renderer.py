@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import uuid
 from collections import OrderedDict
 from contextlib import suppress
 from dataclasses import dataclass
@@ -127,6 +128,23 @@ class RenderFailure:
     message: str
 
 
+@dataclass(frozen=True, slots=True)
+class DocumentReleaseRequest:
+    request_id: str
+    document_id: str
+    generation: int
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentReleaseResult:
+    request_id: str
+    document_id: str
+    requested_generation: int
+    closed_generation: int | None
+    success: bool
+    message: str | None = None
+
+
 @dataclass(slots=True)
 class WorkerDocumentContext:
     backend: PdfDocumentBackend
@@ -193,7 +211,7 @@ class PdfRenderServiceProtocol(Protocol):
         document_id: str,
         generation: int,
         timeout_ms: int = 3000,
-    ) -> bool: ...
+    ) -> DocumentReleaseResult: ...
 
     def transition_cache_revision(
         self,
@@ -508,7 +526,7 @@ class PdfRenderWorker(QObject):
     text_index_progress = Signal(object, object, int, int, int)
     text_index_completed = Signal(object, object, int, int)
     text_index_failed = Signal(object, object, int, str)
-    document_closed = Signal(str, int)
+    document_released = Signal(object)
     shutdown_completed = Signal()
 
     def __init__(
@@ -633,16 +651,80 @@ class PdfRenderWorker(QObject):
     @Slot(str, int)
     def close_document(self, document_id: str, generation: int) -> None:
         context = self._documents.get(document_id)
-        if context is None:
-            self.document_closed.emit(document_id, generation)
-            return
-        if generation < context.generation:
-            self.document_closed.emit(document_id, context.generation)
-            return
         self._drop_pending_render_for_document(document_id)
         self._drop_pending_text_for_document(document_id)
+        if context is None:
+            return
+        if generation < context.generation:
+            return
         self._close_document_backend(document_id)
-        self.document_closed.emit(document_id, generation)
+
+    @Slot(object)
+    def release_document(self, request: object) -> None:
+        if not isinstance(request, DocumentReleaseRequest):
+            raise TypeError("request must be DocumentReleaseRequest")
+        context = self._documents.get(request.document_id)
+        if context is None:
+            self.document_released.emit(
+                DocumentReleaseResult(
+                    request_id=request.request_id,
+                    document_id=request.document_id,
+                    requested_generation=request.generation,
+                    closed_generation=None,
+                    success=True,
+                )
+            )
+            return
+        if request.generation < context.generation:
+            self.document_released.emit(
+                DocumentReleaseResult(
+                    request_id=request.request_id,
+                    document_id=request.document_id,
+                    requested_generation=request.generation,
+                    closed_generation=context.generation,
+                    success=False,
+                    message="stale generation",
+                )
+            )
+            return
+        if request.generation != context.generation:
+            self.document_released.emit(
+                DocumentReleaseResult(
+                    request_id=request.request_id,
+                    document_id=request.document_id,
+                    requested_generation=request.generation,
+                    closed_generation=context.generation,
+                    success=False,
+                    message="generation mismatch",
+                )
+            )
+            return
+        self._drop_pending_render_for_document(request.document_id)
+        self._drop_pending_text_for_document(request.document_id)
+        try:
+            context.backend.close()
+        except Exception as exc:
+            self.document_released.emit(
+                DocumentReleaseResult(
+                    request_id=request.request_id,
+                    document_id=request.document_id,
+                    requested_generation=request.generation,
+                    closed_generation=context.generation,
+                    success=False,
+                    message=str(exc),
+                )
+            )
+            return
+        self._documents.pop(request.document_id, None)
+        self.document_released.emit(
+            DocumentReleaseResult(
+                request_id=request.request_id,
+                document_id=request.document_id,
+                requested_generation=request.generation,
+                closed_generation=context.generation,
+                success=True,
+            )
+        )
 
     @Slot(str, int, object)
     def update_document_generation(
@@ -943,6 +1025,7 @@ class PdfRenderService(QObject):
     _open_requested = Signal(str, Path, int, object)
     _render_requested = Signal(object)
     _close_requested = Signal(str, int)
+    _release_requested = Signal(object)
     _update_generation_requested = Signal(str, int, object)
     _transition_cache_requested = Signal(object, object, object)
     _shutdown_requested = Signal()
@@ -976,6 +1059,7 @@ class PdfRenderService(QObject):
         self._open_requested.connect(self._worker.open_document)
         self._render_requested.connect(self._worker.enqueue_render)
         self._close_requested.connect(self._worker.close_document)
+        self._release_requested.connect(self._worker.release_document)
         self._update_generation_requested.connect(self._worker.update_document_generation)
         self._transition_cache_requested.connect(self._worker.transition_cache_revision)
         self._shutdown_requested.connect(self._worker.shutdown)
@@ -1003,34 +1087,67 @@ class PdfRenderService(QObject):
             return
         self._close_requested.emit(document_id, generation)
 
-    def release_document(self, document_id: str, generation: int, timeout_ms: int = 3000) -> bool:
+    def release_document(
+        self,
+        document_id: str,
+        generation: int,
+        timeout_ms: int = 3000,
+    ) -> DocumentReleaseResult:
         if self._shutdown_requested_once or not self._thread.isRunning():
-            return True
+            return DocumentReleaseResult(
+                request_id="shutdown",
+                document_id=document_id,
+                requested_generation=generation,
+                closed_generation=None,
+                success=True,
+            )
 
         event_loop = QEventLoop(self)
         timeout = QTimer(self)
         timeout.setSingleShot(True)
-        timed_out = False
+        request = DocumentReleaseRequest(
+            request_id=uuid.uuid4().hex,
+            document_id=document_id,
+            generation=generation,
+        )
+        result: DocumentReleaseResult | None = None
 
-        def handle_closed(closed_document_id: str, _closed_generation: int) -> None:
-            if closed_document_id != document_id:
+        def handle_released(release_result: object) -> None:
+            nonlocal result
+            if not isinstance(release_result, DocumentReleaseResult):
+                raise TypeError("release_result must be DocumentReleaseResult")
+            if (
+                release_result.request_id != request.request_id
+                or release_result.document_id != request.document_id
+                or release_result.requested_generation != request.generation
+            ):
                 return
+            result = release_result
             timeout.stop()
             event_loop.quit()
 
         def handle_timeout() -> None:
-            nonlocal timed_out
-            timed_out = True
             event_loop.quit()
 
-        self._worker.document_closed.connect(handle_closed)
+        self._worker.document_released.connect(handle_released)
         timeout.timeout.connect(handle_timeout)
         timeout.start(timeout_ms)
-        self._close_requested.emit(document_id, generation)
+        self._release_requested.emit(request)
         event_loop.exec()
         with suppress(RuntimeError, TypeError):
-            self._worker.document_closed.disconnect(handle_closed)
-        return not timed_out
+            self._worker.document_released.disconnect(handle_released)
+        with suppress(RuntimeError, TypeError):
+            timeout.timeout.disconnect(handle_timeout)
+        if result is None:
+            return DocumentReleaseResult(
+                request_id=request.request_id,
+                document_id=request.document_id,
+                requested_generation=request.generation,
+                closed_generation=None,
+                success=False,
+                message="timeout",
+            )
+        return result
 
     def update_document_generation(
         self,
