@@ -296,3 +296,33 @@ def test_page_organizer_eviction_returns_placeholder_for_evicted_row(
     assert organizer.has_thumbnail_image(0) is False
     assert organizer.thumbnail_state(0) == "not_requested"
     assert organizer.has_thumbnail_image(1) is True
+
+
+def test_page_organizer_updates_desired_thumbnails_by_difference_for_large_models(
+    qtbot: QtBot,
+) -> None:
+    organizer = PageOrganizer()
+    _show_organizer(qtbot, organizer)
+    organizer.set_document(_metadata(1000))
+    changed_rows: list[int] = []
+    organizer.list_view.model().dataChanged.connect(
+        lambda top_left, bottom_right, _roles: changed_rows.extend(
+            range(top_left.row(), bottom_right.row() + 1)
+        )
+    )
+    organizer.set_selected_page_indexes((2, 4), current_index=4)
+    organizer.set_current_page(4)
+
+    organizer.set_desired_thumbnail_pages((0, 1, 2, 3, 4, 5))
+    changed_rows.clear()
+    organizer.set_desired_thumbnail_pages((500, 501, 502, 503, 504, 505))
+
+    assert organizer.row_count == 1000
+    assert organizer.selected_page_indexes == (2, 4)
+    assert organizer.current_page_index == 4
+    assert len(changed_rows) <= 6
+    assert set(changed_rows) <= {0, 1, 2, 3, 4, 5}
+
+    changed_rows.clear()
+    organizer.set_desired_thumbnail_pages((500, 501, 502, 503, 504, 505))
+    assert changed_rows == []

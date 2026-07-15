@@ -521,12 +521,7 @@ class PdfView(QWidget):
     def open_document(self, path: Path) -> None:
         resolved_path = path.expanduser().resolve()
         self._path = resolved_path
-        self._set_current_page_index(0, emit=False)
-        self._metadata = None
-        self._desired_pages.clear()
-        self._expected_main_render_keys.clear()
-        self._page_organizer.clear()
-        self._clear_text_state(clear_query=True)
+        self._clear_document_render_state_for_reload(clear_query=True)
         self._bump_generation()
         self._show_status("PDFを読み込み中です")
         try:
@@ -631,11 +626,7 @@ class PdfView(QWidget):
         if self._closed:
             return
         self._path = None
-        self._desired_pages.clear()
-        self._expected_main_render_keys.clear()
-        self._page_organizer.clear()
-        self._clear_text_state(clear_query=True)
-        self._metadata = None
+        self._clear_document_render_state_for_reload(clear_query=True)
         self._bump_generation()
         self._render_service.close_document(self._document_id, self._generation)
         self._show_status("PDFを開いてください")
@@ -659,8 +650,7 @@ class PdfView(QWidget):
         self.state_changed.emit()
 
     def _show_error(self, message: str) -> None:
-        self._release_mouse_grab()
-        self._metadata = None
+        self._clear_document_render_state_for_reload(clear_query=True)
         self._show_status(message, render_state="error")
         self.error_occurred.emit(message)
 
@@ -695,7 +685,6 @@ class PdfView(QWidget):
         self._page_organizer.schedule_visible_thumbnail_update(force=True)
         self._refresh_page_overlays()
         self.document_loaded.emit()
-        self.current_page_changed.emit(self._current_page_index)
         self.state_changed.emit()
 
     def _on_document_failed(self, document_id: object, generation: int, message: str) -> None:
@@ -1251,6 +1240,17 @@ class PdfView(QWidget):
             return
         self._visible_timer.start()
 
+    def _clear_document_render_state_for_reload(self, *, clear_query: bool) -> None:
+        self._release_mouse_grab()
+        self._set_current_page_index(0, emit=False)
+        self._desired_pages.clear()
+        self._expected_main_render_keys.clear()
+        self._page_organizer.clear()
+        self._canvas.set_pages([])
+        self._metadata = None
+        if clear_query:
+            self._clear_text_state(clear_query=True)
+
     def _request_visible_pages(self) -> None:
         if self._metadata is None or self._path is None or self._closed:
             return
@@ -1260,8 +1260,7 @@ class PdfView(QWidget):
             self._show_error(str(exc))
             return
         if revision != self._metadata.revision:
-            self._clear_text_state(clear_query=True)
-            self._metadata = None
+            self._clear_document_render_state_for_reload(clear_query=True)
             self._bump_generation()
             self._show_status("PDFを再読み込み中です")
             self._render_service.open_document(
@@ -1433,7 +1432,7 @@ class PdfView(QWidget):
         if not desired_page_indexes:
             return
         visible_pages = set(self._page_organizer.visible_page_indexes)
-        for offset, page_index in enumerate(desired_page_indexes):
+        for page_index in desired_page_indexes:
             logical_zoom = self._thumbnail_logical_zoom(page_index)
             cache_key = RenderCacheKey(
                 revision=revision,
@@ -1445,7 +1444,7 @@ class PdfView(QWidget):
             needs_request = self._page_organizer.prepare_thumbnail_request(
                 page_index,
                 cache_key,
-                rendering=offset == 0,
+                rendering=page_index in visible_pages,
             )
             if not needs_request:
                 continue

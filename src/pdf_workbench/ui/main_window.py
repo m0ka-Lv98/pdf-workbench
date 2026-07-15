@@ -1209,6 +1209,7 @@ class MainWindow(QMainWindow):
             view.set_zoom(self._BASE_RENDER_SCALE * session.zoom_factor)
             restored_page_index = session.current_page_index
             page_restored = False
+            document_registered = False
 
             def apply_restored_page() -> None:
                 nonlocal page_restored
@@ -1216,14 +1217,12 @@ class MainWindow(QMainWindow):
                     return
                 if view is None or view.page_count <= 0:
                     return
+                if not document_registered:
+                    QTimer.singleShot(0, apply_restored_page)
+                    return
                 page_restored = True
                 target_page_index = min(restored_page_index, view.page_count - 1)
                 view.set_page(target_page_index)
-                session.set_navigation_state(
-                    page_index=target_page_index,
-                    zoom_factor=session.zoom_factor,
-                )
-                self._schedule_recovery_metadata_persist(session)
 
             view.document_loaded.connect(
                 apply_restored_page,
@@ -1263,6 +1262,7 @@ class MainWindow(QMainWindow):
         tab_index: int | None = None
         try:
             self._documents.append(document)
+            document_registered = True
             tab_index = self._tabs.addTab(
                 view,
                 IconProvider.icon(IconName.DOCUMENT, tone=IconTone.MUTED, size=16),
@@ -1301,6 +1301,9 @@ class MainWindow(QMainWindow):
             self._update_overlay_geometry()
             self._apply_search_inset()
             raise
+
+        if view.page_count > 0:
+            apply_restored_page()
 
         self._remember_recent_file(session.source_path)
         self._refresh_source_change_banner()

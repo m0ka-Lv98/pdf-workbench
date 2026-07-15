@@ -703,6 +703,38 @@ def test_thumbnail_scale_uses_page_geometry_and_rotation(
     assert portrait_rotated_zoom <= 0.25
 
 
+def test_visible_thumbnail_pages_are_rendering_while_prefetch_pages_are_queued(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    document_path = create_pdf(tmp_path / "thumbnail-state.pdf", 20)
+    service = FakeRenderService(create_metadata(document_path, 20))
+    view = PdfView(render_service=service, debounce_interval_ms=0)
+    _wrapper = show_view(qtbot, view)
+
+    view.open_document(document_path)
+    qtbot.waitUntil(lambda: view.page_count == 20)
+    scrollbar = view._page_organizer.list_view.verticalScrollBar()
+    scrollbar.setValue(scrollbar.maximum() // 2)
+    qtbot.waitUntil(lambda: bool(view._page_organizer.visible_page_indexes))
+    view._request_visible_thumbnails(view._metadata.revision)
+
+    visible_pages = set(view._page_organizer.visible_page_indexes)
+    desired_pages = set(view._page_organizer.desired_thumbnail_pages)
+    prefetch_pages = desired_pages - visible_pages
+
+    assert visible_pages
+    assert prefetch_pages
+    assert all(
+        view._page_organizer.thumbnail_state(page_index) == "rendering"
+        for page_index in visible_pages
+    )
+    assert all(
+        view._page_organizer.thumbnail_state(page_index) == "queued"
+        for page_index in prefetch_pages
+    )
+
+
 def test_fast_scroll_does_not_apply_old_offscreen_result(
     qtbot: QtBot,
     tmp_path: Path,
@@ -776,6 +808,89 @@ def test_reload_ignores_late_thumbnail_results_from_previous_document(
         view._page_organizer.expected_key_for_page(stale_request.page_index)
         != stale_request.cache_key
     )
+
+
+def test_revision_reload_clears_organizer_and_expected_render_state_before_reopen(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    document_path = create_pdf(tmp_path / "revision-reload.pdf", 4)
+    service = FakeRenderService(create_metadata(document_path, 4))
+    view = PdfView(render_service=service, debounce_interval_ms=0)
+    _wrapper = show_view(qtbot, view)
+
+    view.open_document(document_path)
+    qtbot.waitUntil(lambda: view.page_count == 4)
+    qtbot.waitUntil(lambda: any(request.priority >= 10 for request in service.render_requests))
+    view._page_organizer.set_selected_page_indexes((1, 2), current_index=2)
+    service.metadata = create_metadata(create_pdf(tmp_path / "updated.pdf", 2), 2)
+    reopen_calls: list[tuple[str, Path, int, DocumentRevision]] = []
+
+    def delayed_open(
+        document_id: str,
+        path: Path,
+        generation: int,
+        revision: DocumentRevision,
+    ) -> None:
+        reopen_calls.append((document_id, path, generation, revision))
+
+    monkeypatch.setattr(service, "open_document", delayed_open)
+    updated_bytes = document_path.read_bytes() + b"\n%reload"
+    document_path.write_bytes(updated_bytes)
+
+    view._request_visible_pages()
+
+    assert reopen_calls
+    assert view._metadata is None
+    assert view._page_organizer.row_count == 0
+    assert view.selected_page_indexes == ()
+    assert view._page_organizer.desired_thumbnail_pages == ()
+    assert view._page_organizer.expected_key_count == 0
+    assert view._expected_main_render_keys == {}
+    assert view._canvas.pages == []
+
+
+def test_reload_failure_keeps_organizer_empty_and_rejects_late_results(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    document_path = create_pdf(tmp_path / "reload-failure.pdf", 4)
+    service = FakeRenderService(create_metadata(document_path, 4))
+    view = PdfView(render_service=service, debounce_interval_ms=0)
+    _wrapper = show_view(qtbot, view)
+
+    view.open_document(document_path)
+    qtbot.waitUntil(lambda: view.page_count == 4)
+    qtbot.waitUntil(lambda: any(request.priority >= 10 for request in service.render_requests))
+    stale_request = next(request for request in service.render_requests if request.priority >= 10)
+    stale_main_request = next(
+        request for request in service.render_requests if request.priority < 10
+    )
+    monkeypatch.setattr(
+        service,
+        "open_document",
+        lambda document_id, _path, generation, _revision: service.document_failed.emit(
+            document_id,
+            generation,
+            "reload failed",
+        ),
+    )
+    document_path.write_bytes(document_path.read_bytes() + b"\n%failure")
+
+    view._request_visible_pages()
+
+    assert view._page_organizer.row_count == 0
+    assert view._page_organizer.expected_key_count == 0
+    assert view._expected_main_render_keys == {}
+    service.render_succeeded.emit(make_render_result(stale_request))
+    service.render_succeeded.emit(make_render_result(stale_main_request))
+    service.render_failed.emit(make_render_failure(stale_request))
+
+    assert view._page_organizer.row_count == 0
+    assert view._canvas.pages == []
+    assert view.page_count == 0
 
 
 def test_previous_and_next_navigation_scroll_to_target_page(

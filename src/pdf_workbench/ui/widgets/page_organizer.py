@@ -123,6 +123,8 @@ class PageOrganizerModel(QAbstractListModel):
         if not 0 <= page_index < len(self._entries):
             return
         entry = self._entries[page_index]
+        if entry.state == state and entry.message == message and entry.image is None:
+            return
         entry.state = state
         entry.message = message
         entry.image = None
@@ -136,6 +138,8 @@ class PageOrganizerModel(QAbstractListModel):
         if not 0 <= page_index < len(self._entries):
             return
         entry = self._entries[page_index]
+        if entry.state == "displayed" and entry.message == "" and entry.image is image:
+            return
         entry.image = image
         entry.state = "displayed"
         entry.message = ""
@@ -149,6 +153,8 @@ class PageOrganizerModel(QAbstractListModel):
         if not 0 <= page_index < len(self._entries):
             return
         entry = self._entries[page_index]
+        if entry.image is None and entry.state == "not_requested" and entry.message == "待機中":
+            return
         entry.image = None
         entry.state = "not_requested"
         entry.message = "待機中"
@@ -609,14 +615,15 @@ class PageOrganizer(QWidget):
                 }
             )
         )
-        self._desired_page_indexes = frozenset(valid_indexes)
-        for page_index in list(self._expected_keys):
-            if page_index not in self._desired_page_indexes:
-                self._expected_keys.pop(page_index, None)
-                self._model.clear_thumbnail(page_index)
-        for page_index in range(self._model.rowCount()):
-            if page_index not in self._desired_page_indexes:
-                self._model.clear_thumbnail(page_index)
+        next_desired = frozenset(valid_indexes)
+        previous_desired = self._desired_page_indexes
+        if next_desired == previous_desired:
+            return valid_indexes
+        removed = previous_desired - next_desired
+        self._desired_page_indexes = next_desired
+        for page_index in removed:
+            self._expected_keys.pop(page_index, None)
+            self._model.clear_thumbnail(page_index)
         return valid_indexes
 
     def prepare_thumbnail_request(
