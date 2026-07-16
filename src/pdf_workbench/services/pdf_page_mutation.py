@@ -5,15 +5,16 @@ import logging
 import os
 import tempfile
 from dataclasses import dataclass
+from enum import StrEnum
 from hashlib import sha256
 from numbers import Integral
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Sequence, cast
 
 import pikepdf
 import pypdfium2 as pdfium  # type: ignore[import-untyped]
 from pypdf import PdfReader, PdfWriter
-from pypdf.generic import NameObject, NumberObject
+from pypdf.generic import ArrayObject, NameObject, NumberObject
 
 from pdf_workbench.domain.mutation import PageIndexTransition, WorkingCopyMutationResult
 from pdf_workbench.services.pdf_document_validator import (
@@ -23,6 +24,39 @@ from pdf_workbench.services.pdf_document_validator import (
 from pdf_workbench.services.pdf_renderer import DocumentRevision
 
 logger = logging.getLogger(__name__)
+
+
+def _require_strict_int(value: object, *, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise ValueError(f"{label} must contain only integers")
+    return int(value)
+
+
+def _validate_sorted_unique_page_indexes(
+    values: tuple[int, ...],
+    *,
+    label: str,
+    page_count: int,
+) -> tuple[int, ...]:
+    normalized = tuple(_require_strict_int(value, label=label) for value in values)
+    if tuple(sorted(normalized)) != normalized:
+        raise ValueError(f"{label} must be sorted")
+    if len(set(normalized)) != len(normalized):
+        raise ValueError(f"{label} must be unique")
+    for page_index in normalized:
+        if page_index < 0 or page_index >= page_count:
+            raise ValueError(f"{label} must stay within the page range")
+    return normalized
+
+
+def _all_original_indexes_after(
+    original_page_count: int,
+    source_page_indexes: tuple[int, ...],
+) -> tuple[int, ...]:
+    return tuple(
+        page_index + sum(1 for source_index in source_page_indexes if source_index < page_index)
+        for page_index in range(original_page_count)
+    )
 
 
 class PdfPageMutationError(RuntimeError):
@@ -50,12 +84,20 @@ class PageBoxState:
     art_box: tuple[float, float, float, float] | None
 
 
+class AnnotationParentState(StrEnum):
+    ABSENT = "absent"
+    POINTS_TO_OWN_PAGE = "points_to_own_page"
+    POINTS_TO_OTHER_PAGE = "points_to_other_page"
+    INVALID = "invalid"
+
+
 @dataclass(frozen=True, slots=True)
 class PdfAnnotationStructureSnapshot:
     subtype: str
     rect: tuple[float, float, float, float]
     has_appearance: bool
     appearance_fingerprint: str | None
+    parent_state: AnnotationParentState
     fingerprint: str
 
 
@@ -70,11 +112,26 @@ class PdfPageStructureSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class PdfOutlineItemSnapshot:
+    title: str
+    destination_page_index: int | None
+    action_type: str | None
+    children: tuple[PdfOutlineItemSnapshot, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PdfNamedDestinationSnapshot:
+    name: str
+    destination_page_index: int
+
+
+@dataclass(frozen=True, slots=True)
 class PdfDocumentStructureSnapshot:
     page_count: int
     pages: tuple[PdfPageStructureSnapshot, ...]
     metadata_fingerprint: str
-    outlines_fingerprint: str
+    outlines: tuple[PdfOutlineItemSnapshot, ...]
+    named_destinations: tuple[PdfNamedDestinationSnapshot, ...]
     attachments_fingerprint: str
 
 
@@ -85,6 +142,54 @@ class PageDuplicationReceipt:
     original_page_indexes_after: tuple[int, ...]
     duplicate_page_indexes: tuple[int, ...]
     before_snapshot: PdfDocumentStructureSnapshot
+
+    def __post_init__(self) -> None:
+        if isinstance(self.original_page_count, bool) or not isinstance(
+            self.original_page_count,
+            Integral,
+        ):
+            raise ValueError("original_page_count must be an integer")
+        if self.original_page_count <= 0:
+            raise ValueError("original_page_count must be positive")
+        if self.before_snapshot.page_count != self.original_page_count:
+            raise ValueError("before_snapshot page count must match original_page_count")
+        source_indexes = _validate_sorted_unique_page_indexes(
+            self.source_page_indexes,
+            label="source_page_indexes",
+            page_count=self.original_page_count,
+        )
+        if not source_indexes:
+            raise ValueError("source_page_indexes must not be empty")
+
+        new_page_count = self.original_page_count + len(source_indexes)
+        expected_original_indexes_after = tuple(
+            _all_original_indexes_after(self.original_page_count, source_indexes)[source_index]
+            for source_index in source_indexes
+        )
+        expected_duplicate_indexes = tuple(
+            page_index + 1 for page_index in expected_original_indexes_after
+        )
+        actual_original_indexes_after = tuple(
+            _require_strict_int(value, label="original_page_indexes_after")
+            for value in self.original_page_indexes_after
+        )
+        actual_duplicate_indexes = tuple(
+            _require_strict_int(value, label="duplicate_page_indexes")
+            for value in self.duplicate_page_indexes
+        )
+        if len(actual_original_indexes_after) != len(source_indexes):
+            raise ValueError("original_page_indexes_after length must match source_page_indexes")
+        if len(actual_duplicate_indexes) != len(source_indexes):
+            raise ValueError("duplicate_page_indexes length must match source_page_indexes")
+        if actual_original_indexes_after != expected_original_indexes_after:
+            raise ValueError("original_page_indexes_after does not match the expected mapping")
+        if actual_duplicate_indexes != expected_duplicate_indexes:
+            raise ValueError("duplicate_page_indexes does not match the expected mapping")
+        if len(set(actual_duplicate_indexes)) != len(actual_duplicate_indexes):
+            raise ValueError("duplicate_page_indexes must be unique")
+        for duplicate_page_index in actual_duplicate_indexes:
+            if duplicate_page_index < 0 or duplicate_page_index >= new_page_count:
+                raise ValueError("duplicate_page_indexes must stay within the new page range")
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,15 +209,16 @@ class PdfPageMutationService:
     ) -> tuple[PageRotationState, ...]:
         resolved_path = path.expanduser().resolve()
         try:
-            reader = PdfReader(str(resolved_path))
-            root = cast(Any, reader.trailer["/Root"])
-            root_pages = cast(Any, root["/Pages"]).get_object()
-            page_objects = self._collect_page_objects(root_pages)
-            validated_indexes = self._validate_page_indexes(page_indexes, len(page_objects))
-            return tuple(
-                self._rotation_state_for_page(page_objects[page_index], page_index)
-                for page_index in validated_indexes
-            )
+            with resolved_path.open("rb") as source_stream:
+                reader = PdfReader(source_stream)
+                root = cast(Any, reader.trailer["/Root"])
+                root_pages = cast(Any, root["/Pages"]).get_object()
+                page_objects = self._collect_page_objects(root_pages)
+                validated_indexes = self._validate_page_indexes(page_indexes, len(page_objects))
+                return tuple(
+                    self._rotation_state_for_page(page_objects[page_index], page_index)
+                    for page_index in validated_indexes
+                )
         except PdfPageMutationError:
             raise
         except ValueError:
@@ -149,20 +255,22 @@ class PdfPageMutationService:
                     tuple(range(page_count)),
                 )
                 box_snapshot = tuple(self._page_box_state(page) for page in pages)
-            writer = PdfWriter(clone_from=str(resolved_path))
-            root_pages = cast(Any, writer.root_object["/Pages"]).get_object()
-            page_objects = self._collect_page_objects(root_pages)
-            candidate_path = self._create_candidate_path(resolved_path)
-            for page_index, original_state in enumerate(rotation_snapshot):
-                state = state_map.get(page_index, original_state)
-                page_object = cast(dict[object, object], page_objects[page_index])
-                if state.direct_rotate_present:
-                    if state.direct_rotate_value is None:
-                        raise PdfPageMutationError("回転値が不正です")
-                    page_object[NameObject("/Rotate")] = NumberObject(state.direct_rotate_value)
-                else:
-                    page_object.pop(NameObject("/Rotate"), None)
-            self._write_candidate(writer, candidate_path)
+            with resolved_path.open("rb") as source_stream:
+                reader = PdfReader(source_stream)
+                writer = PdfWriter(clone_from=reader)
+                root_pages = cast(Any, writer.root_object["/Pages"]).get_object()
+                page_objects = self._collect_page_objects(root_pages)
+                candidate_path = self._create_candidate_path(resolved_path)
+                for page_index, original_state in enumerate(rotation_snapshot):
+                    state = state_map.get(page_index, original_state)
+                    page_object = cast(dict[object, object], page_objects[page_index])
+                    if state.direct_rotate_present:
+                        if state.direct_rotate_value is None:
+                            raise PdfPageMutationError("回転値が不正です")
+                        page_object[NameObject("/Rotate")] = NumberObject(state.direct_rotate_value)
+                    else:
+                        page_object.pop(NameObject("/Rotate"), None)
+                self._write_candidate(writer, candidate_path)
 
             self._validate_rotation_candidate(
                 candidate_path,
@@ -196,6 +304,8 @@ class PdfPageMutationService:
         self,
         path: Path,
         page_indexes: tuple[int, ...],
+        *,
+        expected_before_snapshot: PdfDocumentStructureSnapshot | None = None,
     ) -> PageDuplicationMutation:
         resolved_path = path.expanduser().resolve()
         candidate_path: Path | None = None
@@ -204,29 +314,35 @@ class PdfPageMutationService:
         try:
             old_revision = DocumentRevision.from_path(resolved_path)
             before_snapshot = self._snapshot_document_structure(resolved_path)
-            self._validate_page_indexes(page_indexes, before_snapshot.page_count)
-            self._reject_unsupported_forms(resolved_path, page_indexes)
-            original_indexes_after = self._all_original_indexes_after(
-                before_snapshot.page_count,
+            if expected_before_snapshot is not None and before_snapshot != expected_before_snapshot:
+                raise PdfPageMutationError("複製対象ページの前提状態が変化しました")
+            normalized_page_indexes = self._normalize_duplicate_page_indexes(
                 page_indexes,
+                before_snapshot.page_count,
+            )
+            self._reject_unsupported_forms(resolved_path, normalized_page_indexes)
+            original_indexes_after = _all_original_indexes_after(
+                before_snapshot.page_count,
+                normalized_page_indexes,
             )
             duplicate_page_indexes = tuple(
-                original_indexes_after[source_index] + 1 for source_index in page_indexes
+                original_indexes_after[source_index] + 1 for source_index in normalized_page_indexes
             )
             receipt = PageDuplicationReceipt(
                 original_page_count=before_snapshot.page_count,
-                source_page_indexes=page_indexes,
+                source_page_indexes=normalized_page_indexes,
                 original_page_indexes_after=tuple(
-                    original_indexes_after[source_index] for source_index in page_indexes
+                    original_indexes_after[source_index] for source_index in normalized_page_indexes
                 ),
                 duplicate_page_indexes=duplicate_page_indexes,
                 before_snapshot=before_snapshot,
             )
-            reader = PdfReader(str(resolved_path))
-            writer = PdfWriter(clone_from=str(resolved_path))
-            self._apply_page_duplication_to_writer(writer, reader, receipt)
-            candidate_path = self._create_candidate_path(resolved_path)
-            self._write_candidate(writer, candidate_path)
+            with resolved_path.open("rb") as source_stream:
+                reader = PdfReader(source_stream)
+                writer = PdfWriter(clone_from=reader)
+                self._apply_page_duplication_to_writer(writer, reader, receipt)
+                candidate_path = self._create_candidate_path(resolved_path)
+                self._write_candidate(writer, candidate_path)
             self._validate_page_duplication_candidate(candidate_path, receipt)
             new_revision = self._build_revision_from_candidate(candidate_path, resolved_path)
             self._replace_atomically(candidate_path, resolved_path)
@@ -235,17 +351,19 @@ class PdfPageMutationService:
                 mutation_result=WorkingCopyMutationResult(
                     old_revision=old_revision,
                     new_revision=new_revision,
-                    page_count=before_snapshot.page_count + len(page_indexes),
+                    page_count=before_snapshot.page_count + len(normalized_page_indexes),
                     affected_pages=frozenset(duplicate_page_indexes),
                     page_index_transition=self._build_execute_transition(
                         before_snapshot.page_count,
-                        page_indexes,
+                        normalized_page_indexes,
                     ),
                 ),
                 receipt=receipt,
             )
         except PdfPageMutationError as exc:
             primary_error = exc
+            raise
+        except TypeError:
             raise
         except ValueError:
             raise
@@ -270,11 +388,13 @@ class PdfPageMutationService:
         try:
             old_revision = DocumentRevision.from_path(resolved_path)
             self._validate_current_duplication_state(resolved_path, receipt)
-            writer = PdfWriter(clone_from=str(resolved_path))
-            for page_index in sorted(receipt.duplicate_page_indexes, reverse=True):
-                writer.remove_page(page_index)
-            candidate_path = self._create_candidate_path(resolved_path)
-            self._write_candidate(writer, candidate_path)
+            with resolved_path.open("rb") as source_stream:
+                reader = PdfReader(source_stream)
+                writer = PdfWriter(clone_from=reader)
+                for page_index in sorted(receipt.duplicate_page_indexes, reverse=True):
+                    writer.remove_page(page_index)
+                candidate_path = self._create_candidate_path(resolved_path)
+                self._write_candidate(writer, candidate_path)
             self._validate_undo_duplication_candidate(candidate_path, receipt)
             new_revision = self._build_revision_from_candidate(candidate_path, resolved_path)
             self._replace_atomically(candidate_path, resolved_path)
@@ -304,11 +424,21 @@ class PdfPageMutationService:
         if not validated:
             raise ValueError("page_indexes must not be empty")
         for page_index in validated:
+            if isinstance(page_index, bool) or not isinstance(page_index, Integral):
+                raise TypeError("page indexes must be integers")
             if page_index < 0:
                 raise ValueError("page indexes must be non-negative")
             if page_index >= page_count:
                 raise ValueError("page index is out of range")
         return validated
+
+    def _normalize_duplicate_page_indexes(
+        self,
+        page_indexes: tuple[int, ...],
+        page_count: int,
+    ) -> tuple[int, ...]:
+        validated_indexes = self._validate_page_indexes(page_indexes, page_count)
+        return tuple(sorted(set(int(page_index) for page_index in validated_indexes)))
 
     def _rotation_state_for_page(self, page_object: Any, page_index: int) -> PageRotationState:
         rotate_key = NameObject("/Rotate")
@@ -512,7 +642,14 @@ class PdfPageMutationService:
         after_snapshot = self._snapshot_document_structure(path)
         if after_snapshot.page_count != expected_page_count:
             raise PdfPageMutationError("更新後のページ数検証に失敗しました")
-        self._validate_document_level_fingerprints(after_snapshot, receipt.before_snapshot)
+        self._validate_document_level_snapshots(
+            after_snapshot,
+            receipt.before_snapshot,
+            page_mapping=self._build_execute_transition(
+                receipt.original_page_count,
+                receipt.source_page_indexes,
+            ).cache_old_to_new,
+        )
         self._validate_duplicate_page_layout(after_snapshot, receipt)
         self._validate_duplicate_page_independence(path, receipt)
         self._validate_duplicate_renders(path, receipt)
@@ -544,18 +681,28 @@ class PdfPageMutationService:
         with pikepdf.open(resolved_path) as pdf:
             page_count = len(pdf.pages)
             rotations = self.read_rotation_states(resolved_path, tuple(range(page_count)))
+            page_objgens = {
+                page.obj.objgen
+                for page in pdf.pages
+                if self._has_indirect_objgen(getattr(page.obj, "objgen", None))
+            }
             pages = tuple(
-                self._page_structure_snapshot(pdf.pages[index], rotations[index])
+                self._page_structure_snapshot(pdf.pages[index], rotations[index], page_objgens)
                 for index in range(page_count)
             )
         metadata_fingerprint = self._metadata_fingerprint(resolved_path)
-        outlines_fingerprint = self._outlines_fingerprint(resolved_path)
+        outlines = self._outlines_snapshot(resolved_path, page_count=page_count)
+        named_destinations = self._named_destination_snapshots(
+            resolved_path,
+            page_count=page_count,
+        )
         attachments_fingerprint = self._attachments_fingerprint(resolved_path)
         return PdfDocumentStructureSnapshot(
             page_count=page_count,
             pages=pages,
             metadata_fingerprint=metadata_fingerprint,
-            outlines_fingerprint=outlines_fingerprint,
+            outlines=outlines,
+            named_destinations=named_destinations,
             attachments_fingerprint=attachments_fingerprint,
         )
 
@@ -563,8 +710,13 @@ class PdfPageMutationService:
         self,
         page: pikepdf.Page,
         rotation_state: PageRotationState,
+        page_objgens: set[tuple[int, int]],
     ) -> PdfPageStructureSnapshot:
-        annotations = self._annotation_snapshots(page.obj.get("/Annots", None))
+        annotations = self._annotation_snapshots(
+            page.obj.get("/Annots", None),
+            owning_page=page.obj,
+            page_objgens=page_objgens,
+        )
         return PdfPageStructureSnapshot(
             content_fingerprint=self._contents_fingerprint(page.obj.get("/Contents", None)),
             boxes=self._page_box_state(page),
@@ -577,6 +729,9 @@ class PdfPageMutationService:
     def _annotation_snapshots(
         self,
         annots_object: object,
+        *,
+        owning_page: Any,
+        page_objgens: set[tuple[int, int]],
     ) -> tuple[PdfAnnotationStructureSnapshot, ...]:
         if annots_object is None:
             return ()
@@ -596,6 +751,11 @@ class PdfPageMutationService:
                     rect=self._normalize_box(rect_object),
                     has_appearance="/AP" in annot,
                     appearance_fingerprint=self._appearance_fingerprint(annot),
+                    parent_state=self._annotation_parent_state(
+                        annot,
+                        owning_page=owning_page,
+                        page_objgens=page_objgens,
+                    ),
                     fingerprint=self._object_fingerprint(
                         annot,
                         exclude_keys=frozenset({"/P"}),
@@ -603,6 +763,32 @@ class PdfPageMutationService:
                 )
             )
         return tuple(snapshots)
+
+    def _annotation_parent_state(
+        self,
+        annot: Any,
+        *,
+        owning_page: Any,
+        page_objgens: set[tuple[int, int]],
+    ) -> AnnotationParentState:
+        parent_object = annot.get("/P", None)
+        if parent_object is None:
+            return AnnotationParentState.ABSENT
+        try:
+            parent = self._dereference(parent_object)
+        except Exception:
+            return AnnotationParentState.INVALID
+        parent_objgen = getattr(parent, "objgen", None)
+        owning_page_objgen = getattr(owning_page, "objgen", None)
+        if parent_objgen == owning_page_objgen:
+            return AnnotationParentState.POINTS_TO_OWN_PAGE
+        if (
+            self._has_indirect_objgen(parent_objgen)
+            and cast(tuple[int, int], parent_objgen) in page_objgens
+            and str(parent.get("/Type", "")) == "/Page"
+        ):
+            return AnnotationParentState.POINTS_TO_OTHER_PAGE
+        return AnnotationParentState.INVALID
 
     def _contents_fingerprint(self, contents: object) -> str:
         if contents is None:
@@ -621,7 +807,13 @@ class PdfPageMutationService:
         *,
         exclude_keys: frozenset[str] = frozenset(),
     ) -> str:
-        normalized = self._normalize_object(value, exclude_keys=exclude_keys, seen=set())
+        normalized = self._normalize_object(
+            value,
+            exclude_keys=exclude_keys,
+            seen={},
+            active=set(),
+            next_local_id=[1],
+        )
         encoded = json.dumps(
             normalized,
             ensure_ascii=False,
@@ -635,93 +827,270 @@ class PdfPageMutationService:
         value: object,
         *,
         exclude_keys: frozenset[str],
-        seen: set[tuple[int, int]],
+        seen: dict[tuple[int, int], int],
+        active: set[tuple[int, int]],
+        next_local_id: list[int],
     ) -> object:
         dereferenced = self._dereference(value)
         objgen = getattr(dereferenced, "objgen", None)
         if objgen is not None:
             typed_objgen = cast(tuple[int, int], objgen)
+            if typed_objgen in active:
+                return {"cycle": seen[typed_objgen]}
             if typed_objgen in seen:
-                return {"ref": [typed_objgen[0], typed_objgen[1]]}
-            seen.add(typed_objgen)
-        if isinstance(dereferenced, pikepdf.Stream):
-            payload = {
-                str(key): self._normalize_object(item, exclude_keys=exclude_keys, seen=seen)
-                for key, item in dereferenced.items()
-                if str(key) not in exclude_keys
-            }
-            payload["__stream_data__"] = sha256(dereferenced.read_bytes()).hexdigest()
-            return payload
-        if isinstance(dereferenced, pikepdf.Dictionary):
-            return {
-                str(key): self._normalize_object(item, exclude_keys=exclude_keys, seen=seen)
-                for key, item in dereferenced.items()
-                if str(key) not in exclude_keys
-            }
-        if isinstance(dereferenced, pikepdf.Array):
-            return [
-                self._normalize_object(item, exclude_keys=exclude_keys, seen=seen)
-                for item in dereferenced
-            ]
-        if isinstance(dereferenced, bytes):
-            return {"__bytes__": sha256(dereferenced).hexdigest()}
-        if dereferenced is None or isinstance(dereferenced, (bool, int, float, str)):
-            return dereferenced
-        return str(dereferenced)
+                return {"ref": seen[typed_objgen]}
+            seen[typed_objgen] = next_local_id[0]
+            next_local_id[0] += 1
+            active.add(typed_objgen)
+        try:
+            if isinstance(dereferenced, pikepdf.Stream):
+                payload = {
+                    key: self._normalize_object(
+                        item,
+                        exclude_keys=exclude_keys,
+                        seen=seen,
+                        active=active,
+                        next_local_id=next_local_id,
+                    )
+                    for key, item in sorted(
+                        (
+                            (str(key), item)
+                            for key, item in dereferenced.items()
+                            if str(key) not in exclude_keys
+                        ),
+                        key=lambda entry: entry[0],
+                    )
+                }
+                payload["__stream_data__"] = sha256(dereferenced.read_bytes()).hexdigest()
+                return payload
+            if isinstance(dereferenced, pikepdf.Dictionary):
+                return {
+                    key: self._normalize_object(
+                        item,
+                        exclude_keys=exclude_keys,
+                        seen=seen,
+                        active=active,
+                        next_local_id=next_local_id,
+                    )
+                    for key, item in sorted(
+                        (
+                            (str(key), item)
+                            for key, item in dereferenced.items()
+                            if str(key) not in exclude_keys
+                        ),
+                        key=lambda entry: entry[0],
+                    )
+                }
+            if isinstance(dereferenced, pikepdf.Array):
+                return [
+                    self._normalize_object(
+                        item,
+                        exclude_keys=exclude_keys,
+                        seen=seen,
+                        active=active,
+                        next_local_id=next_local_id,
+                    )
+                    for item in dereferenced
+                ]
+            if isinstance(dereferenced, bytes):
+                return {"__bytes__": sha256(dereferenced).hexdigest()}
+            if dereferenced is None or isinstance(dereferenced, (bool, int, float, str)):
+                return dereferenced
+            return str(dereferenced)
+        finally:
+            if objgen is not None:
+                active.discard(cast(tuple[int, int], objgen))
 
     def _metadata_fingerprint(self, path: Path) -> str:
-        reader = PdfReader(str(path))
-        metadata = reader.metadata
-        payload: dict[str, object] = {}
-        if metadata is not None:
-            payload["info"] = {str(key): str(value) for key, value in metadata.items()}
-        root = self._dereference(reader.trailer["/Root"])
-        metadata_object = root.get("/Metadata", None)
-        if metadata_object is not None:
-            resolved_metadata = self._dereference(metadata_object)
-            get_data = getattr(resolved_metadata, "get_data", None)
-            if callable(get_data):
-                payload["xmp_sha256"] = sha256(get_data()).hexdigest()
-        return self._json_digest(payload)
-
-    def _outlines_fingerprint(self, path: Path) -> str:
-        reader = PdfReader(str(path))
         try:
-            outline = reader.outline
-        except Exception:
-            return self._json_digest([])
-        payload = self._normalize_outline(outline, reader)
-        return self._json_digest(payload)
+            with path.open("rb") as source_stream:
+                reader = PdfReader(source_stream)
+                metadata = reader.metadata
+                payload: dict[str, object] = {}
+                if metadata is not None:
+                    payload["info"] = {str(key): str(value) for key, value in metadata.items()}
+                root = self._dereference(reader.trailer["/Root"])
+                metadata_object = root.get("/Metadata", None)
+                if metadata_object is not None:
+                    resolved_metadata = self._dereference(metadata_object)
+                    get_data = getattr(resolved_metadata, "get_data", None)
+                    if not callable(get_data):
+                        raise PdfPageMutationError("メタデータの解析に失敗しました")
+                    payload["xmp_sha256"] = sha256(get_data()).hexdigest()
+                return self._json_digest(payload)
+        except PdfPageMutationError:
+            raise
+        except Exception as exc:
+            raise PdfPageMutationError("メタデータの解析に失敗しました") from exc
 
-    def _normalize_outline(self, value: object, reader: PdfReader) -> object:
-        if isinstance(value, list):
-            return [self._normalize_outline(item, reader) for item in value]
-        title = str(getattr(value, "title", value))
-        page_number: int | None
+    def _outlines_snapshot(
+        self,
+        path: Path,
+        *,
+        page_count: int,
+    ) -> tuple[PdfOutlineItemSnapshot, ...]:
         try:
-            page_number = reader.get_destination_page_number(value)  # type: ignore[arg-type]
-        except Exception:
-            page_number = None
-        return {
-            "type": type(value).__name__,
-            "title": title,
-            "page": page_number,
-        }
+            with path.open("rb") as source_stream:
+                reader = PdfReader(source_stream)
+                root = self._dereference(reader.trailer["/Root"])
+                if "/Outlines" not in root:
+                    return ()
+                outline = reader.outline
+                if not isinstance(outline, list):
+                    raise PdfPageMutationError("アウトラインの解析に失敗しました")
+                return self._outline_items_snapshot(outline, reader, page_count=page_count)
+        except PdfPageMutationError:
+            raise
+        except Exception as exc:
+            raise PdfPageMutationError("アウトラインの解析に失敗しました") from exc
+
+    def _outline_items_snapshot(
+        self,
+        items: Sequence[object],
+        reader: PdfReader,
+        *,
+        page_count: int,
+    ) -> tuple[PdfOutlineItemSnapshot, ...]:
+        snapshots: list[PdfOutlineItemSnapshot] = []
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if isinstance(item, list):
+                raise PdfPageMutationError("アウトライン階層が不正です")
+            children: tuple[PdfOutlineItemSnapshot, ...] = ()
+            if index + 1 < len(items) and isinstance(items[index + 1], list):
+                children = self._outline_items_snapshot(
+                    cast(list[object], items[index + 1]),
+                    reader,
+                    page_count=page_count,
+                )
+                index += 1
+            snapshots.append(
+                self._outline_item_snapshot(
+                    item,
+                    reader,
+                    children=children,
+                    page_count=page_count,
+                )
+            )
+            index += 1
+        return tuple(snapshots)
+
+    def _outline_item_snapshot(
+        self,
+        item: object,
+        reader: PdfReader,
+        *,
+        children: tuple[PdfOutlineItemSnapshot, ...],
+        page_count: int,
+    ) -> PdfOutlineItemSnapshot:
+        title = str(getattr(item, "title", ""))
+        if not title:
+            raise PdfPageMutationError("アウトラインの解析に失敗しました")
+        action_type, requires_destination = self._outline_action_type(item)
+        destination_page_index = self._outline_destination_page_index(
+            item,
+            reader,
+            page_count=page_count,
+            required=requires_destination,
+        )
+        return PdfOutlineItemSnapshot(
+            title=title,
+            destination_page_index=destination_page_index,
+            action_type=action_type,
+            children=children,
+        )
+
+    def _outline_action_type(self, item: object) -> tuple[str | None, bool]:
+        get = getattr(item, "get", None)
+        if callable(get):
+            destination = get("/Dest", None)
+            if destination is not None:
+                return ("dest", True)
+            action = get("/A", None)
+            if action is not None:
+                resolved_action = self._dereference(action)
+                action_type = str(resolved_action.get("/S", ""))
+                return (action_type or None, action_type == "/GoTo")
+        return (None, False)
+
+    def _outline_destination_page_index(
+        self,
+        item: object,
+        reader: PdfReader,
+        *,
+        page_count: int,
+        required: bool,
+    ) -> int | None:
+        try:
+            page_index = reader.get_destination_page_number(item)  # type: ignore[arg-type]
+        except Exception as exc:
+            if required:
+                raise PdfPageMutationError("アウトラインの解析に失敗しました") from exc
+            return None
+        if page_index is None:
+            if required:
+                raise PdfPageMutationError("アウトラインの解析に失敗しました")
+            return None
+        if page_index < 0 or page_index >= page_count:
+            raise PdfPageMutationError("アウトラインの宛先ページが不正です")
+        return int(page_index)
+
+    def _named_destination_snapshots(
+        self,
+        path: Path,
+        *,
+        page_count: int,
+    ) -> tuple[PdfNamedDestinationSnapshot, ...]:
+        try:
+            with path.open("rb") as source_stream:
+                reader = PdfReader(source_stream)
+                root = self._dereference(reader.trailer["/Root"])
+                if "/Names" not in root and "/Dests" not in root:
+                    return ()
+                named_destinations = reader.named_destinations
+                if not isinstance(named_destinations, dict):
+                    raise PdfPageMutationError("名前付き宛先の解析に失敗しました")
+                snapshots: list[PdfNamedDestinationSnapshot] = []
+                for name, destination in sorted(
+                    named_destinations.items(),
+                    key=lambda item: str(item[0]),
+                ):
+                    page_index = reader.get_destination_page_number(destination)
+                    if page_index is None:
+                        raise PdfPageMutationError("名前付き宛先の解析に失敗しました")
+                    if page_index < 0 or page_index >= page_count:
+                        raise PdfPageMutationError("名前付き宛先のページが不正です")
+                    snapshots.append(
+                        PdfNamedDestinationSnapshot(
+                            name=str(name),
+                            destination_page_index=int(page_index),
+                        )
+                    )
+                return tuple(snapshots)
+        except PdfPageMutationError:
+            raise
+        except Exception as exc:
+            raise PdfPageMutationError("名前付き宛先の解析に失敗しました") from exc
 
     def _attachments_fingerprint(self, path: Path) -> str:
-        reader = PdfReader(str(path))
-        attachments = getattr(reader, "attachments", {})
-        payload: dict[str, list[str]] = {}
-        if isinstance(attachments, dict):
-            for name, values in attachments.items():
-                digests: list[str] = []
-                if isinstance(values, list):
-                    for item in values:
-                        digests.append(sha256(bytes(item)).hexdigest())
-                else:
-                    digests.append(sha256(bytes(values)).hexdigest())
-                payload[str(name)] = digests
-        return self._json_digest(payload)
+        try:
+            with path.open("rb") as source_stream:
+                reader = PdfReader(source_stream)
+                attachments = getattr(reader, "attachments", {})
+                payload: dict[str, list[str]] = {}
+                if isinstance(attachments, dict):
+                    for name, values in attachments.items():
+                        digests: list[str] = []
+                        if isinstance(values, list):
+                            for item in values:
+                                digests.append(sha256(bytes(item)).hexdigest())
+                        else:
+                            digests.append(sha256(bytes(values)).hexdigest())
+                        payload[str(name)] = digests
+                return self._json_digest(payload)
+        except Exception as exc:
+            raise PdfPageMutationError("添付ファイルの解析に失敗しました") from exc
 
     @staticmethod
     def _json_digest(payload: object) -> str:
@@ -757,9 +1126,50 @@ class PdfPageMutationService:
     ) -> None:
         for inserted, source_page_index in enumerate(receipt.source_page_indexes):
             insertion_index = source_page_index + inserted + 1
-            writer.insert_page(reader.pages[source_page_index], index=insertion_index)
+            source_page = reader.pages[source_page_index]
+            writer.insert_page(source_page, index=insertion_index)
             duplicated_page = writer.pages[insertion_index]
+            self._detach_duplicate_page_objects(writer, source_page, duplicated_page)
             self._set_duplicate_annotation_parent_references(duplicated_page)
+
+    def _detach_duplicate_page_objects(
+        self,
+        writer: PdfWriter,
+        source_page: Any,
+        duplicated_page: Any,
+    ) -> None:
+        for key in ("/MediaBox", "/CropBox", "/TrimBox", "/BleedBox", "/ArtBox"):
+            source_value = source_page.get(key, None)
+            if source_value is None:
+                continue
+            cloned_value = self._clone_into_writer(source_value, writer)
+            duplicated_page[NameObject(key)] = cloned_value
+        source_annots = source_page.get("/Annots", None)
+        if source_annots is not None:
+            duplicated_page[NameObject("/Annots")] = self._clone_annotations_into_writer(
+                source_annots,
+                writer,
+            )
+
+    def _clone_into_writer(self, value: Any, writer: PdfWriter) -> Any:
+        clone = getattr(value, "clone", None)
+        if not callable(clone):
+            return value
+        return clone(writer, force_duplicate=True)
+
+    def _clone_annotations_into_writer(self, value: Any, writer: PdfWriter) -> Any:
+        resolved_value = self._dereference(value)
+        if not isinstance(resolved_value, ArrayObject):
+            return self._clone_into_writer(value, writer)
+        cloned_annots = ArrayObject()
+        for annot_ref in resolved_value:
+            annot = self._dereference(annot_ref)
+            cloned_annot = self._clone_into_writer(annot, writer)
+            indirect_reference = getattr(cloned_annot, "indirect_reference", None)
+            cloned_annots.append(
+                indirect_reference if indirect_reference is not None else cloned_annot
+            )
+        return writer._add_object(cloned_annots)
 
     def _set_duplicate_annotation_parent_references(self, page: Any) -> None:
         annots = page.get("/Annots", None)
@@ -770,24 +1180,85 @@ class PdfPageMutationService:
             annot = self._dereference(annot_ref)
             annot[NameObject("/P")] = page_reference
 
-    def _validate_document_level_fingerprints(
+    def _validate_document_level_snapshots(
         self,
         current: PdfDocumentStructureSnapshot,
         before: PdfDocumentStructureSnapshot,
+        *,
+        page_mapping: tuple[int | None, ...] | None,
     ) -> None:
         if current.metadata_fingerprint != before.metadata_fingerprint:
             raise PdfPageMutationError("メタデータの検証に失敗しました")
-        if current.outlines_fingerprint != before.outlines_fingerprint:
+        expected_outlines = (
+            before.outlines
+            if page_mapping is None
+            else self._map_outline_snapshots(before.outlines, page_mapping)
+        )
+        if current.outlines != expected_outlines:
             raise PdfPageMutationError("アウトラインの検証に失敗しました")
+        expected_named_destinations = (
+            before.named_destinations
+            if page_mapping is None
+            else self._map_named_destination_snapshots(before.named_destinations, page_mapping)
+        )
+        if current.named_destinations != expected_named_destinations:
+            raise PdfPageMutationError("名前付き宛先の検証に失敗しました")
         if current.attachments_fingerprint != before.attachments_fingerprint:
             raise PdfPageMutationError("添付ファイルの検証に失敗しました")
+
+    def _map_outline_snapshots(
+        self,
+        items: tuple[PdfOutlineItemSnapshot, ...],
+        page_mapping: tuple[int | None, ...],
+    ) -> tuple[PdfOutlineItemSnapshot, ...]:
+        return tuple(
+            PdfOutlineItemSnapshot(
+                title=item.title,
+                destination_page_index=(
+                    None
+                    if item.destination_page_index is None
+                    else self._mapped_page_index(item.destination_page_index, page_mapping)
+                ),
+                action_type=item.action_type,
+                children=self._map_outline_snapshots(item.children, page_mapping),
+            )
+            for item in items
+        )
+
+    def _map_named_destination_snapshots(
+        self,
+        items: tuple[PdfNamedDestinationSnapshot, ...],
+        page_mapping: tuple[int | None, ...],
+    ) -> tuple[PdfNamedDestinationSnapshot, ...]:
+        return tuple(
+            PdfNamedDestinationSnapshot(
+                name=item.name,
+                destination_page_index=self._mapped_page_index(
+                    item.destination_page_index,
+                    page_mapping,
+                ),
+            )
+            for item in items
+        )
+
+    def _mapped_page_index(
+        self,
+        page_index: int,
+        page_mapping: tuple[int | None, ...],
+    ) -> int:
+        if page_index < 0 or page_index >= len(page_mapping):
+            raise PdfPageMutationError("ページ参照の検証に失敗しました")
+        mapped_page_index = page_mapping[page_index]
+        if mapped_page_index is None:
+            raise PdfPageMutationError("ページ参照の検証に失敗しました")
+        return mapped_page_index
 
     def _validate_duplicate_page_layout(
         self,
         after_snapshot: PdfDocumentStructureSnapshot,
         receipt: PageDuplicationReceipt,
     ) -> None:
-        all_original_indexes_after = self._all_original_indexes_after(
+        all_original_indexes_after = _all_original_indexes_after(
             receipt.original_page_count,
             receipt.source_page_indexes,
         )
@@ -802,9 +1273,34 @@ class PdfPageMutationService:
             strict=True,
         ):
             duplicate_page = after_snapshot.pages[duplicate_page_index]
-            source_page = receipt.before_snapshot.pages[source_page_index]
+            source_page = self._expected_duplicate_page_snapshot(
+                receipt.before_snapshot.pages[source_page_index]
+            )
             if duplicate_page != source_page:
                 raise PdfPageMutationError("複製ページの構造検証に失敗しました")
+
+    def _expected_duplicate_page_snapshot(
+        self,
+        page: PdfPageStructureSnapshot,
+    ) -> PdfPageStructureSnapshot:
+        return PdfPageStructureSnapshot(
+            content_fingerprint=page.content_fingerprint,
+            boxes=page.boxes,
+            direct_rotate_present=page.direct_rotate_present,
+            direct_rotate_value=page.direct_rotate_value,
+            effective_rotation=page.effective_rotation,
+            annotations=tuple(
+                PdfAnnotationStructureSnapshot(
+                    subtype=annot.subtype,
+                    rect=annot.rect,
+                    has_appearance=annot.has_appearance,
+                    appearance_fingerprint=annot.appearance_fingerprint,
+                    parent_state=AnnotationParentState.POINTS_TO_OWN_PAGE,
+                    fingerprint=annot.fingerprint,
+                )
+                for annot in page.annotations
+            ),
+        )
 
     def _validate_duplicate_page_independence(
         self,
@@ -828,6 +1324,7 @@ class PdfPageMutationService:
                 duplicate_page = pdf.pages[duplicate_page_index].obj
                 if getattr(source_page, "objgen", None) == getattr(duplicate_page, "objgen", None):
                     raise PdfPageMutationError("複製ページが元ページと同じオブジェクトです")
+                self._validate_page_box_independence(source_page, duplicate_page)
                 source_annots = self._annotation_objects(source_page.get("/Annots", None))
                 duplicate_annots = self._annotation_objects(duplicate_page.get("/Annots", None))
                 if len(source_annots) != len(duplicate_annots):
@@ -866,6 +1363,23 @@ class PdfPageMutationService:
                         None,
                     ):
                         raise PdfPageMutationError("複製注釈の/P参照が複製ページを指していません")
+
+    def _validate_page_box_independence(self, source_page: Any, duplicate_page: Any) -> None:
+        for key in ("/MediaBox", "/CropBox", "/TrimBox", "/BleedBox", "/ArtBox"):
+            source_value = source_page.get(key, None)
+            duplicate_value = duplicate_page.get(key, None)
+            if source_value is None or duplicate_value is None:
+                continue
+            source_resolved = self._dereference(source_value)
+            duplicate_resolved = self._dereference(duplicate_value)
+            source_objgen = getattr(source_resolved, "objgen", None)
+            duplicate_objgen = getattr(duplicate_resolved, "objgen", None)
+            if (
+                self._has_indirect_objgen(source_objgen)
+                and self._has_indirect_objgen(duplicate_objgen)
+                and source_objgen == duplicate_objgen
+            ):
+                raise PdfPageMutationError("複製ページが元ページとページボックスを共有しています")
 
     def _annotation_objects(self, annots_object: object) -> tuple[Any, ...]:
         if annots_object is None:
@@ -954,7 +1468,14 @@ class PdfPageMutationService:
             expected_page_count = receipt.original_page_count + len(receipt.source_page_indexes)
             if current_snapshot.page_count != expected_page_count:
                 raise PdfPageMutationError("複製済みページの状態が変化しているため元に戻せません")
-            self._validate_document_level_fingerprints(current_snapshot, receipt.before_snapshot)
+            self._validate_document_level_snapshots(
+                current_snapshot,
+                receipt.before_snapshot,
+                page_mapping=self._build_execute_transition(
+                    receipt.original_page_count,
+                    receipt.source_page_indexes,
+                ).cache_old_to_new,
+            )
             self._validate_duplicate_page_layout(current_snapshot, receipt)
         except PdfPageMutationError as exc:
             if "元に戻せません" in str(exc):
@@ -963,22 +1484,23 @@ class PdfPageMutationService:
                 "複製済みページの状態が変化しているため元に戻せません"
             ) from exc
 
-    @staticmethod
-    def _all_original_indexes_after(
-        original_page_count: int,
-        source_page_indexes: tuple[int, ...],
-    ) -> tuple[int, ...]:
-        return tuple(
-            page_index + sum(1 for source_index in source_page_indexes if source_index < page_index)
-            for page_index in range(original_page_count)
-        )
+    def validate_duplication_redo_precondition(
+        self,
+        path: Path,
+        receipt: PageDuplicationReceipt,
+    ) -> None:
+        resolved_path = path.expanduser().resolve()
+        current_snapshot = self._snapshot_document_structure(resolved_path)
+        if current_snapshot != receipt.before_snapshot:
+            raise PdfPageMutationError("複製対象ページの前提状態が変化しました")
+        self._reject_unsupported_forms(resolved_path, receipt.source_page_indexes)
 
     def _build_execute_transition(
         self,
         original_page_count: int,
         source_page_indexes: tuple[int, ...],
     ) -> PageIndexTransition:
-        original_indexes_after = self._all_original_indexes_after(
+        original_indexes_after = _all_original_indexes_after(
             original_page_count,
             source_page_indexes,
         )
@@ -997,7 +1519,7 @@ class PdfPageMutationService:
         )
 
     def _build_undo_transition(self, receipt: PageDuplicationReceipt) -> PageIndexTransition:
-        original_indexes_after = self._all_original_indexes_after(
+        original_indexes_after = _all_original_indexes_after(
             receipt.original_page_count,
             receipt.source_page_indexes,
         )

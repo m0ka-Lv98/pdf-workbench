@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from numbers import Integral
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -15,6 +16,10 @@ class PageIndexTransition:
     current_page_old_to_new: tuple[int | None, ...]
 
     def __post_init__(self) -> None:
+        if isinstance(self.old_page_count, bool) or not isinstance(self.old_page_count, Integral):
+            raise ValueError("old_page_count must be an integer")
+        if isinstance(self.new_page_count, bool) or not isinstance(self.new_page_count, Integral):
+            raise ValueError("new_page_count must be an integer")
         if self.old_page_count < 0 or self.new_page_count < 0:
             raise ValueError("page counts must be non-negative")
         if len(self.cache_old_to_new) != self.old_page_count:
@@ -39,12 +44,15 @@ class PageIndexTransition:
         for value in values:
             if value is None:
                 continue
-            if not 0 <= value < self.new_page_count:
+            if isinstance(value, bool) or not isinstance(value, Integral):
+                raise ValueError(f"{label} values must be integers or None")
+            typed_value = int(value)
+            if not 0 <= typed_value < self.new_page_count:
                 raise ValueError(f"{label} values must be within the new page range")
             if unique:
-                if value in seen:
+                if typed_value in seen:
                     raise ValueError(f"{label} values must be unique")
-                seen.add(value)
+                seen.add(typed_value)
 
 
 @dataclass(frozen=True, slots=True)

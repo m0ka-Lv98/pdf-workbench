@@ -1615,6 +1615,7 @@ class PdfView(QWidget):
         self.set_page(page_index)
 
     def _on_organizer_selection_changed(self, _page_indexes: object) -> None:
+        self.selection_changed.emit()
         self.state_changed.emit()
 
     def _on_visible_thumbnail_pages_changed(self, page_indexes: object) -> None:

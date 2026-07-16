@@ -11,6 +11,10 @@ from pypdf.generic import ArrayObject, DictionaryObject, FloatObject, NameObject
 import pdf_workbench.services.pdf_page_mutation as mutation_module
 from pdf_regression_utils import compatibility_fixture_dir, extract_pdfium_text, file_sha256
 from pdf_workbench.services.pdf_page_mutation import (
+    AnnotationParentState,
+    PageDuplicationReceipt,
+    PdfNamedDestinationSnapshot,
+    PdfOutlineItemSnapshot,
     PdfPageMutationError,
     PdfPageMutationService,
 )
@@ -74,6 +78,19 @@ def create_outline_attachment_pdf(path: Path) -> Path:
     return path
 
 
+def create_outline_mapping_pdf(path: Path) -> Path:
+    writer = PdfWriter()
+    for _ in range(3):
+        writer.add_blank_page(width=200, height=200)
+    parent = writer.add_outline_item("A", 0)
+    writer.add_outline_item("A child", 0, parent=parent)
+    writer.add_outline_item("B", 2)
+    writer.add_named_destination("Later", 2)
+    with path.open("wb") as stream:
+        writer.write(stream)
+    return path
+
+
 def create_widget_pdf(path: Path) -> Path:
     writer = PdfWriter()
     writer.add_blank_page(width=200, height=200)
@@ -99,6 +116,66 @@ def create_widget_pdf(path: Path) -> Path:
     return path
 
 
+def create_manual_annotation_pdf(
+    path: Path,
+    *,
+    annotation_object_number: int,
+    reverse_annotation_key_order: bool = False,
+    rect: tuple[int, int, int, int] = (20, 20, 40, 40),
+) -> Path:
+    annots_object_number = annotation_object_number - 1
+    if annots_object_number <= 3:
+        raise ValueError("annotation_object_number must be greater than 4")
+    objects: dict[int, bytes] = {
+        1: b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n",
+        2: b"2 0 obj << /Type /Pages /Count 1 /Kids [3 0 R] >> endobj\n",
+        3: (
+            f"3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] "
+            f"/Annots {annots_object_number} 0 R >> endobj\n".encode("ascii")
+        ),
+        annots_object_number: (
+            f"{annots_object_number} 0 obj [ {annotation_object_number} 0 R ] endobj\n".encode(
+                "ascii"
+            )
+        ),
+    }
+    annotation_items = [
+        b"/Type /Annot",
+        b"/Subtype /Square",
+        f"/Rect [{rect[0]} {rect[1]} {rect[2]} {rect[3]}]".encode("ascii"),
+    ]
+    if reverse_annotation_key_order:
+        annotation_items = list(reversed(annotation_items))
+    objects[annotation_object_number] = (
+        f"{annotation_object_number} 0 obj << ".encode("ascii")
+        + b" ".join(annotation_items)
+        + b" >> endobj\n"
+    )
+    max_object_number = annotation_object_number
+    pdf = bytearray(b"%PDF-1.4\n")
+    offsets = [0]
+    for object_number in range(1, max_object_number + 1):
+        offsets.append(len(pdf))
+        pdf.extend(
+            objects.get(
+                object_number,
+                f"{object_number} 0 obj << >> endobj\n".encode("ascii"),
+            )
+        )
+    xref_start = len(pdf)
+    pdf.extend(f"xref\n0 {len(offsets)}\n".encode("ascii"))
+    pdf.extend(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        pdf.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
+    pdf.extend(
+        (
+            f"trailer << /Size {len(offsets)} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n"
+        ).encode("ascii")
+    )
+    path.write_bytes(pdf)
+    return path
+
+
 def page_count(path: Path) -> int:
     return len(PdfReader(str(path)).pages)
 
@@ -114,6 +191,19 @@ def annotation_objects(values: object) -> list[pikepdf.Object]:
     if not isinstance(values, pikepdf.Array):
         raise AssertionError("annotation array was not preserved")
     return [item if isinstance(item, pikepdf.Object) else item.get_object() for item in values]
+
+
+def outline_summary(
+    items: tuple[PdfOutlineItemSnapshot, ...],
+) -> tuple[tuple[str, int | None, tuple[object, ...]], ...]:
+    return tuple(
+        (
+            item.title,
+            item.destination_page_index,
+            outline_summary(item.children),
+        )
+        for item in items
+    )
 
 
 def test_duplicate_pages_insert_copies_immediately_after_sources(tmp_path: Path) -> None:
@@ -248,11 +338,48 @@ def test_duplicate_pages_preserve_metadata_outlines_and_attachments(tmp_path: Pa
     snapshot_after = service._snapshot_document_structure(working_copy_path)
 
     assert snapshot_after.metadata_fingerprint == snapshot_before.metadata_fingerprint
-    assert snapshot_after.outlines_fingerprint == snapshot_before.outlines_fingerprint
+    assert snapshot_after.outlines == snapshot_before.outlines
+    assert snapshot_after.named_destinations == snapshot_before.named_destinations
     assert snapshot_after.attachments_fingerprint == snapshot_before.attachments_fingerprint
 
     service.undo_page_duplication(working_copy_path, mutation.receipt)
     assert service._snapshot_document_structure(working_copy_path) == snapshot_before
+
+
+def test_duplicate_pages_map_later_outline_destinations_and_named_destinations(
+    tmp_path: Path,
+) -> None:
+    working_copy_path = create_outline_mapping_pdf(tmp_path / "outline-mapping.pdf")
+    service = PdfPageMutationService()
+    before_snapshot = service._snapshot_document_structure(working_copy_path)
+
+    assert outline_summary(before_snapshot.outlines) == (
+        ("A", 0, (("A child", 0, ()),)),
+        ("B", 2, ()),
+    )
+    assert before_snapshot.named_destinations == (PdfNamedDestinationSnapshot("Later", 2),)
+
+    mutation = service.duplicate_pages(working_copy_path, (0,))
+    after_snapshot = service._snapshot_document_structure(working_copy_path)
+
+    assert outline_summary(after_snapshot.outlines) == (
+        ("A", 0, (("A child", 0, ()),)),
+        ("B", 3, ()),
+    )
+    assert after_snapshot.named_destinations == (PdfNamedDestinationSnapshot("Later", 3),)
+    assert mutation.receipt.duplicate_page_indexes == (1,)
+
+    service.undo_page_duplication(working_copy_path, mutation.receipt)
+    assert service._snapshot_document_structure(working_copy_path) == before_snapshot
+
+    redo_mutation = service.duplicate_pages(working_copy_path, (0,))
+    redo_snapshot = service._snapshot_document_structure(working_copy_path)
+    assert redo_mutation.receipt.duplicate_page_indexes == mutation.receipt.duplicate_page_indexes
+    assert outline_summary(redo_snapshot.outlines) == (
+        ("A", 0, (("A child", 0, ()),)),
+        ("B", 3, ()),
+    )
+    assert redo_snapshot.named_destinations == (PdfNamedDestinationSnapshot("Later", 3),)
 
 
 def test_duplicate_pages_reject_widget_annotations_without_changing_working_copy(
@@ -263,6 +390,63 @@ def test_duplicate_pages_reject_widget_annotations_without_changing_working_copy
     sha_before = file_sha256(working_copy_path)
 
     with pytest.raises(PdfPageMutationError, match="未対応"):
+        service.duplicate_pages(working_copy_path, (0,))
+
+    assert file_sha256(working_copy_path) == sha_before
+
+
+def test_duplicate_pages_reject_outline_parse_failure_without_changing_working_copy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    working_copy_path = create_outline_attachment_pdf(tmp_path / "outline-fail-closed.pdf")
+    service = PdfPageMutationService()
+    sha_before = file_sha256(working_copy_path)
+
+    def raise_outline(_self: PdfReader) -> object:
+        raise RuntimeError("broken outline")
+
+    monkeypatch.setattr(mutation_module.PdfReader, "outline", property(raise_outline))
+
+    with pytest.raises(PdfPageMutationError, match="アウトライン"):
+        service.duplicate_pages(working_copy_path, (0,))
+
+    assert file_sha256(working_copy_path) == sha_before
+
+
+def test_duplicate_pages_reject_metadata_parse_failure_without_changing_working_copy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    working_copy_path = create_outline_attachment_pdf(tmp_path / "metadata-fail-closed.pdf")
+    service = PdfPageMutationService()
+    sha_before = file_sha256(working_copy_path)
+
+    def raise_metadata(_self: PdfReader) -> object:
+        raise RuntimeError("broken metadata")
+
+    monkeypatch.setattr(mutation_module.PdfReader, "metadata", property(raise_metadata))
+
+    with pytest.raises(PdfPageMutationError, match="メタデータ"):
+        service.duplicate_pages(working_copy_path, (0,))
+
+    assert file_sha256(working_copy_path) == sha_before
+
+
+def test_duplicate_pages_reject_attachment_parse_failure_without_changing_working_copy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    working_copy_path = create_outline_attachment_pdf(tmp_path / "attachment-fail-closed.pdf")
+    service = PdfPageMutationService()
+    sha_before = file_sha256(working_copy_path)
+
+    def raise_attachments(_self: PdfReader) -> object:
+        raise RuntimeError("broken attachments")
+
+    monkeypatch.setattr(mutation_module.PdfReader, "attachments", property(raise_attachments))
+
+    with pytest.raises(PdfPageMutationError, match="添付ファイル"):
         service.duplicate_pages(working_copy_path, (0,))
 
     assert file_sha256(working_copy_path) == sha_before
@@ -333,6 +517,219 @@ def test_duplicate_pages_tolerate_parent_directory_fsync_failure(
 
     assert mutation.receipt.duplicate_page_indexes == (1,)
     assert page_count(working_copy_path) == 3
+
+
+def test_duplicate_pages_close_source_streams_before_replace_for_execute_and_undo(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    working_copy_path = create_text_fixture(tmp_path / "stream-lifetime.pdf", ["A", "B", "C"])
+    resolved_working_copy_path = working_copy_path.resolve()
+    service = PdfPageMutationService()
+    tracked_streams: list[object] = []
+    original_path_open = Path.open
+    original_replace = service._replace_atomically
+
+    def tracking_open(self: Path, mode: str = "r", *args: object, **kwargs: object) -> object:
+        stream = original_path_open(self, mode, *args, **kwargs)
+        if self.expanduser().resolve() == resolved_working_copy_path and mode == "rb":
+            tracked_streams.append(stream)
+        return stream
+
+    def assert_closed_then_replace(source_path: Path, destination_path: Path) -> None:
+        assert tracked_streams
+        assert all(getattr(stream, "closed", False) for stream in tracked_streams)
+        original_replace(source_path, destination_path)
+
+    monkeypatch.setattr(Path, "open", tracking_open)
+    monkeypatch.setattr(service, "_replace_atomically", assert_closed_then_replace)
+
+    mutation = service.duplicate_pages(working_copy_path, (1,))
+    assert tracked_streams
+    assert all(getattr(stream, "closed", False) for stream in tracked_streams)
+
+    tracked_streams.clear()
+    service.undo_page_duplication(working_copy_path, mutation.receipt)
+    assert tracked_streams
+    assert all(getattr(stream, "closed", False) for stream in tracked_streams)
+
+
+def test_duplicate_pages_preserve_annotation_parent_semantics(
+    tmp_path: Path,
+) -> None:
+    working_copy_path = copy_compatibility_fixture(
+        "annotations.pdf",
+        tmp_path / "annots-parent.pdf",
+    )
+    service = PdfPageMutationService()
+    before_snapshot = service._snapshot_document_structure(working_copy_path)
+
+    assert before_snapshot.pages[0].annotations
+    assert all(
+        annotation.parent_state is AnnotationParentState.ABSENT
+        for annotation in before_snapshot.pages[0].annotations
+    )
+
+    mutation = service.duplicate_pages(working_copy_path, (0,))
+
+    with pikepdf.open(working_copy_path) as pdf:
+        original_page = pdf.pages[0].obj
+        duplicate_page = pdf.pages[1].obj
+        original_items = annotation_objects(original_page.get("/Annots", None))
+        duplicate_items = annotation_objects(duplicate_page.get("/Annots", None))
+        for original_annot, duplicate_annot in zip(original_items, duplicate_items, strict=True):
+            original_parent = original_annot.get("/P", None)
+            duplicate_parent = duplicate_annot.get("/P", None)
+            assert original_parent is None
+            assert isinstance(duplicate_parent, pikepdf.Object)
+            assert duplicate_parent.objgen == duplicate_page.objgen
+
+    service.undo_page_duplication(working_copy_path, mutation.receipt)
+    restored_snapshot = service._snapshot_document_structure(working_copy_path)
+    assert restored_snapshot == before_snapshot
+
+
+def test_duplicate_pages_reject_tampered_annotation_parent_candidate_without_changing_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    working_copy_path = copy_compatibility_fixture(
+        "annotations.pdf",
+        tmp_path / "annots-tamper.pdf",
+    )
+    service = PdfPageMutationService()
+    sha_before = file_sha256(working_copy_path)
+    original_write_candidate = service._write_candidate
+
+    def tampering_write_candidate(writer: PdfWriter, candidate_path: Path) -> None:
+        original_write_candidate(writer, candidate_path)
+        with pikepdf.open(candidate_path, allow_overwriting_input=True) as pdf:
+            duplicate_page = pdf.pages[1].obj
+            original_page = pdf.pages[0].obj
+            duplicate_annot = annotation_objects(duplicate_page.get("/Annots", None))[0]
+            duplicate_annot[NameObject("/P")] = original_page
+            pdf.save(candidate_path)
+
+    monkeypatch.setattr(service, "_write_candidate", tampering_write_candidate)
+
+    with pytest.raises(PdfPageMutationError, match=r"/P|構造検証|検証"):
+        service.duplicate_pages(working_copy_path, (0,))
+
+    assert file_sha256(working_copy_path) == sha_before
+
+
+def test_duplicate_pages_page_boxes_are_independent_after_mutation(tmp_path: Path) -> None:
+    working_copy_path = copy_compatibility_fixture("page-boxes.pdf", tmp_path / "box-share.pdf")
+    service = PdfPageMutationService()
+    service.duplicate_pages(working_copy_path, (0,))
+
+    with pikepdf.open(working_copy_path, allow_overwriting_input=True) as pdf:
+        original_page = pdf.pages[0]
+        duplicate_page = pdf.pages[1]
+        original_crop_before = tuple(float(value) for value in original_page.obj["/CropBox"])
+        duplicate_crop_before = tuple(float(value) for value in duplicate_page.obj["/CropBox"])
+        original_media_before = tuple(float(value) for value in original_page.obj["/MediaBox"])
+        duplicate_media_before = tuple(float(value) for value in duplicate_page.obj["/MediaBox"])
+        duplicate_page.obj["/CropBox"] = pikepdf.Array([40, 80, 560, 700])
+        original_page.obj["/MediaBox"] = pikepdf.Array([10, 10, 600, 760])
+        pdf.save(working_copy_path)
+
+    with pikepdf.open(working_copy_path) as pdf:
+        original_page = pdf.pages[0]
+        duplicate_page = pdf.pages[1]
+        assert (
+            tuple(float(value) for value in original_page.obj["/CropBox"]) == original_crop_before
+        )
+        assert (
+            tuple(float(value) for value in duplicate_page.obj["/CropBox"]) != duplicate_crop_before
+        )
+        assert (
+            tuple(float(value) for value in duplicate_page.obj["/MediaBox"])
+            == duplicate_media_before
+        )
+        assert (
+            tuple(float(value) for value in original_page.obj["/MediaBox"]) != original_media_before
+        )
+
+
+def test_page_duplication_receipt_rejects_malformed_indexes(tmp_path: Path) -> None:
+    service = PdfPageMutationService()
+    working_copy_path = create_text_fixture(tmp_path / "receipt-source.pdf", ["A", "B", "C"])
+    before_snapshot = service._snapshot_document_structure(working_copy_path)
+
+    with pytest.raises(ValueError, match="sorted"):
+        PageDuplicationReceipt(
+            original_page_count=3,
+            source_page_indexes=(1, 0),
+            original_page_indexes_after=(1, 0),
+            duplicate_page_indexes=(2, 1),
+            before_snapshot=before_snapshot,
+        )
+    with pytest.raises(ValueError, match="expected mapping"):
+        PageDuplicationReceipt(
+            original_page_count=3,
+            source_page_indexes=(0, 2),
+            original_page_indexes_after=(1, 3),
+            duplicate_page_indexes=(2, 4),
+            before_snapshot=before_snapshot,
+        )
+
+
+def test_duplicate_pages_service_normalizes_unsorted_unique_input_and_rejects_invalid_types(
+    tmp_path: Path,
+) -> None:
+    working_copy_path = create_text_fixture(
+        tmp_path / "normalize-service.pdf",
+        ["A", "B", "C", "D"],
+    )
+    service = PdfPageMutationService()
+
+    mutation = service.duplicate_pages(working_copy_path, (3, 1, 1))
+    assert mutation.receipt.source_page_indexes == (1, 3)
+    assert mutation.receipt.duplicate_page_indexes == (2, 5)
+
+    with pytest.raises(TypeError, match="integers"):
+        service.duplicate_pages(working_copy_path, (True,))  # type: ignore[arg-type]
+
+
+def test_object_fingerprint_ignores_object_numbers_and_dictionary_order(tmp_path: Path) -> None:
+    first_path = create_manual_annotation_pdf(
+        tmp_path / "fingerprint-a.pdf",
+        annotation_object_number=6,
+    )
+    second_path = create_manual_annotation_pdf(
+        tmp_path / "fingerprint-b.pdf",
+        annotation_object_number=16,
+        reverse_annotation_key_order=True,
+    )
+    changed_path = create_manual_annotation_pdf(
+        tmp_path / "fingerprint-c.pdf",
+        annotation_object_number=26,
+        rect=(20, 20, 60, 60),
+    )
+    service = PdfPageMutationService()
+
+    first_snapshot = service._snapshot_document_structure(first_path)
+    second_snapshot = service._snapshot_document_structure(second_path)
+    changed_snapshot = service._snapshot_document_structure(changed_path)
+
+    assert first_snapshot.pages[0].annotations[0].fingerprint == (
+        second_snapshot.pages[0].annotations[0].fingerprint
+    )
+    assert first_snapshot.pages[0].annotations[0].fingerprint != (
+        changed_snapshot.pages[0].annotations[0].fingerprint
+    )
+
+
+def test_object_fingerprint_handles_cycles_without_recursion() -> None:
+    service = PdfPageMutationService()
+    cyclic = pikepdf.Dictionary()
+    cyclic["/Self"] = cyclic
+
+    fingerprint = service._object_fingerprint(cyclic)
+
+    assert isinstance(fingerprint, str)
+    assert len(fingerprint) == 64
 
 
 def test_undo_page_duplication_rejects_changed_current_state(tmp_path: Path) -> None:

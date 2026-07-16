@@ -6,9 +6,10 @@ import pikepdf
 import pytest
 from pypdf import PdfReader
 
+from pdf_regression_utils import file_sha256
 from pdf_test_utils import create_blank_pdf
 from pdf_workbench.domain.page_commands import DuplicatePagesCommand, RotatePagesCommand
-from pdf_workbench.services.pdf_page_mutation import PdfPageMutationService
+from pdf_workbench.services.pdf_page_mutation import PdfPageMutationError, PdfPageMutationService
 from pdf_workbench.services.pdf_renderer import DocumentRevision
 
 
@@ -235,3 +236,27 @@ def test_duplicate_pages_command_rejects_undo_and_redo_before_execute(tmp_path: 
         command.undo()
     with pytest.raises(RuntimeError, match="not been executed"):
         command.redo()
+
+
+def test_duplicate_pages_command_redo_preflight_failure_preserves_working_copy(
+    tmp_path: Path,
+) -> None:
+    document_path = create_blank_pdf(tmp_path / "duplicate-redo-preflight.pdf", 3)
+    command = DuplicatePagesCommand(document_path, (1,), PdfPageMutationService())
+
+    command.execute()
+    command.undo()
+    pristine_sha = file_sha256(document_path)
+
+    with pikepdf.open(document_path, allow_overwriting_input=True) as pdf:
+        pdf.pages[0].obj["/Rotate"] = 90
+        pdf.save(document_path)
+
+    changed_sha = file_sha256(document_path)
+    assert changed_sha != pristine_sha
+
+    with pytest.raises(PdfPageMutationError, match="前提状態"):
+        command.redo()
+
+    assert file_sha256(document_path) == changed_sha
+    assert page_count(document_path) == 3

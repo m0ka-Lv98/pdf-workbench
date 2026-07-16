@@ -429,6 +429,30 @@ def test_render_cache_structural_transition_rekeys_originals_and_drops_duplicate
     assert all(key.revision != old_revision for key in cache._items)
 
 
+def test_page_index_transition_rejects_non_integer_and_duplicate_mappings() -> None:
+    with pytest.raises(ValueError, match="old_page_count must be an integer"):
+        PageIndexTransition(  # type: ignore[arg-type]
+            old_page_count=True,
+            new_page_count=1,
+            cache_old_to_new=(0,),
+            current_page_old_to_new=(0,),
+        )
+    with pytest.raises(ValueError, match="values must be integers or None"):
+        PageIndexTransition(  # type: ignore[arg-type]
+            old_page_count=1,
+            new_page_count=2,
+            cache_old_to_new=(False,),
+            current_page_old_to_new=(0,),
+        )
+    with pytest.raises(ValueError, match="must be unique"):
+        PageIndexTransition(
+            old_page_count=2,
+            new_page_count=3,
+            cache_old_to_new=(1, 1),
+            current_page_old_to_new=(1, 2),
+        )
+
+
 def test_render_cache_structural_undo_transition_drops_duplicate_entries(
     tmp_path: Path,
 ) -> None:

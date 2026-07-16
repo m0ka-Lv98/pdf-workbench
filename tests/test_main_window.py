@@ -33,6 +33,7 @@ from pdf_test_utils import (
     create_blank_pdf,
     create_image_only_pdf,
     create_qt_text_pdf,
+    create_simple_text_pdf,
 )
 from pdf_workbench.domain.command_history import (
     CommandChange,
@@ -1670,7 +1671,7 @@ def test_main_window_duplicate_toolbar_button_persists_into_working_copy_and_res
         lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
     )
     window = create_real_main_window(qtbot, tmp_path)
-    document_path = create_qt_text_pdf(
+    document_path = create_simple_text_pdf(
         tmp_path / "duplicate-selected.pdf",
         ["A", "B", "C", "D", "E"],
     )
@@ -1723,7 +1724,7 @@ def test_main_window_duplicate_menu_action_save_marks_clean_and_undo_restores_di
         lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
     )
     window = create_real_main_window(qtbot, tmp_path)
-    document_path = create_qt_text_pdf(tmp_path / "duplicate-save.pdf", ["A", "B"])
+    document_path = create_simple_text_pdf(tmp_path / "duplicate-save.pdf", ["A", "B"])
     window.open_document(document_path)
     qtbot.waitUntil(lambda: window._documents[0].view.page_count == 2)
     document = window._documents[0]

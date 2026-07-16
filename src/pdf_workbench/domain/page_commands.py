@@ -149,11 +149,15 @@ class DuplicatePagesCommand(DocumentCommand):
         receipt = self._receipt
         if receipt is None:
             raise RuntimeError("DuplicatePagesCommand has not been executed")
-        mutation = self._duplicate()
-        if mutation.receipt.duplicate_page_indexes != receipt.duplicate_page_indexes:
-            raise RuntimeError("duplicate page indexes changed during redo")
-        if mutation.receipt.original_page_indexes_after != receipt.original_page_indexes_after:
-            raise RuntimeError("original page indexes changed during redo")
+        self._mutation_service.validate_duplication_redo_precondition(
+            self._working_copy_path,
+            receipt,
+        )
+        mutation = self._mutation_service.duplicate_pages(
+            self._working_copy_path,
+            self._page_indexes,
+            expected_before_snapshot=receipt.before_snapshot,
+        )
         self._receipt = mutation.receipt
         self.last_mutation_result = mutation.mutation_result
         self.last_selected_page_indexes_after = mutation.receipt.duplicate_page_indexes
