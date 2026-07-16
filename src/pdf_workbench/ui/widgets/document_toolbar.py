@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from PySide6.QtCore import QEvent, QObject, QRect, QSignalBlocker, Qt, Signal
+from PySide6.QtCore import QEvent, QObject, QRect, QSignalBlocker, QSize, Qt, Signal
 from PySide6.QtGui import QIcon, QPainter, QPaintEvent, QResizeEvent
 from PySide6.QtWidgets import (
     QComboBox,
@@ -28,6 +28,7 @@ class ToolbarState:
     page_index: int
     page_count: int
     zoom_factor: float
+    can_delete: bool = True
     can_duplicate: bool = True
     can_rotate: bool = True
 
@@ -69,10 +70,13 @@ class ChevronComboBox(QComboBox):
 
 
 class DocumentToolbar(QWidget):
+    _COMPACT_THRESHOLD = 808
+
     open_requested = Signal()
     search_requested = Signal()
     previous_requested = Signal()
     next_requested = Signal()
+    delete_requested = Signal()
     duplicate_requested = Signal()
     rotate_requested = Signal()
     page_requested = Signal(int)
@@ -193,6 +197,14 @@ class DocumentToolbar(QWidget):
         self.rotate_button.clicked.connect(self.rotate_requested.emit)
         self._root.addWidget(self.rotate_button, 0, Qt.AlignmentFlag.AlignVCenter)
 
+        self.delete_button = self._icon_button(
+            "Delete selected pages",
+            "選択したページを削除",
+            object_name="deletePagesButton",
+        )
+        self.delete_button.clicked.connect(self.delete_requested.emit)
+        self._root.addWidget(self.delete_button, 0, Qt.AlignmentFlag.AlignVCenter)
+
         self.duplicate_button = self._icon_button(
             "Duplicate selected pages",
             "選択したページを複製",
@@ -213,6 +225,7 @@ class DocumentToolbar(QWidget):
         self.search_button.setEnabled(state.has_document)
         self.previous_button.setEnabled(state.has_document and state.page_index > 0)
         self.next_button.setEnabled(state.has_document and state.page_index + 1 < state.page_count)
+        self.delete_button.setEnabled(state.has_document and state.can_delete)
         self.duplicate_button.setEnabled(state.has_document and state.can_duplicate)
         self.rotate_button.setEnabled(state.has_document and state.can_rotate)
         self.zoom_out_button.setEnabled(state.has_document)
@@ -234,6 +247,7 @@ class DocumentToolbar(QWidget):
         self._page_label.setText(f"/ {state.page_count}")
         display_text = f"{round(state.zoom_factor * 100)}%"
         self._set_zoom_text(display_text, remember=True)
+        self._sync_compact_mode_for_width(self.width())
 
     def refresh_theme_assets(self) -> None:
         self.open_button.setIcon(IconProvider.icon(IconName.OPEN, tone=IconTone.INVERSE, size=18))
@@ -242,6 +256,7 @@ class DocumentToolbar(QWidget):
         self.next_button.setIcon(IconProvider.icon(IconName.CHEVRON_RIGHT, size=18))
         self.zoom_out_button.setIcon(IconProvider.icon(IconName.ZOOM_OUT, size=18))
         self.zoom_in_button.setIcon(IconProvider.icon(IconName.ZOOM_IN, size=18))
+        self.delete_button.setIcon(IconProvider.icon(IconName.DELETE, size=18))
         self.duplicate_button.setIcon(IconProvider.icon(IconName.DUPLICATE, size=18))
         self.rotate_button.setIcon(IconProvider.icon(IconName.ROTATE_CLOCKWISE, size=18))
         self.zoom_field.refresh_theme_assets()
@@ -271,15 +286,12 @@ class DocumentToolbar(QWidget):
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
-        compact = self.width() <= 800
-        if compact != self._compact_mode:
-            self._compact_mode = compact
-            self._apply_layout_metrics()
+        self._sync_compact_mode_for_width(self.width())
 
     def _apply_layout_metrics(self) -> None:
         if self._compact_mode:
             self._root.setSpacing(6)
-            self.open_button.setFixedWidth(108)
+            self.open_button.setFixedWidth(100)
             self.page_field.setFixedWidth(56)
             self.zoom_field.setFixedWidth(92)
             icon_extent = 32
@@ -297,12 +309,64 @@ class DocumentToolbar(QWidget):
             self.next_button,
             self.zoom_out_button,
             self.zoom_in_button,
+            self.delete_button,
             self.duplicate_button,
             self.rotate_button,
         ):
             button.setFixedSize(icon_extent, icon_extent)
         for separator in self.findChildren(QWidget, "toolbarSeparator"):
             separator.setFixedHeight(separator_extent)
+        self._root.invalidate()
+        self._root.activate()
+        self.updateGeometry()
+
+    def _sync_compact_mode_for_width(self, width: int) -> None:
+        compact = 0 < width <= self._COMPACT_THRESHOLD
+        if compact == self._compact_mode:
+            return
+        self._compact_mode = compact
+        self._apply_layout_metrics()
+
+    def sizeHint(self) -> QSize:
+        return self._effective_size_hint(super().sizeHint())
+
+    def minimumSizeHint(self) -> QSize:
+        return self._effective_size_hint(super().minimumSizeHint())
+
+    def _effective_size_hint(self, fallback: QSize) -> QSize:
+        compact = self._compact_mode or (0 < self.width() <= self._COMPACT_THRESHOLD)
+        if not compact:
+            return fallback
+        margins = self._root.contentsMargins()
+        label_width = max(
+            self._page_label.sizeHint().width(),
+            self._page_label.minimumSizeHint().width(),
+        )
+        widths = [
+            100,
+            32,
+            1,
+            32,
+            56,
+            label_width,
+            32,
+            1,
+            32,
+            92,
+            32,
+            1,
+            32,
+            32,
+            32,
+        ]
+        width = (
+            margins.left()
+            + margins.right()
+            + sum(widths)
+            + self._root.spacing() * max(0, len(widths) - 1)
+        )
+        height = max(fallback.height(), 32)
+        return QSize(width, height)
 
     def _emit_page_requested(self, value: int) -> None:
         if self.page_field.isEnabled():

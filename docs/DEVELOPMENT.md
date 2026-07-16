@@ -64,15 +64,21 @@ PDF-writing PR の最低限の回帰チェック:
 - duplicate / delete のような page-count-changing command では、page index transition と cache remap を明示的に検証する
 - selected-page duplication では original source PDF が Save まで不変であることを確認する
 - selected-page duplication では source page の直後に duplicate が入ること、page order が安定していることを検証する
+- selected-page deletion では少なくとも 1 ページが残ること、deleted current page が nearest survivor へ mapping されること、undo で original selection / current page が戻ることを検証する
+- selected-page deletion では undo snapshot を working copy と同じ directory に置き、SHA-256、pikepdf reopen、PDFium render を通してから receipt に保存する
+- selected-page deletion では execute failure、redo tail discard、tab close の各タイミングで undo snapshot cleanup が走ることを確認する
 - page object と annotation object の独立性、annotation `/P` back-reference、raw/effective rotation、all page boxes の保存を検証する
 - execute / undo / redo の各経路で、pikepdf 再オープンと PDFium render を通して semantic restoration を確認する
 - form / widget page duplication は fail-closed とし、working copy hash が変わらないことを確認する
+- page deletion では deleted destination を自動補正せず、outline / named destination / OpenAction / annotation GoTo が deleted page を指す場合は fail-closed にする
 - relevant English/Japanese text の抽出
 - source と round-trip output の platform-neutral visual comparison
 - byte equality は要求しない
 - fixture 追加・更新時は provenance、license、SHA-256、manifest expectation を更新
 - Phase A では物理実機、Acrobat、Edge、Chrome による手動確認を要求しない
 - working copy を mutate する command では、少なくとも execute / undo / redo の3経路と、reopen validation failure 時に original working copy が維持される経路を追加で確認する
+- pypdf の public API だけを使用し、`writer._*` / `reader._*` の private API へ依存しない
+- page mutation PR では、通常環境に加えて pypdf 5 系でも focused tests を流し、5.x / 6.x の両方で互換性を確認する
 
 ## ブランチ
 

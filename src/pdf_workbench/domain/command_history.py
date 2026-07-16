@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Literal
 
 from pdf_workbench.domain.mutation import WorkingCopyMutationResult
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -13,6 +16,7 @@ class CommandChange:
     requires_reload: bool = False
     mutation_result: WorkingCopyMutationResult | None = None
     selected_page_indexes_after: tuple[int, ...] | None = None
+    current_page_index_after: int | None = None
 
     @classmethod
     def from_command(cls, command: DocumentCommand) -> CommandChange:
@@ -23,6 +27,11 @@ class CommandChange:
             selected_page_indexes_after=getattr(
                 command,
                 "last_selected_page_indexes_after",
+                None,
+            ),
+            current_page_index_after=getattr(
+                command,
+                "last_current_page_index_after",
                 None,
             ),
         )
@@ -62,6 +71,10 @@ class DocumentCommand(ABC):
         """
 
         return self.execute()
+
+    def dispose(self) -> None:
+        """Release command-owned temporary resources."""
+        return None
 
 
 class CommandHistoryError(Exception):
@@ -109,6 +122,13 @@ class CompoundCommandRollbackError(CommandHistoryError):
         self.original_cause = original_cause
         self.rollback_command = rollback_command
         self.rollback_cause = rollback_cause
+
+
+class CommandResourceDisposalError(CommandHistoryError):
+    def __init__(self, command: DocumentCommand, cause: Exception) -> None:
+        super().__init__(f"Command resource disposal failed: {command.description}")
+        self.command = command
+        self.cause = cause
 
 
 class CompoundCommand(DocumentCommand):
@@ -188,6 +208,23 @@ class CompoundCommand(DocumentCommand):
             raise exc
         return CommandChange.from_command(self)
 
+    def dispose(self) -> None:
+        first_error: Exception | None = None
+        for command in self._commands:
+            try:
+                command.dispose()
+            except Exception as exc:
+                logger.warning(
+                    "Failed to dispose compound child resources: compound=%s child=%s",
+                    self.description,
+                    command.description,
+                    exc_info=True,
+                )
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise CommandResourceDisposalError(self, first_error) from first_error
+
 
 class CommandHistory:
     def __init__(self, *, initially_dirty: bool = False) -> None:
@@ -235,11 +272,13 @@ class CommandHistory:
         try:
             change = command.execute()
         except Exception as exc:
+            self._dispose_command(command)
             raise CommandExecutionError(command, exc) from exc
 
         if self.can_redo:
             if self._clean_cursor is not None and self._clean_cursor > self._cursor:
                 self._clean_cursor = None
+            self._dispose_commands(self._commands[self._cursor :])
             del self._commands[self._cursor :]
 
         self._commands.append(command)
@@ -274,3 +313,27 @@ class CommandHistory:
 
     def mark_clean(self) -> None:
         self._clean_cursor = self._cursor
+
+    def clear(self) -> None:
+        self._dispose_commands(self._commands)
+        self._commands.clear()
+        self._cursor = 0
+        self._clean_cursor = 0
+
+    def dispose(self) -> None:
+        self.clear()
+
+    def _dispose_commands(self, commands: list[DocumentCommand]) -> None:
+        for command in commands:
+            self._dispose_command(command)
+
+    @staticmethod
+    def _dispose_command(command: DocumentCommand) -> None:
+        try:
+            command.dispose()
+        except Exception:
+            logger.warning(
+                "Failed to dispose command resources: %s",
+                command.description,
+                exc_info=True,
+            )

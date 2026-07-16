@@ -7,6 +7,8 @@ from pathlib import Path
 from pdf_workbench.domain.command_history import CommandChange, DocumentCommand
 from pdf_workbench.domain.mutation import WorkingCopyMutationResult
 from pdf_workbench.services.pdf_page_mutation import (
+    PageDeletionMutation,
+    PageDeletionReceipt,
     PageDuplicationMutation,
     PageDuplicationReceipt,
     PageRotationState,
@@ -57,6 +59,7 @@ class RotatePagesCommand(DocumentCommand):
         self._rotated_states: tuple[PageRotationState, ...] | None = None
         self.last_mutation_result: WorkingCopyMutationResult | None = None
         self.last_selected_page_indexes_after: tuple[int, ...] | None = None
+        self.last_current_page_index_after: int | None = None
 
     def execute(self) -> CommandChange:
         self._original_states = self._mutation_service.read_rotation_states(
@@ -77,6 +80,7 @@ class RotatePagesCommand(DocumentCommand):
             self._rotated_states,
         )
         self.last_selected_page_indexes_after = None
+        self.last_current_page_index_after = None
         return CommandChange.from_command(self)
 
     def undo(self) -> CommandChange:
@@ -87,6 +91,7 @@ class RotatePagesCommand(DocumentCommand):
             self._original_states,
         )
         self.last_selected_page_indexes_after = None
+        self.last_current_page_index_after = None
         return CommandChange.from_command(self)
 
     def redo(self) -> CommandChange:
@@ -97,6 +102,7 @@ class RotatePagesCommand(DocumentCommand):
             self._rotated_states,
         )
         self.last_selected_page_indexes_after = None
+        self.last_current_page_index_after = None
         return CommandChange.from_command(self)
 
 
@@ -125,12 +131,14 @@ class DuplicatePagesCommand(DocumentCommand):
         self._receipt: PageDuplicationReceipt | None = None
         self.last_mutation_result: WorkingCopyMutationResult | None = None
         self.last_selected_page_indexes_after: tuple[int, ...] | None = None
+        self.last_current_page_index_after: int | None = None
 
     def execute(self) -> CommandChange:
         mutation = self._duplicate()
         self._receipt = mutation.receipt
         self.last_mutation_result = mutation.mutation_result
         self.last_selected_page_indexes_after = mutation.receipt.duplicate_page_indexes
+        self.last_current_page_index_after = None
         return CommandChange.from_command(self)
 
     def undo(self) -> CommandChange:
@@ -143,6 +151,7 @@ class DuplicatePagesCommand(DocumentCommand):
         )
         self.last_mutation_result = mutation_result
         self.last_selected_page_indexes_after = receipt.source_page_indexes
+        self.last_current_page_index_after = None
         return CommandChange.from_command(self)
 
     def redo(self) -> CommandChange:
@@ -161,6 +170,7 @@ class DuplicatePagesCommand(DocumentCommand):
         self._receipt = mutation.receipt
         self.last_mutation_result = mutation.mutation_result
         self.last_selected_page_indexes_after = mutation.receipt.duplicate_page_indexes
+        self.last_current_page_index_after = None
         return CommandChange.from_command(self)
 
     def _duplicate(self) -> PageDuplicationMutation:
@@ -168,3 +178,99 @@ class DuplicatePagesCommand(DocumentCommand):
             self._working_copy_path,
             self._page_indexes,
         )
+
+
+class DeletePagesCommand(DocumentCommand):
+    requires_document_reload = True
+    mutates_working_copy = True
+
+    def __init__(
+        self,
+        working_copy_path: Path,
+        page_indexes: Sequence[int],
+        current_page_index: int,
+        mutation_service: PdfPageMutationService,
+    ) -> None:
+        unique_page_indexes = _normalize_page_indexes(page_indexes)
+        if not unique_page_indexes:
+            raise ValueError("page_indexes must not be empty")
+        self.description = (
+            "1ページを削除"
+            if len(unique_page_indexes) == 1
+            else f"{len(unique_page_indexes)}ページを削除"
+        )
+        self.affected_pages = frozenset()
+        self._working_copy_path = working_copy_path.expanduser().resolve()
+        self._page_indexes = unique_page_indexes
+        self._requested_current_page_index = current_page_index
+        self._mutation_service = mutation_service
+        self._receipt: PageDeletionReceipt | None = None
+        self._disposed = False
+        self.last_mutation_result: WorkingCopyMutationResult | None = None
+        self.last_selected_page_indexes_after: tuple[int, ...] | None = None
+        self.last_current_page_index_after: int | None = None
+
+    def execute(self) -> CommandChange:
+        self._require_not_disposed()
+        mutation = self._delete()
+        self._receipt = mutation.receipt
+        self.last_mutation_result = mutation.mutation_result
+        self.last_selected_page_indexes_after = ()
+        self.last_current_page_index_after = None
+        return CommandChange.from_command(self)
+
+    def undo(self) -> CommandChange:
+        self._require_not_disposed()
+        receipt = self._require_receipt()
+        mutation_result = self._mutation_service.undo_page_deletion(
+            self._working_copy_path,
+            receipt,
+        )
+        self.last_mutation_result = mutation_result
+        self.last_selected_page_indexes_after = receipt.deleted_page_indexes
+        self.last_current_page_index_after = receipt.original_current_page_index
+        return CommandChange.from_command(self)
+
+    def redo(self) -> CommandChange:
+        self._require_not_disposed()
+        receipt = self._require_receipt()
+        self._mutation_service.validate_deletion_redo_precondition(
+            self._working_copy_path,
+            receipt,
+        )
+        mutation_result = self._mutation_service.redo_page_deletion(
+            self._working_copy_path,
+            receipt,
+        )
+        self.last_mutation_result = mutation_result
+        self.last_selected_page_indexes_after = ()
+        self.last_current_page_index_after = None
+        return CommandChange.from_command(self)
+
+    def dispose(self) -> None:
+        if self._disposed:
+            return
+        receipt = self._receipt
+        if receipt is not None:
+            self._mutation_service.discard_page_deletion_receipt(
+                self._working_copy_path,
+                receipt,
+            )
+            self._receipt = None
+        self._disposed = True
+
+    def _delete(self) -> PageDeletionMutation:
+        return self._mutation_service.delete_pages(
+            self._working_copy_path,
+            self._page_indexes,
+            current_page_index=self._requested_current_page_index,
+        )
+
+    def _require_receipt(self) -> PageDeletionReceipt:
+        if self._receipt is None:
+            raise RuntimeError("DeletePagesCommand has not been executed")
+        return self._receipt
+
+    def _require_not_disposed(self) -> None:
+        if self._disposed:
+            raise RuntimeError("DeletePagesCommand has been disposed")

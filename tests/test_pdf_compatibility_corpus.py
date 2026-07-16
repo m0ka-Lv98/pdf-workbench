@@ -26,7 +26,7 @@ from pdf_regression_utils import (
     normalize_rotation,
     render_pdf_pages,
 )
-from pdf_workbench.services.pdf_page_mutation import PdfPageMutationService
+from pdf_workbench.services.pdf_page_mutation import PdfPageMutationError, PdfPageMutationService
 
 SUBSET_FONT_NAME_PATTERN = re.compile(r"^/[A-Z]{6}\+")
 
@@ -354,3 +354,112 @@ def test_duplicate_round_trip_preserves_fixture_structure_and_rendering(
         working_copy_path,
         expected_page_count=int(expected["page_count"]) + 1,
     )
+
+
+@pytest.mark.parametrize(
+    ("name", "deleted_page_indexes", "survivor_indexes"),
+    [
+        ("rotations.pdf", (1,), (0, 2, 3)),
+        ("page-boxes.pdf", (0,), (1,)),
+    ],
+)
+def test_delete_round_trip_preserves_surviving_fixture_structure_and_rendering(
+    tmp_path: Path,
+    name: str,
+    deleted_page_indexes: tuple[int, ...],
+    survivor_indexes: tuple[int, ...],
+) -> None:
+    fixture_dir = compatibility_fixture_dir()
+    fixture_path = fixture_dir / name
+    working_copy_path = tmp_path / name
+    tolerance = VisualComparisonTolerance()
+    service = PdfPageMutationService()
+    fixture_sha_before = file_sha256(fixture_path)
+    with pikepdf.open(fixture_path) as pdf:
+        pdf.save(working_copy_path)
+    working_sha_before = file_sha256(working_copy_path)
+
+    before_structure = inspect_pdf_structure(fixture_path)
+    before_pdfium = inspect_pdfium_pages(fixture_path)
+    source_images = render_pdf_pages(fixture_path, scale=0.4)
+    try:
+        mutation = service.delete_pages(
+            working_copy_path,
+            deleted_page_indexes,
+            current_page_index=0,
+        )
+
+        assert file_sha256(fixture_path) == fixture_sha_before
+        assert mutation.receipt.survivor_original_indexes == survivor_indexes
+        after_structure = inspect_pdf_structure(working_copy_path)
+        after_pdfium = inspect_pdfium_pages(working_copy_path)
+        assert after_structure.page_count == len(survivor_indexes)
+        assert len(after_pdfium) == len(survivor_indexes)
+        assert_pdfium_renders_all_pages(
+            working_copy_path,
+            expected_page_count=len(survivor_indexes),
+        )
+
+        deleted_images = render_pdf_pages(working_copy_path, scale=0.4)
+        try:
+            for new_page_index, original_page_index in enumerate(survivor_indexes):
+                assert (
+                    after_structure.pages[new_page_index]
+                    == before_structure.pages[original_page_index]
+                )
+                assert after_pdfium[new_page_index] == before_pdfium[original_page_index]
+                assert_images_visually_close(
+                    deleted_images[new_page_index],
+                    source_images[original_page_index],
+                    tolerance=tolerance,
+                    label=f"{name} deleted page {new_page_index}",
+                )
+        finally:
+            for image in deleted_images:
+                image.close()
+
+        undo_result = service.undo_page_deletion(working_copy_path, mutation.receipt)
+        assert undo_result.page_count == before_structure.page_count
+        assert file_sha256(working_copy_path) == working_sha_before
+        assert inspect_pdf_structure(working_copy_path) == before_structure
+        assert inspect_pdfium_pages(working_copy_path) == before_pdfium
+        assert_pdfium_renders_all_pages(
+            working_copy_path,
+            expected_page_count=before_structure.page_count,
+        )
+
+        redo_result = service.redo_page_deletion(working_copy_path, mutation.receipt)
+        assert redo_result.page_count == len(survivor_indexes)
+        assert inspect_pdf_structure(working_copy_path) == after_structure
+        assert inspect_pdfium_pages(working_copy_path) == after_pdfium
+        assert_pdfium_renders_all_pages(
+            working_copy_path,
+            expected_page_count=len(survivor_indexes),
+        )
+    finally:
+        for image in source_images:
+            image.close()
+
+
+def test_delete_rejects_all_page_selection_for_single_page_annotations_fixture(
+    tmp_path: Path,
+) -> None:
+    fixture_path = compatibility_fixture_dir() / "annotations.pdf"
+    working_copy_path = tmp_path / "annotations.pdf"
+    fixture_sha_before = file_sha256(fixture_path)
+    with pikepdf.open(fixture_path) as pdf:
+        pdf.save(working_copy_path)
+    working_sha_before = file_sha256(working_copy_path)
+
+    with pytest.raises(PdfPageMutationError, match="少なくとも1ページは残す必要があります"):
+        PdfPageMutationService().delete_pages(
+            working_copy_path,
+            (0,),
+            current_page_index=0,
+        )
+
+    assert file_sha256(fixture_path) == fixture_sha_before
+    assert file_sha256(working_copy_path) == working_sha_before
+    assert inspect_pdf_structure(working_copy_path) == inspect_pdf_structure(fixture_path)
+    assert inspect_pdfium_pages(working_copy_path) == inspect_pdfium_pages(fixture_path)
+    assert_pdfium_renders_all_pages(working_copy_path, expected_page_count=1)

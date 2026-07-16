@@ -7,6 +7,7 @@ from pdf_workbench.domain.command_history import (
     CommandExecutionError,
     CommandHistory,
     CommandRedoError,
+    CommandResourceDisposalError,
     CommandUndoError,
     CompoundCommand,
     CompoundCommandConfigurationError,
@@ -99,6 +100,27 @@ class StateCommand(DocumentCommand):
             raise RuntimeError(f"rollback redo failed: {self.description}")
         self._state.append(self._token)
         return CommandChange.from_command(self)
+
+
+class DisposableCommand(RecordingCommand):
+    def __init__(
+        self,
+        description: str,
+        *,
+        events: list[str],
+        fail_dispose: bool = False,
+        **kwargs: object,
+    ) -> None:
+        super().__init__(description, events=events, **kwargs)
+        self._dispose_events = events
+        self._fail_dispose = fail_dispose
+        self.dispose_count = 0
+
+    def dispose(self) -> None:
+        self.dispose_count += 1
+        self._dispose_events.append(f"dispose:{self.description}")
+        if self._fail_dispose:
+            raise RuntimeError(f"dispose failed: {self.description}")
 
 
 def test_command_history_starts_clean() -> None:
@@ -221,6 +243,192 @@ def test_command_history_redo_failure_preserves_cursor() -> None:
     assert history.can_undo is False
     assert history.can_redo is True
     assert history.redo_description == "Fail redo"
+
+
+def test_document_command_dispose_defaults_to_noop() -> None:
+    command = RecordingCommand("noop")
+
+    command.dispose()
+
+
+def test_command_history_discards_redo_tail_and_disposes_discarded_commands() -> None:
+    events: list[str] = []
+    history = CommandHistory()
+    first = DisposableCommand("First", events=events)
+    second = DisposableCommand("Second", events=events)
+    replacement = DisposableCommand("Replacement", events=events)
+    history.execute(first)
+    history.execute(second)
+
+    history.undo()
+    history.execute(replacement)
+
+    assert second.dispose_count == 1
+    assert first.dispose_count == 0
+    assert replacement.dispose_count == 0
+    assert "dispose:Second" in events
+    assert history.can_redo is False
+    assert history.is_dirty is True
+
+
+def test_command_history_clear_disposes_all_commands_and_resets_clean_state() -> None:
+    events: list[str] = []
+    history = CommandHistory(initially_dirty=True)
+    first = DisposableCommand("First", events=events)
+    second = DisposableCommand("Second", events=events)
+    history.execute(first)
+    history.execute(second)
+    history.mark_clean()
+
+    history.clear()
+
+    assert first.dispose_count == 1
+    assert second.dispose_count == 1
+    assert history.can_undo is False
+    assert history.can_redo is False
+    assert history.is_dirty is False
+
+
+def test_command_history_dispose_logs_and_continues_when_cleanup_fails(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    events: list[str] = []
+    history = CommandHistory()
+    good = DisposableCommand("Good", events=events)
+    bad = DisposableCommand("Bad", events=events, fail_dispose=True)
+    history.execute(good)
+    history.execute(bad)
+
+    history.clear()
+
+    assert good.dispose_count == 1
+    assert bad.dispose_count == 1
+    assert "Failed to dispose command resources" in caplog.text
+
+
+def test_compound_command_dispose_releases_children() -> None:
+    events: list[str] = []
+    first = DisposableCommand("First", events=events)
+    second = DisposableCommand("Second", events=events)
+    command = CompoundCommand("Compound", (first, second))
+
+    command.dispose()
+
+    assert first.dispose_count == 1
+    assert second.dispose_count == 1
+
+
+@pytest.mark.parametrize("failing_index", [0, 1, 2])
+def test_compound_command_dispose_attempts_all_children_even_if_one_fails(
+    caplog: pytest.LogCaptureFixture,
+    failing_index: int,
+) -> None:
+    events: list[str] = []
+    commands = [
+        DisposableCommand("First", events=events, fail_dispose=failing_index == 0),
+        DisposableCommand("Middle", events=events, fail_dispose=failing_index == 1),
+        DisposableCommand("Last", events=events, fail_dispose=failing_index == 2),
+    ]
+    command = CompoundCommand("Compound", commands)
+
+    with pytest.raises(CommandResourceDisposalError):
+        command.dispose()
+
+    assert [child.dispose_count for child in commands] == [1, 1, 1]
+    assert "compound=Compound" in caplog.text
+    assert f"child={commands[failing_index].description}" in caplog.text
+
+
+def test_command_history_execute_failure_disposes_command_resources() -> None:
+    events: list[str] = []
+    history = CommandHistory()
+    failing = DisposableCommand("Fail", events=events, fail_execute=True)
+
+    with pytest.raises(CommandExecutionError):
+        history.execute(failing)
+
+    assert failing.dispose_count == 1
+    assert history.can_undo is False
+    assert history.can_redo is False
+
+
+def test_command_history_clear_continues_compound_child_cleanup_after_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    events: list[str] = []
+    history = CommandHistory(initially_dirty=True)
+    compound = CompoundCommand(
+        "Compound",
+        (
+            DisposableCommand("First", events=events),
+            DisposableCommand("Bad", events=events, fail_dispose=True),
+            DisposableCommand("Last", events=events),
+        ),
+    )
+    history.execute(compound)
+    history.mark_clean()
+
+    history.clear()
+
+    first, bad, last = compound._commands
+    assert isinstance(first, DisposableCommand)
+    assert isinstance(bad, DisposableCommand)
+    assert isinstance(last, DisposableCommand)
+    assert first.dispose_count == 1
+    assert bad.dispose_count == 1
+    assert last.dispose_count == 1
+    assert history.can_undo is False
+    assert history.can_redo is False
+    assert history.is_dirty is False
+    assert "Failed to dispose command resources: Compound" in caplog.text
+    assert "compound=Compound child=Bad" in caplog.text
+
+
+def test_command_history_redo_tail_disposal_continues_compound_child_cleanup(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    events: list[str] = []
+    history = CommandHistory()
+    first = RecordingCommand("First")
+    compound = CompoundCommand(
+        "Compound",
+        (
+            DisposableCommand("Keep", events=events),
+            DisposableCommand("Bad", events=events, fail_dispose=True),
+            DisposableCommand("Release", events=events),
+        ),
+    )
+    replacement = RecordingCommand("Replacement")
+    history.execute(first)
+    history.execute(compound)
+
+    history.undo()
+    history.execute(replacement)
+
+    keep, bad, release = compound._commands
+    assert isinstance(keep, DisposableCommand)
+    assert isinstance(bad, DisposableCommand)
+    assert isinstance(release, DisposableCommand)
+    assert keep.dispose_count == 1
+    assert bad.dispose_count == 1
+    assert release.dispose_count == 1
+    assert history.can_redo is False
+    assert history.undo_description == "Replacement"
+    assert history.is_dirty is True
+    assert "Failed to dispose command resources: Compound" in caplog.text
+    assert "compound=Compound child=Bad" in caplog.text
+
+
+def test_command_history_does_not_dispose_commands_during_undo_or_redo() -> None:
+    events: list[str] = []
+    history = CommandHistory()
+    command = DisposableCommand("Keep", events=events)
+    history.execute(command)
+
+    history.undo()
+    history.redo()
+
+    assert command.dispose_count == 0
 
 
 def test_compound_command_rejects_empty_children() -> None:

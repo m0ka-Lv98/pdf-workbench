@@ -829,6 +829,82 @@ def test_reload_after_working_copy_mutation_restores_mapped_snapshot_after_page_
     assert view._search_query == "Alpha"
 
 
+def test_reload_after_working_copy_mutation_restores_mapped_snapshot_after_page_count_shrink(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    document_path = create_pdf(tmp_path / "mutation-shrink.pdf", 5)
+    service = FakeRenderService(create_metadata(document_path, 5))
+    view = PdfView(render_service=service, debounce_interval_ms=0)
+    _wrapper = show_view(qtbot, view)
+
+    view.open_document(document_path)
+    qtbot.waitUntil(lambda: view.page_count == 5)
+    view.set_zoom(1.9)
+    view._search_query = "Alpha"
+    snapshot = view.suspend_for_working_copy_mutation()
+    mapped_snapshot = PdfViewMutationSnapshot(
+        current_page_index=1,
+        selected_page_indexes=(),
+        logical_zoom=snapshot.logical_zoom,
+        search_query=snapshot.search_query,
+    )
+
+    updated_path = create_pdf(tmp_path / "mutation-shrink-updated.pdf", 3)
+    document_path.write_bytes(updated_path.read_bytes())
+    service.metadata = create_metadata(document_path, 3)
+    completions: list[bool] = []
+    view.mutation_reload_completed.connect(completions.append)
+
+    assert view.reload_after_working_copy_mutation(mapped_snapshot) is True
+
+    qtbot.waitUntil(lambda: completions == [True])
+    assert view.page_count == 3
+    assert view.page_index == 1
+    assert view.selected_page_indexes == (1,)
+    assert view._page_organizer.current_page_index == 1
+    assert view._logical_zoom == mapped_snapshot.logical_zoom
+    assert view._search_query == "Alpha"
+
+
+def test_reload_after_working_copy_mutation_uses_left_survivor_when_deleted_current_was_last_page(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    document_path = create_pdf(tmp_path / "mutation-shrink-last.pdf", 5)
+    service = FakeRenderService(create_metadata(document_path, 5))
+    view = PdfView(render_service=service, debounce_interval_ms=0)
+    _wrapper = show_view(qtbot, view)
+
+    view.open_document(document_path)
+    qtbot.waitUntil(lambda: view.page_count == 5)
+    view.set_zoom(1.4)
+    view._search_query = "Alpha"
+    snapshot = view.suspend_for_working_copy_mutation()
+    mapped_snapshot = PdfViewMutationSnapshot(
+        current_page_index=3,
+        selected_page_indexes=(),
+        logical_zoom=snapshot.logical_zoom,
+        search_query=snapshot.search_query,
+    )
+
+    updated_path = create_pdf(tmp_path / "mutation-shrink-last-updated.pdf", 4)
+    document_path.write_bytes(updated_path.read_bytes())
+    service.metadata = create_metadata(document_path, 4)
+    completions: list[bool] = []
+    view.mutation_reload_completed.connect(completions.append)
+
+    assert view.reload_after_working_copy_mutation(mapped_snapshot) is True
+
+    qtbot.waitUntil(lambda: completions == [True])
+    assert view.page_count == 4
+    assert view.page_index == 3
+    assert view.selected_page_indexes == (3,)
+    assert view._page_organizer.current_page_index == 3
+    assert view._logical_zoom == mapped_snapshot.logical_zoom
+    assert view._search_query == "Alpha"
+
+
 def test_reload_after_working_copy_mutation_clears_old_text_state_and_rebuilds_new_revision_matches(
     qtbot: QtBot,
     tmp_path: Path,
