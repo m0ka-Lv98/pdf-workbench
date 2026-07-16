@@ -33,13 +33,16 @@ def test_document_toolbar_updates_state_and_emits_signals(qtbot: QtBot) -> None:
     assert toolbar.zoom_out_button.text() == ""
     assert toolbar.zoom_in_button.text() == ""
     assert toolbar.rotate_button.text() == ""
+    assert toolbar.delete_button.text() == ""
     assert toolbar.duplicate_button.text() == ""
     assert toolbar.rotate_button.accessibleName() == "Rotate selected pages clockwise"
+    assert toolbar.delete_button.accessibleName() == "Delete selected pages"
     assert toolbar.duplicate_button.accessibleName() == "Duplicate selected pages"
     assert toolbar.previous_button.toolTip() == "前のページ"
     assert toolbar.zoom_out_button.toolTip() == "ズームを縮小"
     assert toolbar.zoom_in_button.toolTip() == "ズームを拡大"
     assert toolbar.rotate_button.toolTip() == "選択したページを時計回りに90°回転"
+    assert toolbar.delete_button.toolTip() == "選択したページを削除"
     assert toolbar.duplicate_button.toolTip() == "選択したページを複製"
     assert toolbar.height() == 54
     assert button_has_icon(toolbar.open_button)
@@ -47,6 +50,7 @@ def test_document_toolbar_updates_state_and_emits_signals(qtbot: QtBot) -> None:
     assert button_has_icon(toolbar.previous_button)
     assert button_has_icon(toolbar.next_button)
     assert button_has_icon(toolbar.rotate_button)
+    assert button_has_icon(toolbar.delete_button)
     assert button_has_icon(toolbar.duplicate_button)
     assert 56 <= toolbar.page_field.width() <= 64
     assert 90 <= toolbar.zoom_field.width() <= 104
@@ -165,6 +169,7 @@ def test_document_toolbar_responsive_layout_keeps_primary_controls_visible(qtbot
         toolbar.zoom_field,
         toolbar.zoom_in_button,
         toolbar.rotate_button,
+        toolbar.delete_button,
         toolbar.duplicate_button,
     ):
         assert widget.isVisible()

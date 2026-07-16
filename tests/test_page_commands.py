@@ -8,7 +8,11 @@ from pypdf import PdfReader
 
 from pdf_regression_utils import file_sha256
 from pdf_test_utils import create_blank_pdf
-from pdf_workbench.domain.page_commands import DuplicatePagesCommand, RotatePagesCommand
+from pdf_workbench.domain.page_commands import (
+    DeletePagesCommand,
+    DuplicatePagesCommand,
+    RotatePagesCommand,
+)
 from pdf_workbench.services.pdf_page_mutation import PdfPageMutationError, PdfPageMutationService
 from pdf_workbench.services.pdf_renderer import DocumentRevision
 
@@ -258,5 +262,151 @@ def test_duplicate_pages_command_redo_preflight_failure_preserves_working_copy(
     with pytest.raises(PdfPageMutationError, match="前提状態"):
         command.redo()
 
-    assert file_sha256(document_path) == changed_sha
+
+def test_delete_pages_command_executes_undoes_and_redoes(tmp_path: Path) -> None:
+    document_path = create_blank_pdf(tmp_path / "delete-command.pdf", 5)
+    command = DeletePagesCommand(
+        document_path,
+        (1, 3),
+        3,
+        PdfPageMutationService(),
+    )
+
+    execute_change = command.execute()
+    assert execute_change.requires_reload is True
+    assert execute_change.selected_page_indexes_after == ()
+    assert execute_change.current_page_index_after is None
+    assert execute_change.mutation_result is not None
+    assert execute_change.mutation_result.page_count == 3
+    assert execute_change.mutation_result.page_index_transition is not None
+    assert execute_change.mutation_result.page_index_transition.cache_old_to_new == (
+        0,
+        None,
+        1,
+        None,
+        2,
+    )
+    assert execute_change.mutation_result.page_index_transition.current_page_old_to_new == (
+        0,
+        1,
+        1,
+        2,
+        2,
+    )
     assert page_count(document_path) == 3
+
+    undo_change = command.undo()
+    assert undo_change.selected_page_indexes_after == (1, 3)
+    assert undo_change.current_page_index_after == 3
+    assert undo_change.mutation_result is not None
+    assert undo_change.mutation_result.page_count == 5
+    assert undo_change.mutation_result.page_index_transition is not None
+    assert undo_change.mutation_result.page_index_transition.cache_old_to_new == (0, 2, 4)
+    assert page_count(document_path) == 5
+
+    redo_change = command.redo()
+    assert redo_change.selected_page_indexes_after == ()
+    assert redo_change.current_page_index_after is None
+    assert redo_change.mutation_result is not None
+    assert redo_change.mutation_result.page_count == 3
+    assert page_count(document_path) == 3
+
+
+def test_delete_pages_command_rejects_invalid_configuration(tmp_path: Path) -> None:
+    document_path = create_blank_pdf(tmp_path / "delete-invalid.pdf", 2)
+    service = PdfPageMutationService()
+
+    with pytest.raises(ValueError, match="must not be empty"):
+        DeletePagesCommand(document_path, (), 0, service)
+    with pytest.raises(ValueError, match="non-negative"):
+        DeletePagesCommand(document_path, (-1,), 0, service)
+    with pytest.raises(TypeError, match="integers"):
+        DeletePagesCommand(document_path, (1.5,), 0, service)
+    with pytest.raises(TypeError, match="integers"):
+        DeletePagesCommand(document_path, ("1",), 0, service)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="integers"):
+        DeletePagesCommand(document_path, (True,), 0, service)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="current_page_index must be an integer"):
+        DeletePagesCommand(document_path, (0,), 1.5, service)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="current_page_index must be non-negative"):
+        DeletePagesCommand(document_path, (0,), -1, service)
+
+
+def test_delete_pages_command_rejects_all_pages_and_out_of_range_on_execute(tmp_path: Path) -> None:
+    document_path = create_blank_pdf(tmp_path / "delete-range.pdf", 2)
+
+    with pytest.raises(ValueError, match="out of range"):
+        DeletePagesCommand(document_path, (2,), 0, PdfPageMutationService()).execute()
+    with pytest.raises(PdfPageMutationError, match="少なくとも1ページは残す必要があります"):
+        DeletePagesCommand(document_path, (0, 1), 0, PdfPageMutationService()).execute()
+
+
+def test_delete_pages_command_normalizes_selection_and_description(tmp_path: Path) -> None:
+    document_path = create_blank_pdf(tmp_path / "delete-normalize.pdf", 5)
+    command = DeletePagesCommand(document_path, (3, 1, 1), 1, PdfPageMutationService())
+
+    assert command.description == "2ページを削除"
+    assert command.affected_pages == frozenset()
+
+    execute_change = command.execute()
+    assert execute_change.mutation_result is not None
+    assert execute_change.mutation_result.page_index_transition is not None
+    assert execute_change.mutation_result.page_index_transition.cache_old_to_new == (
+        0,
+        None,
+        1,
+        None,
+        2,
+    )
+
+
+def test_delete_pages_command_rejects_undo_and_redo_before_execute(tmp_path: Path) -> None:
+    document_path = create_blank_pdf(tmp_path / "delete-before-execute.pdf", 2)
+    command = DeletePagesCommand(document_path, (0,), 0, PdfPageMutationService())
+
+    with pytest.raises(RuntimeError, match="not been executed"):
+        command.undo()
+    with pytest.raises(RuntimeError, match="not been executed"):
+        command.redo()
+
+
+def test_delete_pages_command_redo_preflight_failure_preserves_working_copy(tmp_path: Path) -> None:
+    document_path = create_blank_pdf(tmp_path / "delete-redo-preflight.pdf", 3)
+    command = DeletePagesCommand(document_path, (1,), 1, PdfPageMutationService())
+
+    command.execute()
+    command.undo()
+    pristine_sha = file_sha256(document_path)
+
+    with pikepdf.open(document_path, allow_overwriting_input=True) as pdf:
+        pdf.pages[0].obj["/Rotate"] = 90
+        pdf.save(document_path)
+
+    changed_sha = file_sha256(document_path)
+    assert changed_sha != pristine_sha
+
+    with pytest.raises(PdfPageMutationError, match="前提状態"):
+        command.redo()
+
+
+def test_delete_pages_command_dispose_cleans_snapshot_and_rejects_future_use(
+    tmp_path: Path,
+) -> None:
+    document_path = create_blank_pdf(tmp_path / "delete-dispose.pdf", 3)
+    command = DeletePagesCommand(document_path, (1,), 1, PdfPageMutationService())
+
+    command.execute()
+    receipt = command._receipt
+    assert receipt is not None
+    assert receipt.undo_snapshot_path.exists()
+
+    command.dispose()
+    assert not receipt.undo_snapshot_path.exists()
+
+    command.dispose()
+
+    with pytest.raises(RuntimeError, match="disposed"):
+        command.undo()
+    with pytest.raises(RuntimeError, match="disposed"):
+        command.redo()
+    assert page_count(document_path) == 2

@@ -490,6 +490,91 @@ def test_render_cache_structural_undo_transition_drops_duplicate_entries(
     assert all(key.revision != duplicated_revision for key in cache._items)
 
 
+def test_render_cache_delete_transition_rekeys_survivors_and_drops_deleted_pages(
+    tmp_path: Path,
+) -> None:
+    cache = RenderImageCache(max_bytes=1024 * 1024)
+    old_revision = make_revision(tmp_path, name="before-delete.pdf", content=b"before-delete")
+    new_revision = make_revision(tmp_path, name="after-delete.pdf", content=b"after-delete")
+    transition = PageIndexTransition(
+        old_page_count=5,
+        new_page_count=3,
+        cache_old_to_new=(0, None, 1, None, 2),
+        current_page_old_to_new=(0, 1, 1, 2, 2),
+    )
+    first_key = RenderCacheKey(old_revision, 0, 1.5, 0, 1.0)
+    deleted_key = RenderCacheKey(old_revision, 1, 1.5, 0, 1.0)
+    shifted_key = RenderCacheKey(old_revision, 2, 0.25, 90, 2.0)
+    last_key = RenderCacheKey(old_revision, 4, 1.0, 180, 1.0)
+    first_image = make_image(80, 80)
+    deleted_image = make_image(81, 81)
+    shifted_image = make_image(32, 48)
+    last_image = make_image(90, 64)
+
+    cache.put(first_key, first_image)
+    cache.put(deleted_key, deleted_image)
+    cache.put(shifted_key, shifted_image)
+    cache.put(last_key, last_image)
+
+    cache.transition_revision(
+        old_revision,
+        new_revision,
+        affected_pages=frozenset(),
+        page_index_transition=transition,
+    )
+
+    assert cache.get(RenderCacheKey(new_revision, 0, 1.5, 0, 1.0)) is first_image
+    assert cache.get(RenderCacheKey(new_revision, 1, 0.25, 90, 2.0)) is shifted_image
+    assert cache.get(RenderCacheKey(new_revision, 2, 1.0, 180, 1.0)) is last_image
+    assert cache.get(RenderCacheKey(new_revision, 1, 1.5, 0, 1.0)) is None
+    assert cache.get(deleted_key) is None
+    assert cache.total_bytes == (
+        first_image.sizeInBytes() + shifted_image.sizeInBytes() + last_image.sizeInBytes()
+    )
+    assert all(key.revision != old_revision for key in cache._items)
+
+
+def test_render_cache_delete_undo_transition_restores_survivor_indexes_and_keeps_restored_pages(
+    tmp_path: Path,
+) -> None:
+    cache = RenderImageCache(max_bytes=1024 * 1024)
+    deleted_revision = make_revision(tmp_path, name="deleted.pdf", content=b"deleted")
+    restored_revision = make_revision(tmp_path, name="restored.pdf", content=b"restored")
+    transition = PageIndexTransition(
+        old_page_count=3,
+        new_page_count=5,
+        cache_old_to_new=(0, 2, 4),
+        current_page_old_to_new=(0, 2, 4),
+    )
+    first_key = RenderCacheKey(deleted_revision, 0, 1.5, 0, 1.0)
+    middle_key = RenderCacheKey(deleted_revision, 1, 0.25, 90, 2.0)
+    last_key = RenderCacheKey(deleted_revision, 2, 1.0, 180, 1.0)
+    first_image = make_image(80, 80)
+    middle_image = make_image(32, 48)
+    last_image = make_image(90, 64)
+
+    cache.put(first_key, first_image)
+    cache.put(middle_key, middle_image)
+    cache.put(last_key, last_image)
+
+    cache.transition_revision(
+        deleted_revision,
+        restored_revision,
+        affected_pages=frozenset(),
+        page_index_transition=transition,
+    )
+
+    assert cache.get(RenderCacheKey(restored_revision, 0, 1.5, 0, 1.0)) is first_image
+    assert cache.get(RenderCacheKey(restored_revision, 2, 0.25, 90, 2.0)) is middle_image
+    assert cache.get(RenderCacheKey(restored_revision, 4, 1.0, 180, 1.0)) is last_image
+    assert cache.get(RenderCacheKey(restored_revision, 1, 1.5, 0, 1.0)) is None
+    assert cache.get(RenderCacheKey(restored_revision, 3, 1.0, 180, 1.0)) is None
+    assert cache.total_bytes == (
+        first_image.sizeInBytes() + middle_image.sizeInBytes() + last_image.sizeInBytes()
+    )
+    assert all(key.revision != deleted_revision for key in cache._items)
+
+
 def test_render_cache_structural_transition_prefers_existing_new_revision_entry_on_collision(
     tmp_path: Path,
 ) -> None:

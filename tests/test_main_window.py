@@ -41,7 +41,7 @@ from pdf_workbench.domain.command_history import (
 )
 from pdf_workbench.domain.document_session import DocumentSession, FileFingerprint, SourceStatus
 from pdf_workbench.domain.mutation import WorkingCopyMutationResult
-from pdf_workbench.domain.page_commands import RotatePagesCommand
+from pdf_workbench.domain.page_commands import DeletePagesCommand, RotatePagesCommand
 from pdf_workbench.services.page_coordinates import PageMetadata
 from pdf_workbench.services.pdf_page_mutation import PdfPageMutationService
 from pdf_workbench.services.pdf_renderer import (
@@ -1824,6 +1824,225 @@ def test_main_window_duplicate_controls_disable_during_mutation_and_save(
     assert window._toolbar_widget.duplicate_button.isEnabled() is False
     assert window.duplicate_pages_action.isEnabled() is False
 
+    window.close()
+    qtbot.waitUntil(lambda: not window._render_service._thread.isRunning())
+
+
+def test_main_window_delete_toolbar_button_persists_into_working_copy_and_maps_current_page(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    window = create_real_main_window(qtbot, tmp_path)
+    document_path = create_simple_text_pdf(
+        tmp_path / "delete-selected.pdf",
+        ["A", "B", "C", "D", "E"],
+    )
+    window.open_document(document_path)
+    qtbot.waitUntil(lambda: window._documents[0].view.page_count == 5)
+    document = window._documents[0]
+    source_before = file_sha256(document_path)
+    working_copy_before = file_sha256(document.session.document_path)
+
+    assert window._toolbar_widget.delete_button.objectName() == "deletePagesButton"
+    assert window._toolbar_widget.delete_button.accessibleName() == "Delete selected pages"
+    assert window._toolbar_widget.delete_button.toolTip() == "選択したページを削除"
+    assert window.delete_pages_action.text() == "選択したページを削除"
+
+    document.view._page_organizer.set_selected_page_indexes((1, 3), current_index=1)
+    document.view.set_page(1)
+    qtbot.waitUntil(lambda: document.session.current_page_index == 1)
+    qtbot.waitUntil(window._toolbar_widget.delete_button.isEnabled)
+
+    QTest.mouseClick(window._toolbar_widget.delete_button, Qt.MouseButton.LeftButton)
+
+    qtbot.waitUntil(lambda: document.command_history.can_undo)
+    qtbot.waitUntil(lambda: document.view.page_count == 3)
+    qtbot.waitUntil(lambda: document.view.page_index == 1)
+
+    assert document.view.selected_page_indexes == (1,)
+    assert working_copy_page_count(document.session.document_path) == 3
+    assert extract_pdfium_text(document.session.document_path) == "A C E"
+    assert file_sha256(document_path) == source_before
+    assert file_sha256(document.session.document_path) != working_copy_before
+    assert document.session.is_modified is True
+    assert window.save_action.isEnabled() is True
+    assert window.undo_action.isEnabled() is True
+    assert window.redo_action.isEnabled() is False
+    assert document.session.operation_history[-1] == "2ページを削除"
+
+    window.close()
+    qtbot.waitUntil(lambda: not window._render_service._thread.isRunning())
+
+
+def test_main_window_delete_menu_action_save_marks_clean_and_undo_restores_dirty(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    window = create_real_main_window(qtbot, tmp_path)
+    document_path = create_simple_text_pdf(tmp_path / "delete-save.pdf", ["A", "B", "C"])
+    window.open_document(document_path)
+    qtbot.waitUntil(lambda: window._documents[0].view.page_count == 3)
+    document = window._documents[0]
+
+    document.view._page_organizer.set_selected_page_indexes((1,), current_index=1)
+    document.view.set_page(1)
+    qtbot.waitUntil(lambda: document.session.current_page_index == 1)
+    qtbot.waitUntil(lambda: window.delete_pages_action.isEnabled())
+
+    window.delete_pages_action.trigger()
+
+    qtbot.waitUntil(lambda: document.command_history.can_undo)
+    qtbot.waitUntil(lambda: document.view.page_count == 2)
+    assert document.view.selected_page_indexes == (1,)
+    assert extract_pdfium_text(document.session.document_path) == "A C"
+    assert extract_pdfium_text(document_path) == "A B C"
+    assert window._save_current_document() is True
+    assert document.session.is_modified is False
+    assert document.command_history.is_dirty is False
+    assert window.save_action.isEnabled() is False
+    assert extract_pdfium_text(document_path) == "A C"
+
+    assert window._undo_current_command() is True
+    qtbot.waitUntil(lambda: document.view.page_count == 3)
+    assert document.session.is_modified is True
+    assert document.command_history.is_dirty is True
+    assert document.view.selected_page_indexes == (1,)
+    assert document.view.page_index == 1
+    assert extract_pdfium_text(document.session.document_path) == "A B C"
+    assert extract_pdfium_text(document_path) == "A C"
+    assert document.session.operation_history[-1] == "Undo: 1ページを削除"
+
+    window.close()
+    qtbot.waitUntil(lambda: not window._render_service._thread.isRunning())
+
+
+def test_main_window_delete_controls_disable_for_all_page_selection_and_noop_when_empty(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    window = create_real_main_window(qtbot, tmp_path)
+    document_path = create_blank_pdf(tmp_path / "delete-guards.pdf", 2)
+    window.open_document(document_path)
+    qtbot.waitUntil(lambda: window._documents[0].view.page_count == 2)
+    document = window._documents[0]
+    calls: list[str] = []
+    monkeypatch.setattr(
+        window,
+        "execute_document_command",
+        lambda command: calls.append(command.description) or True,
+    )
+
+    document.view._page_organizer.set_selected_page_indexes((), current_index=0)
+    window._sync_toolbar(document)
+    window._update_actions()
+    window._delete_selected_pages()
+    assert calls == []
+
+    document.view._page_organizer.set_selected_page_indexes((0, 1), current_index=0)
+    window._sync_toolbar(document)
+    window._update_actions()
+    assert window._toolbar_widget.delete_button.isEnabled() is False
+    assert window.delete_pages_action.isEnabled() is False
+    window._delete_selected_pages()
+    assert calls == []
+
+    window.close()
+    qtbot.waitUntil(lambda: not window._render_service._thread.isRunning())
+
+
+def test_main_window_delete_failure_preserves_history_dirty_and_viewer_state(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    window = create_real_main_window(qtbot, tmp_path)
+    document_path = create_qt_text_pdf(tmp_path / "delete-failure.pdf", ["A", "B", "C"])
+    window.open_document(document_path)
+    qtbot.waitUntil(lambda: window._documents[0].view.page_count == 3)
+    document = window._documents[0]
+    document.view._page_organizer.set_selected_page_indexes((1,), current_index=1)
+    document.view.set_page(1)
+    qtbot.waitUntil(lambda: document.session.current_page_index == 1)
+    working_copy_before = file_sha256(document.session.document_path)
+    errors: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        window,
+        "_report_error",
+        lambda title, message: errors.append((title, message)),
+    )
+
+    def fail_delete(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("deletion failed")
+
+    monkeypatch.setattr(window._page_mutation_service, "delete_pages", fail_delete)
+
+    window._delete_selected_pages()
+
+    qtbot.waitUntil(lambda: bool(errors))
+    assert document.command_history.can_undo is False
+    assert document.session.is_modified is False
+    assert document.view.page_index == 1
+    assert document.view.selected_page_indexes == (1,)
+    assert working_copy_page_count(document.session.document_path) == 3
+    assert file_sha256(document.session.document_path) == working_copy_before
+    assert errors[-1][1] == "deletion failed"
+
+    window.close()
+    qtbot.waitUntil(lambda: not window._render_service._thread.isRunning())
+
+
+def test_main_window_close_document_cleans_delete_undo_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    window = create_real_main_window(qtbot, tmp_path)
+    document_path = create_simple_text_pdf(tmp_path / "delete-close.pdf", ["A", "B", "C"])
+    window.open_document(document_path)
+    qtbot.waitUntil(lambda: window._documents[0].view.page_count == 3)
+    document = window._documents[0]
+    document.view._page_organizer.set_selected_page_indexes((1,), current_index=1)
+
+    window._delete_selected_pages()
+
+    qtbot.waitUntil(lambda: document.command_history.can_undo)
+    undo_command = document.command_history.undo_command
+    assert isinstance(undo_command, DeletePagesCommand)
+    receipt = undo_command._receipt
+    assert receipt is not None
+    snapshot_path = receipt.undo_snapshot_path
+    assert snapshot_path.exists()
+
+    assert window.close_document_at(0) is True
+    assert not snapshot_path.exists()
     window.close()
     qtbot.waitUntil(lambda: not window._render_service._thread.isRunning())
 

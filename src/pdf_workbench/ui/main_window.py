@@ -50,7 +50,11 @@ from pdf_workbench.domain.command_history import (
     DocumentCommand,
 )
 from pdf_workbench.domain.document_session import DocumentSession, SourceStatus
-from pdf_workbench.domain.page_commands import DuplicatePagesCommand, RotatePagesCommand
+from pdf_workbench.domain.page_commands import (
+    DeletePagesCommand,
+    DuplicatePagesCommand,
+    RotatePagesCommand,
+)
 from pdf_workbench.services.pdf_page_mutation import PdfPageMutationService
 from pdf_workbench.services.pdf_renderer import PdfRenderService
 from pdf_workbench.services.pdf_save_service import (
@@ -220,6 +224,7 @@ class MainWindow(QMainWindow):
         self._toolbar_widget.search_requested.connect(self.open_search_bar)
         self._toolbar_widget.previous_requested.connect(self._previous_page)
         self._toolbar_widget.next_requested.connect(self._next_page)
+        self._toolbar_widget.delete_requested.connect(self._delete_selected_pages)
         self._toolbar_widget.duplicate_requested.connect(self._duplicate_selected_pages)
         self._toolbar_widget.rotate_requested.connect(self._rotate_page)
         self._toolbar_widget.page_requested.connect(self._set_page_from_toolbar)
@@ -317,6 +322,9 @@ class MainWindow(QMainWindow):
         self.save_as_action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
         self.save_as_action.triggered.connect(self._save_current_document_as)
 
+        self.delete_pages_action = QAction("選択したページを削除", self)
+        self.delete_pages_action.triggered.connect(self._delete_selected_pages)
+
         self.duplicate_pages_action = QAction("選択したページを複製", self)
         self.duplicate_pages_action.triggered.connect(self._duplicate_selected_pages)
 
@@ -328,6 +336,7 @@ class MainWindow(QMainWindow):
             self.open_action,
             self.undo_action,
             self.redo_action,
+            self.delete_pages_action,
             self.duplicate_pages_action,
             self.save_action,
             self.save_as_action,
@@ -366,6 +375,7 @@ class MainWindow(QMainWindow):
         edit_menu.addAction(self.undo_action)
         edit_menu.addAction(self.redo_action)
         edit_menu.addSeparator()
+        edit_menu.addAction(self.delete_pages_action)
         edit_menu.addAction(self.duplicate_pages_action)
         edit_menu.addSeparator()
         edit_menu.addAction(self.find_action)
@@ -506,6 +516,7 @@ class MainWindow(QMainWindow):
         self._dismissed_source_banner_revisions.pop(document.session.session_id, None)
         self._tabs.removeTab(index)
         self._documents.pop(index)
+        document.command_history.dispose()
         if widget is not None:
             if isinstance(widget, PdfView):
                 widget.close_document()
@@ -584,6 +595,22 @@ class MainWindow(QMainWindow):
             DuplicatePagesCommand(
                 document.session.document_path,
                 page_indexes,
+                self._page_mutation_service,
+            )
+        )
+
+    def _delete_selected_pages(self) -> None:
+        document = self._current_document()
+        if document is None or document.session.is_saving or document.mutation_in_progress:
+            return
+        page_indexes = tuple(sorted(set(document.view.selected_page_indexes)))
+        if not page_indexes or len(page_indexes) >= document.view.page_count:
+            return
+        self.execute_document_command(
+            DeletePagesCommand(
+                document.session.document_path,
+                page_indexes,
+                document.view.page_index,
                 self._page_mutation_service,
             )
         )
@@ -1040,6 +1067,15 @@ class MainWindow(QMainWindow):
         )
         self.save_as_action.setEnabled(
             bool(document and not document.session.is_saving and not document.mutation_in_progress)
+        )
+        self.delete_pages_action.setEnabled(
+            bool(
+                document
+                and document.view.selected_page_indexes
+                and len(document.view.selected_page_indexes) < document.view.page_count
+                and not document.session.is_saving
+                and not document.mutation_in_progress
+            )
         )
         self.duplicate_pages_action.setEnabled(
             bool(
@@ -1628,6 +1664,12 @@ class MainWindow(QMainWindow):
         )
         if mapped_current_page is None:
             mapped_current_page = 0
+        current_page_override = change.current_page_index_after
+        if (
+            current_page_override is not None
+            and 0 <= current_page_override < mutation_result.page_count
+        ):
+            mapped_current_page = current_page_override
         if change.selected_page_indexes_after is not None:
             selected_page_indexes = tuple(
                 page_index
@@ -1734,6 +1776,12 @@ class MainWindow(QMainWindow):
                 page_index=document.view.page_index,
                 page_count=document.view.page_count,
                 zoom_factor=document.session.zoom_factor,
+                can_delete=bool(
+                    document.view.selected_page_indexes
+                    and len(document.view.selected_page_indexes) < document.view.page_count
+                    and not document.session.is_saving
+                    and not document.mutation_in_progress
+                ),
                 can_duplicate=bool(
                     document.view.selected_page_indexes
                     and not document.session.is_saving

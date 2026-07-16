@@ -101,6 +101,27 @@ class StateCommand(DocumentCommand):
         return CommandChange.from_command(self)
 
 
+class DisposableCommand(RecordingCommand):
+    def __init__(
+        self,
+        description: str,
+        *,
+        events: list[str],
+        fail_dispose: bool = False,
+        **kwargs: object,
+    ) -> None:
+        super().__init__(description, events=events, **kwargs)
+        self._dispose_events = events
+        self._fail_dispose = fail_dispose
+        self.dispose_count = 0
+
+    def dispose(self) -> None:
+        self.dispose_count += 1
+        self._dispose_events.append(f"dispose:{self.description}")
+        if self._fail_dispose:
+            raise RuntimeError(f"dispose failed: {self.description}")
+
+
 def test_command_history_starts_clean() -> None:
     history = CommandHistory()
 
@@ -221,6 +242,104 @@ def test_command_history_redo_failure_preserves_cursor() -> None:
     assert history.can_undo is False
     assert history.can_redo is True
     assert history.redo_description == "Fail redo"
+
+
+def test_document_command_dispose_defaults_to_noop() -> None:
+    command = RecordingCommand("noop")
+
+    command.dispose()
+
+
+def test_command_history_discards_redo_tail_and_disposes_discarded_commands() -> None:
+    events: list[str] = []
+    history = CommandHistory()
+    first = DisposableCommand("First", events=events)
+    second = DisposableCommand("Second", events=events)
+    replacement = DisposableCommand("Replacement", events=events)
+    history.execute(first)
+    history.execute(second)
+
+    history.undo()
+    history.execute(replacement)
+
+    assert second.dispose_count == 1
+    assert first.dispose_count == 0
+    assert replacement.dispose_count == 0
+    assert "dispose:Second" in events
+    assert history.can_redo is False
+    assert history.is_dirty is True
+
+
+def test_command_history_clear_disposes_all_commands_and_resets_clean_state() -> None:
+    events: list[str] = []
+    history = CommandHistory(initially_dirty=True)
+    first = DisposableCommand("First", events=events)
+    second = DisposableCommand("Second", events=events)
+    history.execute(first)
+    history.execute(second)
+    history.mark_clean()
+
+    history.clear()
+
+    assert first.dispose_count == 1
+    assert second.dispose_count == 1
+    assert history.can_undo is False
+    assert history.can_redo is False
+    assert history.is_dirty is False
+
+
+def test_command_history_dispose_logs_and_continues_when_cleanup_fails(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    events: list[str] = []
+    history = CommandHistory()
+    good = DisposableCommand("Good", events=events)
+    bad = DisposableCommand("Bad", events=events, fail_dispose=True)
+    history.execute(good)
+    history.execute(bad)
+
+    history.clear()
+
+    assert good.dispose_count == 1
+    assert bad.dispose_count == 1
+    assert "Failed to dispose command resources" in caplog.text
+
+
+def test_compound_command_dispose_releases_children() -> None:
+    events: list[str] = []
+    first = DisposableCommand("First", events=events)
+    second = DisposableCommand("Second", events=events)
+    command = CompoundCommand("Compound", (first, second))
+
+    command.dispose()
+
+    assert first.dispose_count == 1
+    assert second.dispose_count == 1
+
+
+def test_command_history_execute_failure_disposes_command_resources() -> None:
+    events: list[str] = []
+    history = CommandHistory()
+    failing = DisposableCommand("Fail", events=events, fail_execute=True)
+
+    with pytest.raises(CommandExecutionError):
+        history.execute(failing)
+
+    assert failing.dispose_count == 1
+    assert history.can_undo is False
+    assert history.can_redo is False
+
+
+def test_command_history_does_not_dispose_commands_during_undo_or_redo() -> None:
+    events: list[str] = []
+    history = CommandHistory()
+    command = DisposableCommand("Keep", events=events)
+    history.execute(command)
+
+    history.undo()
+    history.redo()
+
+    assert command.dispose_count == 0
 
 
 def test_compound_command_rejects_empty_children() -> None:
