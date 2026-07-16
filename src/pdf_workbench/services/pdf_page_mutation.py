@@ -4,12 +4,13 @@ import json
 import logging
 import os
 import tempfile
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from hashlib import sha256
 from numbers import Integral
 from pathlib import Path
-from typing import Any, Sequence, cast
+from typing import Any, cast
 
 import pikepdf
 import pypdfium2 as pdfium  # type: ignore[import-untyped]
