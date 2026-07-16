@@ -1883,6 +1883,187 @@ def test_main_window_delete_toolbar_button_persists_into_working_copy_and_maps_c
     qtbot.waitUntil(lambda: not window._render_service._thread.isRunning())
 
 
+def test_main_window_reorder_request_persists_into_working_copy_and_tracks_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    window = create_real_main_window(qtbot, tmp_path)
+    document_path = create_simple_text_pdf(
+        tmp_path / "reorder-selected.pdf",
+        ["A", "B", "C", "D", "E", "F"],
+    )
+    window.open_document(document_path)
+    qtbot.waitUntil(lambda: window._documents[0].view.page_count == 6)
+    document = window._documents[0]
+    source_before = file_sha256(document_path)
+    working_copy_before = file_sha256(document.session.document_path)
+    document.view._page_organizer.set_selected_page_indexes((1, 3), current_index=3)
+    document.view.set_page(3)
+    qtbot.waitUntil(lambda: document.session.current_page_index == 3)
+
+    document.view._page_organizer.pages_reorder_requested.emit((1, 3), 6)
+
+    qtbot.waitUntil(lambda: document.command_history.can_undo)
+    qtbot.waitUntil(lambda: document.view.page_index == 5)
+
+    assert document.view.selected_page_indexes == (4, 5)
+    assert extract_pdfium_text(document.session.document_path) == "A C E F B D"
+    assert file_sha256(document_path) == source_before
+    assert file_sha256(document.session.document_path) != working_copy_before
+    assert document.session.is_modified is True
+    assert window.undo_action.text() == "元に戻す: 2ページを移動"
+    assert window.redo_action.isEnabled() is False
+    assert document.session.operation_history[-1] == "2ページを移動"
+
+    assert window._undo_current_command() is True
+    qtbot.waitUntil(lambda: document.view.page_index == 3)
+    assert document.view.selected_page_indexes == (1, 3)
+    assert extract_pdfium_text(document.session.document_path) == "A B C D E F"
+    assert document.session.operation_history[-1] == "Undo: 2ページを移動"
+
+    assert window._redo_current_command() is True
+    qtbot.waitUntil(lambda: document.view.page_index == 5)
+    assert document.view.selected_page_indexes == (4, 5)
+    assert extract_pdfium_text(document.session.document_path) == "A C E F B D"
+    assert document.session.operation_history[-1] == "Redo: 2ページを移動"
+
+    window.close()
+    qtbot.waitUntil(lambda: not window._render_service._thread.isRunning())
+
+
+def test_main_window_reorder_noop_does_not_create_history_entry(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    window = create_real_main_window(qtbot, tmp_path)
+    document_path = create_blank_pdf(tmp_path / "reorder-noop.pdf", 5)
+    window.open_document(document_path)
+    qtbot.waitUntil(lambda: window._documents[0].view.page_count == 5)
+    document = window._documents[0]
+    document.view._page_organizer.set_selected_page_indexes((1, 2), current_index=2)
+    calls: list[str] = []
+    reported: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        window,
+        "execute_document_command",
+        lambda command: calls.append(command.description) or True,
+    )
+    monkeypatch.setattr(
+        window,
+        "_report_error",
+        lambda title, message: reported.append((title, message)),
+    )
+
+    document.view._page_organizer.pages_reorder_requested.emit((1, 2), 3)
+
+    assert calls == []
+    assert reported == []
+    assert document.command_history.can_undo is False
+    assert document.session.operation_history == []
+
+    window.close()
+    qtbot.waitUntil(lambda: not window._render_service._thread.isRunning())
+
+
+def test_main_window_reorder_failure_preserves_history_dirty_and_viewer_state(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    window = create_real_main_window(qtbot, tmp_path)
+    document_path = create_qt_text_pdf(
+        tmp_path / "reorder-failure.pdf",
+        ["A", "B", "C", "D"],
+    )
+    window.open_document(document_path)
+    qtbot.waitUntil(lambda: window._documents[0].view.page_count == 4)
+    document = window._documents[0]
+    document.view._page_organizer.set_selected_page_indexes((1, 3), current_index=3)
+    document.view.set_page(3)
+    qtbot.waitUntil(lambda: document.session.current_page_index == 3)
+    working_copy_before = file_sha256(document.session.document_path)
+    reported: list[tuple[str, str]] = []
+
+    def fail_reorder(*_args: object, **_kwargs: object) -> object:
+        raise PdfPageMutationError("reorder failed")
+
+    monkeypatch.setattr(window._page_mutation_service, "reorder_pages", fail_reorder)
+    monkeypatch.setattr(
+        window,
+        "_report_error",
+        lambda title, message: reported.append((title, message)),
+    )
+
+    document.view._page_organizer.pages_reorder_requested.emit((1, 3), 4)
+
+    qtbot.waitUntil(lambda: bool(reported))
+    assert reported[-1] == ("編集に失敗しました", "reorder failed")
+    assert document.command_history.can_undo is False
+    assert document.command_history.is_dirty is False
+    assert document.session.is_modified is False
+    assert document.view.selected_page_indexes == (1, 3)
+    assert document.view.page_index == 3
+    assert file_sha256(document.session.document_path) == working_copy_before
+    assert document.mutation_in_progress is False
+    assert document.session.operation_history == []
+
+    window.close()
+    qtbot.waitUntil(lambda: not window._render_service._thread.isRunning())
+
+
+def test_main_window_reorder_requests_are_blocked_while_saving_or_mutating(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    window = create_real_main_window(qtbot, tmp_path)
+    document_path = create_blank_pdf(tmp_path / "reorder-guards.pdf", 4)
+    window.open_document(document_path)
+    qtbot.waitUntil(lambda: window._documents[0].view.page_count == 4)
+    document = window._documents[0]
+    calls: list[str] = []
+    monkeypatch.setattr(
+        window,
+        "execute_document_command",
+        lambda command: calls.append(command.description) or True,
+    )
+
+    document.session.is_saving = True
+    document.view._page_organizer.pages_reorder_requested.emit((1,), 4)
+    document.session.is_saving = False
+    document.mutation_in_progress = True
+    document.view._page_organizer.pages_reorder_requested.emit((1,), 4)
+
+    assert calls == []
+    assert document.command_history.can_undo is False
+
+    document.mutation_in_progress = False
+    window.close()
+    qtbot.waitUntil(lambda: not window._render_service._thread.isRunning())
+
+
 def test_main_window_delete_menu_action_save_marks_clean_and_undo_restores_dirty(
     monkeypatch: pytest.MonkeyPatch,
     qtbot: QtBot,

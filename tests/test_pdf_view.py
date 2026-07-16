@@ -451,6 +451,27 @@ def test_page_organizer_current_page_sync_preserves_multi_selection(
     assert view._page_organizer.list_view.currentIndex().row() == 6
 
 
+def test_pdf_view_forwards_page_reorder_requests_from_page_organizer(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    document_path = create_pdf(tmp_path / "organizer-reorder.pdf", 6)
+    service = FakeRenderService(create_metadata(document_path, 6))
+    view = PdfView(render_service=service, debounce_interval_ms=0)
+    _wrapper = show_view(qtbot, view)
+    captured: list[tuple[tuple[int, ...], int]] = []
+    view.page_reorder_requested.connect(
+        lambda page_indexes, insertion_slot: captured.append((page_indexes, insertion_slot))
+    )
+
+    view.open_document(document_path)
+    qtbot.waitUntil(lambda: view.page_count == 6)
+    view.set_page_reordering_enabled(True)
+    view._page_organizer.pages_reorder_requested.emit((1, 3), 6)
+
+    assert captured == [((1, 3), 6)]
+
+
 def test_page_organizer_requests_low_resolution_thumbnail_renders(
     qtbot: QtBot,
     tmp_path: Path,

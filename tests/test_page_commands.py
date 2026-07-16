@@ -6,8 +6,8 @@ import pikepdf
 import pytest
 from pypdf import PdfReader
 
-from pdf_regression_utils import file_sha256
-from pdf_test_utils import create_blank_pdf
+from pdf_regression_utils import extract_pdfium_text, file_sha256
+from pdf_test_utils import create_blank_pdf, create_simple_text_pdf
 from pdf_workbench.domain.command_history import (
     CommandExecutionError,
     CommandHistory,
@@ -17,9 +17,14 @@ from pdf_workbench.domain.command_history import (
 from pdf_workbench.domain.page_commands import (
     DeletePagesCommand,
     DuplicatePagesCommand,
+    ReorderPagesCommand,
     RotatePagesCommand,
 )
-from pdf_workbench.services.pdf_page_mutation import PdfPageMutationError, PdfPageMutationService
+from pdf_workbench.domain.page_reorder import build_page_reorder_plan
+from pdf_workbench.services.pdf_page_mutation import (
+    PdfPageMutationError,
+    PdfPageMutationService,
+)
 from pdf_workbench.services.pdf_renderer import DocumentRevision
 
 
@@ -502,6 +507,130 @@ def test_delete_pages_command_redo_failure_preserves_history_cursor(tmp_path: Pa
     assert history.can_redo is True
     assert file_sha256(document_path) == original_state_sha
     assert receipt.undo_snapshot_path.exists()
+
+
+def test_reorder_pages_command_executes_undoes_and_redoes(tmp_path: Path) -> None:
+    document_path = create_simple_text_pdf(
+        tmp_path / "reorder-command.pdf",
+        ["A", "B", "C", "D", "E", "F"],
+    )
+    command = ReorderPagesCommand(
+        document_path,
+        build_page_reorder_plan(6, (1, 3), 6),
+        PdfPageMutationService(),
+    )
+
+    execute_change = command.execute()
+    assert execute_change.requires_reload is True
+    assert execute_change.affected_pages == frozenset({1, 2, 3, 4, 5})
+    assert execute_change.selected_page_indexes_after == (4, 5)
+    assert execute_change.current_page_index_after is None
+    assert execute_change.mutation_result is not None
+    assert execute_change.mutation_result.page_index_transition is not None
+    assert execute_change.mutation_result.page_index_transition.current_page_old_to_new == (
+        0,
+        4,
+        1,
+        5,
+        2,
+        3,
+    )
+    assert extract_pdfium_text(document_path) == "A C E F B D"
+
+    undo_change = command.undo()
+    assert undo_change.requires_reload is True
+    assert undo_change.selected_page_indexes_after == (1, 3)
+    assert undo_change.current_page_index_after is None
+    assert extract_pdfium_text(document_path) == "A B C D E F"
+
+    redo_change = command.redo()
+    assert redo_change.requires_reload is True
+    assert redo_change.selected_page_indexes_after == (4, 5)
+    assert redo_change.current_page_index_after is None
+    assert extract_pdfium_text(document_path) == "A C E F B D"
+
+
+def test_reorder_pages_command_description_and_affected_pages(tmp_path: Path) -> None:
+    document_path = create_blank_pdf(tmp_path / "reorder-description.pdf", 5)
+    single_command = ReorderPagesCommand(
+        document_path,
+        build_page_reorder_plan(5, (1,), 5),
+        PdfPageMutationService(),
+    )
+    multi_command = ReorderPagesCommand(
+        document_path,
+        build_page_reorder_plan(5, (1, 3), 5),
+        PdfPageMutationService(),
+    )
+
+    assert single_command.description == "1ページを移動"
+    assert single_command.affected_pages == frozenset({1, 2, 3, 4})
+    assert multi_command.description == "2ページを移動"
+    assert multi_command.affected_pages == frozenset({1, 2, 3, 4})
+
+
+def test_reorder_pages_command_rejects_undo_and_redo_before_execute(tmp_path: Path) -> None:
+    document_path = create_blank_pdf(tmp_path / "reorder-before-execute.pdf", 3)
+    command = ReorderPagesCommand(
+        document_path,
+        build_page_reorder_plan(3, (1,), 3),
+        PdfPageMutationService(),
+    )
+
+    with pytest.raises(RuntimeError, match="not been executed"):
+        command.undo()
+    with pytest.raises(RuntimeError, match="not been executed"):
+        command.redo()
+
+
+def test_reorder_pages_command_redo_preflight_failure_preserves_working_copy(
+    tmp_path: Path,
+) -> None:
+    document_path = create_simple_text_pdf(tmp_path / "reorder-redo.pdf", ["A", "B", "C", "D"])
+    command = ReorderPagesCommand(
+        document_path,
+        build_page_reorder_plan(4, (1,), 4),
+        PdfPageMutationService(),
+    )
+
+    command.execute()
+    command.undo()
+    pristine_sha = file_sha256(document_path)
+
+    with pikepdf.open(document_path, allow_overwriting_input=True) as pdf:
+        pdf.pages[0].obj["/Rotate"] = 90
+        pdf.save(document_path)
+
+    changed_sha = file_sha256(document_path)
+    assert changed_sha != pristine_sha
+
+    with pytest.raises(PdfPageMutationError, match="前提状態"):
+        command.redo()
+
+
+def test_reorder_pages_command_is_single_history_entry_for_multi_page_move(tmp_path: Path) -> None:
+    document_path = create_simple_text_pdf(tmp_path / "reorder-history.pdf", ["A", "B", "C", "D"])
+    history = CommandHistory()
+    command = ReorderPagesCommand(
+        document_path,
+        build_page_reorder_plan(4, (1, 3), 4),
+        PdfPageMutationService(),
+    )
+
+    execute_change = history.execute(command)
+
+    assert execute_change.selected_page_indexes_after == (2, 3)
+    assert history.can_undo is True
+    assert history.undo_description == "2ページを移動"
+    assert extract_pdfium_text(document_path) == "A C B D"
+
+    undo_change = history.undo()
+
+    assert undo_change.selected_page_indexes_after == (1, 3)
+    assert history.can_undo is False
+    assert history.can_redo is True
+    assert history.redo_description == "2ページを移動"
+    assert extract_pdfium_text(document_path) == "A B C D"
 
 
 def test_delete_pages_command_dispose_failure_preserves_receipt_and_state(
