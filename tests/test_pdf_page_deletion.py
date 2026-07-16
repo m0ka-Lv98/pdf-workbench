@@ -12,6 +12,7 @@ import pdf_workbench.services.pdf_page_mutation as mutation_module
 from pdf_regression_utils import compatibility_fixture_dir, extract_pdfium_text, file_sha256
 from pdf_test_utils import create_blank_pdf
 from pdf_workbench.services.pdf_page_mutation import (
+    PageDeletionReceipt,
     PdfPageMutationError,
     PdfPageMutationService,
 )
@@ -195,11 +196,42 @@ def page_count(path: Path) -> int:
     return len(PdfReader(str(path)).pages)
 
 
+def delete_undo_snapshots(path: Path) -> list[Path]:
+    return list(path.parent.glob(f".{path.stem}.delete-undo.*.pdf"))
+
+
+def delete_candidates(path: Path) -> list[Path]:
+    return list(path.parent.glob(f".{path.stem}.mutation.*.tmp.pdf"))
+
+
+def clone_delete_receipt(
+    receipt: PageDeletionReceipt,
+    **overrides: object,
+) -> PageDeletionReceipt:
+    return PageDeletionReceipt(
+        working_copy_path=overrides.get("working_copy_path", receipt.working_copy_path),
+        original_page_count=receipt.original_page_count,
+        original_current_page_index=overrides.get(
+            "original_current_page_index",
+            receipt.original_current_page_index,
+        ),
+        deleted_page_indexes=overrides.get("deleted_page_indexes", receipt.deleted_page_indexes),
+        survivor_original_indexes=overrides.get(
+            "survivor_original_indexes",
+            receipt.survivor_original_indexes,
+        ),
+        before_snapshot=overrides.get("before_snapshot", receipt.before_snapshot),
+        after_snapshot=overrides.get("after_snapshot", receipt.after_snapshot),
+        undo_snapshot_path=overrides.get("undo_snapshot_path", receipt.undo_snapshot_path),
+        undo_snapshot_sha256=overrides.get("undo_snapshot_sha256", receipt.undo_snapshot_sha256),
+    )
+
+
 def test_delete_pages_removes_selected_pages_in_order_and_builds_transition(tmp_path: Path) -> None:
     working_copy = create_text_fixture(tmp_path / "delete-order.pdf", ["A", "B", "C", "D", "E"])
     service = PdfPageMutationService()
 
-    mutation = service.delete_pages(working_copy, (1, 3))
+    mutation = service.delete_pages(working_copy, (1, 3), current_page_index=0)
 
     assert mutation.receipt.deleted_page_indexes == (1, 3)
     assert mutation.receipt.survivor_original_indexes == (0, 2, 4)
@@ -240,7 +272,11 @@ def test_delete_pages_supports_adjacent_edge_and_all_but_one_cases(
     base_pages = ["A", "B", "C", "D", "E"] if len(expected_mapping) == 5 else ["A", "B", "C", "D"]
     working_copy = create_text_fixture(tmp_path / f"{deleted_indexes}.pdf", base_pages)
 
-    mutation = PdfPageMutationService().delete_pages(working_copy, deleted_indexes)
+    mutation = PdfPageMutationService().delete_pages(
+        working_copy,
+        deleted_indexes,
+        current_page_index=0,
+    )
 
     assert mutation.mutation_result.page_index_transition is not None
     assert mutation.mutation_result.page_index_transition.cache_old_to_new == expected_mapping
@@ -255,7 +291,7 @@ def test_delete_pages_preserves_source_and_undo_redo_round_trip(tmp_path: Path) 
     source_sha_before = file_sha256(source_path)
     working_sha_before = file_sha256(working_copy)
 
-    mutation = service.delete_pages(working_copy, (1, 3))
+    mutation = service.delete_pages(working_copy, (1, 3), current_page_index=0)
     working_sha_after = file_sha256(working_copy)
     assert working_sha_after != working_sha_before
     assert extract_pdfium_text(working_copy) == "A C E"
@@ -277,7 +313,7 @@ def test_delete_pages_creates_disk_backed_undo_snapshot_and_discard_removes_it(
     working_copy = create_blank_pdf(tmp_path / "delete-snapshot.pdf", 3)
     service = PdfPageMutationService()
 
-    mutation = service.delete_pages(working_copy, (1,))
+    mutation = service.delete_pages(working_copy, (1,), current_page_index=1)
 
     snapshot_path = mutation.receipt.undo_snapshot_path
     assert snapshot_path.parent == working_copy.parent
@@ -288,7 +324,7 @@ def test_delete_pages_creates_disk_backed_undo_snapshot_and_discard_removes_it(
     service.undo_page_deletion(working_copy, mutation.receipt)
     assert snapshot_path.exists()
 
-    service.discard_page_deletion_receipt(mutation.receipt)
+    service.discard_page_deletion_receipt(working_copy, mutation.receipt)
     assert not snapshot_path.exists()
 
 
@@ -309,10 +345,10 @@ def test_delete_pages_attempts_hard_link_before_fallback(
 
     monkeypatch.setattr(mutation_module.os, "link", tracking_link)
 
-    mutation = service.delete_pages(working_copy, (1,))
+    mutation = service.delete_pages(working_copy, (1,), current_page_index=1)
 
     assert called is True
-    service.discard_page_deletion_receipt(mutation.receipt)
+    service.discard_page_deletion_receipt(working_copy, mutation.receipt)
 
 
 def test_delete_pages_falls_back_to_copy_when_hard_link_fails(
@@ -327,7 +363,7 @@ def test_delete_pages_falls_back_to_copy_when_hard_link_fails(
 
     monkeypatch.setattr(mutation_module.os, "link", fail_link)
 
-    mutation = service.delete_pages(working_copy, (1,))
+    mutation = service.delete_pages(working_copy, (1,), current_page_index=1)
 
     assert mutation.receipt.undo_snapshot_path.exists()
     assert extract_pdfium_text(working_copy) == "A C"
@@ -337,7 +373,7 @@ def test_delete_pages_rejects_all_pages(tmp_path: Path) -> None:
     working_copy = create_blank_pdf(tmp_path / "delete-all-pages.pdf", 2)
 
     with pytest.raises(PdfPageMutationError, match="少なくとも1ページは残す必要があります"):
-        PdfPageMutationService().delete_pages(working_copy, (0, 1))
+        PdfPageMutationService().delete_pages(working_copy, (0, 1), current_page_index=0)
 
     assert page_count(working_copy) == 2
 
@@ -350,8 +386,8 @@ def test_delete_pages_preserves_rotations_and_page_boxes_for_survivors(tmp_path:
     rotations_before = service._snapshot_document_structure(rotations_path)
     page_boxes_before = service._snapshot_document_structure(page_boxes_path)
 
-    rotations_mutation = service.delete_pages(rotations_path, (1,))
-    page_boxes_mutation = service.delete_pages(page_boxes_path, (0,))
+    rotations_mutation = service.delete_pages(rotations_path, (1,), current_page_index=0)
+    page_boxes_mutation = service.delete_pages(page_boxes_path, (0,), current_page_index=0)
 
     rotations_after = service._snapshot_document_structure(rotations_path)
     page_boxes_after = service._snapshot_document_structure(page_boxes_path)
@@ -375,8 +411,8 @@ def test_delete_pages_preserves_annotations_and_maps_surviving_outline_targets(
     annotations_before = service._snapshot_document_structure(annotations_path)
     outline_before = service._snapshot_document_structure(outline_path)
 
-    annotations_mutation = service.delete_pages(annotations_path, (0,))
-    outline_mutation = service.delete_pages(outline_path, (1,))
+    annotations_mutation = service.delete_pages(annotations_path, (0,), current_page_index=0)
+    outline_mutation = service.delete_pages(outline_path, (1,), current_page_index=0)
 
     annotations_after = service._snapshot_document_structure(annotations_path)
     outline_after = service._snapshot_document_structure(outline_path)
@@ -395,7 +431,7 @@ def test_delete_pages_rejects_deleted_outline_destination(tmp_path: Path) -> Non
     before_sha = file_sha256(outline_path)
 
     with pytest.raises(PdfPageMutationError):
-        PdfPageMutationService().delete_pages(outline_path, (2,))
+        PdfPageMutationService().delete_pages(outline_path, (2,), current_page_index=0)
 
     assert file_sha256(outline_path) == before_sha
 
@@ -419,6 +455,297 @@ def test_delete_pages_rejects_unsupported_structures(
     before_sha = file_sha256(path)
 
     with pytest.raises(PdfPageMutationError, match=message):
-        PdfPageMutationService().delete_pages(path, (0,))
+        PdfPageMutationService().delete_pages(path, (0,), current_page_index=0)
 
     assert file_sha256(path) == before_sha
+
+
+def test_delete_pages_receipt_tracks_working_copy_identity_and_current_page(
+    tmp_path: Path,
+) -> None:
+    working_copy = create_text_fixture(tmp_path / "delete-receipt.pdf", ["A", "B", "C"])
+
+    mutation = PdfPageMutationService().delete_pages(
+        working_copy,
+        (1,),
+        current_page_index=2,
+    )
+
+    assert mutation.receipt.working_copy_path == working_copy.resolve()
+    assert mutation.receipt.original_current_page_index == 2
+
+
+@pytest.mark.parametrize(
+    ("failure_target", "expected_error"),
+    [
+        ("receipt", "receipt failed"),
+        ("transition", "transition failed"),
+        ("mutation_result", "mutation result failed"),
+        ("prepared_result", "prepared result failed"),
+    ],
+)
+def test_delete_pages_prepared_result_failures_do_not_replace_working_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_target: str,
+    expected_error: str,
+) -> None:
+    source_path = create_text_fixture(tmp_path / "source.pdf", ["A", "B", "C", "D"])
+    working_copy = tmp_path / "working.pdf"
+    shutil.copyfile(source_path, working_copy)
+    service = PdfPageMutationService()
+    working_sha_before = file_sha256(working_copy)
+    source_sha_before = file_sha256(source_path)
+    replace_calls: list[tuple[Path, Path]] = []
+
+    def replace_spy(source: Path | str, destination: Path | str) -> None:
+        replace_calls.append((Path(source), Path(destination)))
+
+    monkeypatch.setattr(mutation_module.os, "replace", replace_spy)
+
+    def fail(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError(expected_error)
+
+    if failure_target == "receipt":
+        monkeypatch.setattr(mutation_module, "PageDeletionReceipt", fail)
+    elif failure_target == "transition":
+        monkeypatch.setattr(service, "_build_delete_execute_transition", fail)
+    elif failure_target == "mutation_result":
+        monkeypatch.setattr(mutation_module, "WorkingCopyMutationResult", fail)
+    else:
+        monkeypatch.setattr(mutation_module, "PageDeletionMutation", fail)
+
+    with pytest.raises(PdfPageMutationError, match="作業コピーPDFの更新に失敗しました"):
+        service.delete_pages(working_copy, (1, 3), current_page_index=2)
+
+    assert replace_calls == []
+    assert file_sha256(working_copy) == working_sha_before
+    assert page_count(working_copy) == 4
+    assert file_sha256(source_path) == source_sha_before
+    assert delete_undo_snapshots(working_copy) == []
+    assert delete_candidates(working_copy) == []
+
+
+@pytest.mark.parametrize(
+    ("current_page_index", "expected_exception", "expected_message"),
+    [
+        (-1, ValueError, "current_page_index must stay within the page range"),
+        (3, ValueError, "current_page_index must stay within the page range"),
+        (4, ValueError, "current_page_index must stay within the page range"),
+        (True, TypeError, "current_page_index must be an integer"),
+        (1.5, TypeError, "current_page_index must be an integer"),
+        ("1", TypeError, "current_page_index must be an integer"),
+    ],
+)
+def test_delete_pages_validates_current_page_index_before_creating_temporary_files(
+    tmp_path: Path,
+    current_page_index: object,
+    expected_exception: type[Exception],
+    expected_message: str,
+) -> None:
+    working_copy = create_blank_pdf(tmp_path / "current-page-validation.pdf", 3)
+    service = PdfPageMutationService()
+    working_sha_before = file_sha256(working_copy)
+
+    with pytest.raises(expected_exception, match=expected_message):
+        service.delete_pages(
+            working_copy,
+            (1,),
+            current_page_index=current_page_index,
+        )
+
+    assert file_sha256(working_copy) == working_sha_before
+    assert page_count(working_copy) == 3
+    assert delete_undo_snapshots(working_copy) == []
+    assert delete_candidates(working_copy) == []
+
+
+@pytest.mark.parametrize(
+    ("failure_target", "expected_error"),
+    [
+        ("transition", "undo transition failed"),
+        ("mutation_result", "undo mutation result failed"),
+    ],
+)
+def test_undo_page_deletion_prepared_result_failures_preserve_deleted_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_target: str,
+    expected_error: str,
+) -> None:
+    working_copy = create_text_fixture(tmp_path / "undo-atomicity.pdf", ["A", "B", "C", "D"])
+    service = PdfPageMutationService()
+    mutation = service.delete_pages(working_copy, (1, 3), current_page_index=2)
+    deleted_state_sha = file_sha256(working_copy)
+    snapshot_path = mutation.receipt.undo_snapshot_path
+    replace_calls: list[tuple[Path, Path]] = []
+
+    def replace_spy(source: Path | str, destination: Path | str) -> None:
+        replace_calls.append((Path(source), Path(destination)))
+
+    monkeypatch.setattr(mutation_module.os, "replace", replace_spy)
+
+    def fail(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError(expected_error)
+
+    if failure_target == "transition":
+        monkeypatch.setattr(service, "_build_delete_undo_transition", fail)
+    else:
+        monkeypatch.setattr(mutation_module, "WorkingCopyMutationResult", fail)
+
+    with pytest.raises(PdfPageMutationError, match="作業コピーPDFの更新に失敗しました"):
+        service.undo_page_deletion(working_copy, mutation.receipt)
+
+    assert replace_calls == []
+    assert file_sha256(working_copy) == deleted_state_sha
+    assert extract_pdfium_text(working_copy) == "A C"
+    assert snapshot_path.exists()
+    assert delete_candidates(working_copy) == []
+
+
+@pytest.mark.parametrize(
+    ("failure_target", "expected_error"),
+    [
+        ("transition", "redo transition failed"),
+        ("mutation_result", "redo mutation result failed"),
+    ],
+)
+def test_redo_page_deletion_prepared_result_failures_preserve_original_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_target: str,
+    expected_error: str,
+) -> None:
+    working_copy = create_text_fixture(tmp_path / "redo-atomicity.pdf", ["A", "B", "C", "D"])
+    service = PdfPageMutationService()
+    mutation = service.delete_pages(working_copy, (1, 3), current_page_index=2)
+    service.undo_page_deletion(working_copy, mutation.receipt)
+    original_state_sha = file_sha256(working_copy)
+    snapshot_path = mutation.receipt.undo_snapshot_path
+    replace_calls: list[tuple[Path, Path]] = []
+
+    def replace_spy(source: Path | str, destination: Path | str) -> None:
+        replace_calls.append((Path(source), Path(destination)))
+
+    monkeypatch.setattr(mutation_module.os, "replace", replace_spy)
+
+    def fail(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError(expected_error)
+
+    if failure_target == "transition":
+        monkeypatch.setattr(service, "_build_delete_execute_transition", fail)
+    else:
+        monkeypatch.setattr(mutation_module, "WorkingCopyMutationResult", fail)
+
+    with pytest.raises(PdfPageMutationError, match="作業コピーPDFの更新に失敗しました"):
+        service.redo_page_deletion(working_copy, mutation.receipt)
+
+    assert replace_calls == []
+    assert file_sha256(working_copy) == original_state_sha
+    assert extract_pdfium_text(working_copy) == "A B C D"
+    assert snapshot_path.exists()
+    assert delete_candidates(working_copy) == []
+
+
+def test_page_deletion_receipt_rejects_working_copy_as_snapshot_path(tmp_path: Path) -> None:
+    working_copy = create_blank_pdf(tmp_path / "receipt-self.pdf", 3)
+    mutation = PdfPageMutationService().delete_pages(working_copy, (1,), current_page_index=1)
+
+    with pytest.raises(ValueError, match="must differ"):
+        clone_delete_receipt(mutation.receipt, undo_snapshot_path=working_copy.resolve())
+
+
+@pytest.mark.parametrize(
+    "case_name",
+    ["outside", "wrong-prefix", "subdirectory", "directory", "symlink"],
+)
+def test_discard_page_deletion_receipt_rejects_malicious_snapshot_paths(
+    tmp_path: Path,
+    case_name: str,
+) -> None:
+    source_path = create_text_fixture(tmp_path / "source.pdf", ["A", "B", "C"])
+    working_copy = tmp_path / "working.pdf"
+    shutil.copyfile(source_path, working_copy)
+    service = PdfPageMutationService()
+    mutation = service.delete_pages(working_copy, (1,), current_page_index=1)
+    valid_snapshot_path = mutation.receipt.undo_snapshot_path
+    working_sha_before = file_sha256(working_copy)
+    source_sha_before = file_sha256(source_path)
+    path_to_preserve: Path
+    preserved_file_sha: str | None = None
+
+    if case_name == "outside":
+        outside_dir = tmp_path / "outside"
+        outside_dir.mkdir()
+        path_to_preserve = create_blank_pdf(outside_dir / "outside.pdf", 1)
+        preserved_file_sha = file_sha256(path_to_preserve)
+    elif case_name == "wrong-prefix":
+        path_to_preserve = working_copy.parent / f".{working_copy.stem}.other.pdf"
+        shutil.copyfile(valid_snapshot_path, path_to_preserve)
+        preserved_file_sha = file_sha256(path_to_preserve)
+    elif case_name == "subdirectory":
+        subdirectory = working_copy.parent / "subdir"
+        subdirectory.mkdir()
+        path_to_preserve = subdirectory / f".{working_copy.stem}.delete-undo.subdir.pdf"
+        shutil.copyfile(valid_snapshot_path, path_to_preserve)
+        preserved_file_sha = file_sha256(path_to_preserve)
+    elif case_name == "directory":
+        path_to_preserve = working_copy.parent / f".{working_copy.stem}.delete-undo.dir.pdf"
+        path_to_preserve.mkdir()
+    else:
+        symlink_target = create_blank_pdf(tmp_path / "symlink-target.pdf", 1)
+        path_to_preserve = working_copy.parent / f".{working_copy.stem}.delete-undo.symlink.pdf"
+        path_to_preserve.symlink_to(symlink_target)
+        preserved_file_sha = file_sha256(symlink_target)
+
+    malicious_receipt = clone_delete_receipt(
+        mutation.receipt,
+        undo_snapshot_path=path_to_preserve,
+    )
+
+    with pytest.raises(PdfPageMutationError, match="削除前スナップショット"):
+        service.discard_page_deletion_receipt(working_copy, malicious_receipt)
+
+    assert file_sha256(working_copy) == working_sha_before
+    assert file_sha256(source_path) == source_sha_before
+    assert valid_snapshot_path.exists()
+    if preserved_file_sha is not None and path_to_preserve.is_symlink():
+        assert file_sha256(path_to_preserve.resolve()) == preserved_file_sha
+    elif preserved_file_sha is not None:
+        assert file_sha256(path_to_preserve) == preserved_file_sha
+    else:
+        assert path_to_preserve.exists()
+
+
+def test_discard_page_deletion_receipt_rejects_mismatched_working_copy_identity(
+    tmp_path: Path,
+) -> None:
+    first_working_copy = create_blank_pdf(tmp_path / "first.pdf", 3)
+    second_working_copy = create_blank_pdf(tmp_path / "second.pdf", 3)
+    service = PdfPageMutationService()
+    first_mutation = service.delete_pages(first_working_copy, (1,), current_page_index=1)
+    second_mutation = service.delete_pages(second_working_copy, (1,), current_page_index=1)
+
+    with pytest.raises(PdfPageMutationError, match="所有者"):
+        service.discard_page_deletion_receipt(first_working_copy, second_mutation.receipt)
+
+    assert first_mutation.receipt.undo_snapshot_path.exists()
+    assert second_mutation.receipt.undo_snapshot_path.exists()
+
+
+def test_discard_page_deletion_receipt_is_idempotent_for_missing_owned_snapshot(
+    tmp_path: Path,
+) -> None:
+    working_copy = create_blank_pdf(tmp_path / "discard-missing.pdf", 3)
+    service = PdfPageMutationService()
+    mutation = service.delete_pages(working_copy, (1,), current_page_index=1)
+    missing_snapshot_path = working_copy.parent / f".{working_copy.stem}.delete-undo.missing.pdf"
+    missing_receipt = clone_delete_receipt(
+        mutation.receipt,
+        undo_snapshot_path=missing_snapshot_path,
+    )
+
+    service.discard_page_deletion_receipt(working_copy, missing_receipt)
+
+    assert not missing_snapshot_path.exists()
+    assert mutation.receipt.undo_snapshot_path.exists()

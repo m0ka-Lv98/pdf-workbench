@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Literal
 
 from pdf_workbench.domain.mutation import WorkingCopyMutationResult
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +124,13 @@ class CompoundCommandRollbackError(CommandHistoryError):
         self.rollback_cause = rollback_cause
 
 
+class CommandResourceDisposalError(CommandHistoryError):
+    def __init__(self, command: DocumentCommand, cause: Exception) -> None:
+        super().__init__(f"Command resource disposal failed: {command.description}")
+        self.command = command
+        self.cause = cause
+
+
 class CompoundCommand(DocumentCommand):
     def __init__(
         self,
@@ -199,8 +209,21 @@ class CompoundCommand(DocumentCommand):
         return CommandChange.from_command(self)
 
     def dispose(self) -> None:
+        first_error: Exception | None = None
         for command in self._commands:
-            command.dispose()
+            try:
+                command.dispose()
+            except Exception as exc:
+                logger.warning(
+                    "Failed to dispose compound child resources: compound=%s child=%s",
+                    self.description,
+                    command.description,
+                    exc_info=True,
+                )
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise CommandResourceDisposalError(self, first_error) from first_error
 
 
 class CommandHistory:
@@ -309,9 +332,7 @@ class CommandHistory:
         try:
             command.dispose()
         except Exception:
-            from logging import getLogger
-
-            getLogger(__name__).warning(
+            logger.warning(
                 "Failed to dispose command resources: %s",
                 command.description,
                 exc_info=True,

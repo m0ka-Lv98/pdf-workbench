@@ -8,6 +8,12 @@ from pypdf import PdfReader
 
 from pdf_regression_utils import file_sha256
 from pdf_test_utils import create_blank_pdf
+from pdf_workbench.domain.command_history import (
+    CommandExecutionError,
+    CommandHistory,
+    CommandRedoError,
+    CommandUndoError,
+)
 from pdf_workbench.domain.page_commands import (
     DeletePagesCommand,
     DuplicatePagesCommand,
@@ -326,10 +332,6 @@ def test_delete_pages_command_rejects_invalid_configuration(tmp_path: Path) -> N
         DeletePagesCommand(document_path, ("1",), 0, service)  # type: ignore[arg-type]
     with pytest.raises(TypeError, match="integers"):
         DeletePagesCommand(document_path, (True,), 0, service)  # type: ignore[arg-type]
-    with pytest.raises(TypeError, match="current_page_index must be an integer"):
-        DeletePagesCommand(document_path, (0,), 1.5, service)  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="current_page_index must be non-negative"):
-        DeletePagesCommand(document_path, (0,), -1, service)
 
 
 def test_delete_pages_command_rejects_all_pages_and_out_of_range_on_execute(tmp_path: Path) -> None:
@@ -410,3 +412,121 @@ def test_delete_pages_command_dispose_cleans_snapshot_and_rejects_future_use(
     with pytest.raises(RuntimeError, match="disposed"):
         command.redo()
     assert page_count(document_path) == 2
+
+
+@pytest.mark.parametrize(
+    ("current_page_index", "expected_error", "expected_message"),
+    [
+        (-1, ValueError, "current_page_index must stay within the page range"),
+        (3, ValueError, "current_page_index must stay within the page range"),
+        (4, ValueError, "current_page_index must stay within the page range"),
+        (True, TypeError, "current_page_index must be an integer"),
+        (1.5, TypeError, "current_page_index must be an integer"),
+        ("1", TypeError, "current_page_index must be an integer"),
+    ],
+)
+def test_delete_pages_command_invalid_current_page_preserves_history_cursor(
+    tmp_path: Path,
+    current_page_index: object,
+    expected_error: type[Exception],
+    expected_message: str,
+) -> None:
+    document_path = create_blank_pdf(tmp_path / "delete-invalid-current-page.pdf", 3)
+    history = CommandHistory()
+    command = DeletePagesCommand(
+        document_path,
+        (1,),
+        current_page_index,  # type: ignore[arg-type]
+        PdfPageMutationService(),
+    )
+    working_sha_before = file_sha256(document_path)
+
+    with pytest.raises(CommandExecutionError) as exc_info:
+        history.execute(command)
+
+    assert isinstance(exc_info.value.cause, expected_error)
+    assert expected_message in str(exc_info.value.cause)
+    assert history.can_undo is False
+    assert history.can_redo is False
+    assert history.is_dirty is False
+    assert file_sha256(document_path) == working_sha_before
+    assert list(tmp_path.glob(".*.delete-undo.*.pdf")) == []
+
+
+def test_delete_pages_command_undo_failure_preserves_history_cursor(tmp_path: Path) -> None:
+    document_path = create_blank_pdf(tmp_path / "delete-undo-cursor.pdf", 4)
+    service = PdfPageMutationService()
+    history = CommandHistory()
+    command = DeletePagesCommand(document_path, (1, 3), 2, service)
+
+    history.execute(command)
+    deleted_state_sha = file_sha256(document_path)
+    receipt = command._receipt
+    assert receipt is not None
+
+    def fail_transition(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("undo transition failed")
+
+    service._build_delete_undo_transition = fail_transition  # type: ignore[method-assign]
+
+    with pytest.raises(CommandUndoError):
+        history.undo()
+
+    assert history.can_undo is True
+    assert history.can_redo is False
+    assert file_sha256(document_path) == deleted_state_sha
+    assert receipt.undo_snapshot_path.exists()
+
+
+def test_delete_pages_command_redo_failure_preserves_history_cursor(tmp_path: Path) -> None:
+    document_path = create_blank_pdf(tmp_path / "delete-redo-cursor.pdf", 4)
+    service = PdfPageMutationService()
+    history = CommandHistory()
+    command = DeletePagesCommand(document_path, (1, 3), 2, service)
+
+    history.execute(command)
+    history.undo()
+    original_state_sha = file_sha256(document_path)
+    receipt = command._receipt
+    assert receipt is not None
+
+    def fail_transition(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("redo transition failed")
+
+    service._build_delete_execute_transition = fail_transition  # type: ignore[method-assign]
+
+    with pytest.raises(CommandRedoError):
+        history.redo()
+
+    assert history.can_undo is False
+    assert history.can_redo is True
+    assert file_sha256(document_path) == original_state_sha
+    assert receipt.undo_snapshot_path.exists()
+
+
+def test_delete_pages_command_dispose_failure_preserves_receipt_and_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    document_path = create_blank_pdf(tmp_path / "delete-dispose-failure.pdf", 3)
+    command = DeletePagesCommand(document_path, (1,), 1, PdfPageMutationService())
+
+    command.execute()
+    receipt = command._receipt
+    assert receipt is not None
+
+    def fail_discard(_working_copy_path: Path, _receipt: object) -> None:
+        raise PdfPageMutationError("cleanup failed")
+
+    monkeypatch.setattr(
+        command._mutation_service,
+        "discard_page_deletion_receipt",
+        fail_discard,
+    )
+
+    with pytest.raises(PdfPageMutationError, match="cleanup failed"):
+        command.dispose()
+
+    assert command._receipt is receipt
+    assert command._disposed is False
+    assert receipt.undo_snapshot_path.exists()

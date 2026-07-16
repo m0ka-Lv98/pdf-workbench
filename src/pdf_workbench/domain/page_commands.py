@@ -28,15 +28,6 @@ def _normalize_page_indexes(page_indexes: Sequence[int]) -> tuple[int, ...]:
     return tuple(sorted(set(normalized)))
 
 
-def _require_strict_int(value: int, *, label: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, Integral):
-        raise TypeError(f"{label} must be an integer")
-    typed_value = int(value)
-    if typed_value < 0:
-        raise ValueError(f"{label} must be non-negative")
-    return typed_value
-
-
 class RotatePagesCommand(DocumentCommand):
     requires_document_reload = True
     mutates_working_copy = True
@@ -211,10 +202,7 @@ class DeletePagesCommand(DocumentCommand):
         self.affected_pages = frozenset()
         self._working_copy_path = working_copy_path.expanduser().resolve()
         self._page_indexes = unique_page_indexes
-        self._current_page_index = _require_strict_int(
-            current_page_index,
-            label="current_page_index",
-        )
+        self._requested_current_page_index = current_page_index
         self._mutation_service = mutation_service
         self._receipt: PageDeletionReceipt | None = None
         self._disposed = False
@@ -240,7 +228,7 @@ class DeletePagesCommand(DocumentCommand):
         )
         self.last_mutation_result = mutation_result
         self.last_selected_page_indexes_after = receipt.deleted_page_indexes
-        self.last_current_page_index_after = self._current_page_index
+        self.last_current_page_index_after = receipt.original_current_page_index
         return CommandChange.from_command(self)
 
     def redo(self) -> CommandChange:
@@ -264,14 +252,18 @@ class DeletePagesCommand(DocumentCommand):
             return
         receipt = self._receipt
         if receipt is not None:
-            self._mutation_service.discard_page_deletion_receipt(receipt)
-        self._receipt = None
+            self._mutation_service.discard_page_deletion_receipt(
+                self._working_copy_path,
+                receipt,
+            )
+            self._receipt = None
         self._disposed = True
 
     def _delete(self) -> PageDeletionMutation:
         return self._mutation_service.delete_pages(
             self._working_copy_path,
             self._page_indexes,
+            current_page_index=self._requested_current_page_index,
         )
 
     def _require_receipt(self) -> PageDeletionReceipt:

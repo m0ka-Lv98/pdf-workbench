@@ -1665,10 +1665,9 @@ class MainWindow(QMainWindow):
         if mapped_current_page is None:
             mapped_current_page = 0
         current_page_override = change.current_page_index_after
-        if (
-            current_page_override is not None
-            and 0 <= current_page_override < mutation_result.page_count
-        ):
+        if current_page_override is not None:
+            if not 0 <= current_page_override < mutation_result.page_count:
+                raise ValueError("current page override is outside the new page range")
             mapped_current_page = current_page_override
         if change.selected_page_indexes_after is not None:
             selected_page_indexes = tuple(

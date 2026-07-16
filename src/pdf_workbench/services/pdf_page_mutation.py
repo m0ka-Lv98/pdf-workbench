@@ -203,7 +203,9 @@ class PageDuplicationMutation:
 
 @dataclass(frozen=True, slots=True)
 class PageDeletionReceipt:
+    working_copy_path: Path
     original_page_count: int
+    original_current_page_index: int
     deleted_page_indexes: tuple[int, ...]
     survivor_original_indexes: tuple[int, ...]
     before_snapshot: PdfDocumentStructureSnapshot
@@ -212,6 +214,10 @@ class PageDeletionReceipt:
     undo_snapshot_sha256: str
 
     def __post_init__(self) -> None:
+        if not self.working_copy_path.is_absolute():
+            raise ValueError("working_copy_path must be absolute")
+        if self.working_copy_path.suffix.lower() != ".pdf":
+            raise ValueError("working_copy_path must point to a PDF")
         if isinstance(self.original_page_count, bool) or not isinstance(
             self.original_page_count,
             Integral,
@@ -221,6 +227,13 @@ class PageDeletionReceipt:
             raise ValueError("original_page_count must be positive")
         if self.before_snapshot.page_count != self.original_page_count:
             raise ValueError("before_snapshot page count must match original_page_count")
+        if isinstance(self.original_current_page_index, bool) or not isinstance(
+            self.original_current_page_index,
+            Integral,
+        ):
+            raise ValueError("original_current_page_index must be an integer")
+        if not 0 <= int(self.original_current_page_index) < self.original_page_count:
+            raise ValueError("original_current_page_index must stay within the page range")
         deleted_indexes = _validate_sorted_unique_page_indexes(
             self.deleted_page_indexes,
             label="deleted_page_indexes",
@@ -242,6 +255,8 @@ class PageDeletionReceipt:
         expected_after_page_count = self.original_page_count - len(deleted_indexes)
         if self.after_snapshot.page_count != expected_after_page_count:
             raise ValueError("after_snapshot page count does not match the deletion result")
+        if self.undo_snapshot_path == self.working_copy_path:
+            raise ValueError("undo_snapshot_path must differ from working_copy_path")
         if not self.undo_snapshot_path.is_absolute():
             raise ValueError("undo_snapshot_path must be absolute")
         if len(self.undo_snapshot_sha256) != 64 or any(
@@ -480,6 +495,8 @@ class PdfPageMutationService:
         self,
         path: Path,
         page_indexes: tuple[int, ...],
+        *,
+        current_page_index: object,
     ) -> PageDeletionMutation:
         resolved_path = path.expanduser().resolve()
         candidate_path: Path | None = None
@@ -489,6 +506,10 @@ class PdfPageMutationService:
         try:
             old_revision = DocumentRevision.from_path(resolved_path)
             before_snapshot = self._snapshot_document_structure(resolved_path)
+            validated_current_page_index = self._validate_delete_current_page_index(
+                current_page_index,
+                page_count=before_snapshot.page_count,
+            )
             deleted_page_indexes = self._normalize_delete_page_indexes(
                 page_indexes,
                 before_snapshot.page_count,
@@ -511,40 +532,47 @@ class PdfPageMutationService:
                 deleted_page_indexes=deleted_page_indexes,
             )
             new_revision = self._build_revision_from_candidate(candidate_path, resolved_path)
-            self._replace_atomically(candidate_path, resolved_path)
-            self._fsync_parent_directory(resolved_path.parent)
+            survivor_original_indexes = self._survivor_original_indexes(
+                before_snapshot.page_count,
+                deleted_page_indexes,
+            )
+            transition = self._build_delete_execute_transition(
+                before_snapshot.page_count,
+                deleted_page_indexes,
+            )
             receipt = PageDeletionReceipt(
+                working_copy_path=resolved_path,
                 original_page_count=before_snapshot.page_count,
+                original_current_page_index=validated_current_page_index,
                 deleted_page_indexes=deleted_page_indexes,
-                survivor_original_indexes=tuple(
-                    index
-                    for index in range(before_snapshot.page_count)
-                    if index not in set(deleted_page_indexes)
-                ),
+                survivor_original_indexes=survivor_original_indexes,
                 before_snapshot=before_snapshot,
                 after_snapshot=after_snapshot,
                 undo_snapshot_path=undo_snapshot_path,
                 undo_snapshot_sha256=undo_snapshot_sha256,
             )
-            return PageDeletionMutation(
-                mutation_result=WorkingCopyMutationResult(
-                    old_revision=old_revision,
-                    new_revision=new_revision,
-                    page_count=after_snapshot.page_count,
-                    affected_pages=frozenset(),
-                    page_index_transition=self._build_delete_execute_transition(
-                        before_snapshot.page_count,
-                        deleted_page_indexes,
-                    ),
-                ),
+            mutation_result = WorkingCopyMutationResult(
+                old_revision=old_revision,
+                new_revision=new_revision,
+                page_count=after_snapshot.page_count,
+                affected_pages=frozenset(),
+                page_index_transition=transition,
+            )
+            prepared_result = PageDeletionMutation(
+                mutation_result=mutation_result,
                 receipt=receipt,
             )
+            self._replace_atomically(candidate_path, resolved_path)
+            self._fsync_parent_directory(resolved_path.parent)
+            return prepared_result
         except PdfPageMutationError as exc:
             primary_error = exc
             raise
-        except TypeError:
+        except TypeError as exc:
+            primary_error = exc
             raise
-        except ValueError:
+        except ValueError as exc:
+            primary_error = exc
             raise
         except OSError as exc:
             primary_error = exc
@@ -573,22 +601,24 @@ class PdfPageMutationService:
             old_revision = DocumentRevision.from_path(resolved_path)
             self._validate_current_deletion_state(resolved_path, receipt)
             self._validate_delete_undo_snapshot(
+                resolved_path,
                 receipt,
-                expected_parent=resolved_path.parent,
             )
             candidate_path = self._create_candidate_path(resolved_path)
             self._copy_delete_undo_snapshot(receipt.undo_snapshot_path, candidate_path)
             self._validate_undo_page_deletion_candidate(candidate_path, receipt)
             new_revision = self._build_revision_from_candidate(candidate_path, resolved_path)
-            self._replace_atomically(candidate_path, resolved_path)
-            self._fsync_parent_directory(resolved_path.parent)
-            return WorkingCopyMutationResult(
+            transition = self._build_delete_undo_transition(receipt)
+            mutation_result = WorkingCopyMutationResult(
                 old_revision=old_revision,
                 new_revision=new_revision,
                 page_count=receipt.original_page_count,
                 affected_pages=frozenset(),
-                page_index_transition=self._build_delete_undo_transition(receipt),
+                page_index_transition=transition,
             )
+            self._replace_atomically(candidate_path, resolved_path)
+            self._fsync_parent_directory(resolved_path.parent)
+            return mutation_result
         except PdfPageMutationError as exc:
             primary_error = exc
             raise
@@ -615,8 +645,8 @@ class PdfPageMutationService:
             receipt.deleted_page_indexes,
         )
         self._validate_delete_undo_snapshot(
+            resolved_path,
             receipt,
-            expected_parent=resolved_path.parent,
         )
 
     def redo_page_deletion(
@@ -640,18 +670,20 @@ class PdfPageMutationService:
                 self._write_candidate(writer, candidate_path)
             self._validate_redo_page_deletion_candidate(candidate_path, receipt)
             new_revision = self._build_revision_from_candidate(candidate_path, resolved_path)
-            self._replace_atomically(candidate_path, resolved_path)
-            self._fsync_parent_directory(resolved_path.parent)
-            return WorkingCopyMutationResult(
+            transition = self._build_delete_execute_transition(
+                receipt.original_page_count,
+                receipt.deleted_page_indexes,
+            )
+            mutation_result = WorkingCopyMutationResult(
                 old_revision=old_revision,
                 new_revision=new_revision,
                 page_count=receipt.after_snapshot.page_count,
                 affected_pages=frozenset(),
-                page_index_transition=self._build_delete_execute_transition(
-                    receipt.original_page_count,
-                    receipt.deleted_page_indexes,
-                ),
+                page_index_transition=transition,
             )
+            self._replace_atomically(candidate_path, resolved_path)
+            self._fsync_parent_directory(resolved_path.parent)
+            return mutation_result
         except PdfPageMutationError as exc:
             primary_error = exc
             raise
@@ -666,9 +698,20 @@ class PdfPageMutationService:
 
     def discard_page_deletion_receipt(
         self,
+        working_copy_path: Path,
         receipt: PageDeletionReceipt,
     ) -> None:
-        self._cleanup_delete_undo_snapshot(receipt.undo_snapshot_path, primary_error=None)
+        snapshot_path = self._validate_delete_undo_snapshot_ownership(
+            working_copy_path,
+            receipt,
+            require_exists=False,
+        )
+        if not snapshot_path.exists():
+            return
+        try:
+            snapshot_path.unlink()
+        except OSError as exc:
+            raise PdfPageMutationError("削除前スナップショットPDFの削除に失敗しました") from exc
 
     @staticmethod
     def _validate_page_indexes(page_indexes: tuple[int, ...], page_count: int) -> tuple[int, ...]:
@@ -702,6 +745,27 @@ class PdfPageMutationService:
         if len(normalized) >= page_count:
             raise PdfPageMutationError("少なくとも1ページは残す必要があります")
         return normalized
+
+    @staticmethod
+    def _survivor_original_indexes(
+        original_page_count: int,
+        deleted_page_indexes: tuple[int, ...],
+    ) -> tuple[int, ...]:
+        deleted_set = set(deleted_page_indexes)
+        return tuple(index for index in range(original_page_count) if index not in deleted_set)
+
+    @staticmethod
+    def _validate_delete_current_page_index(
+        current_page_index: object,
+        *,
+        page_count: int,
+    ) -> int:
+        if isinstance(current_page_index, bool) or not isinstance(current_page_index, Integral):
+            raise TypeError("current_page_index must be an integer")
+        validated_current_page_index = int(current_page_index)
+        if not 0 <= validated_current_page_index < page_count:
+            raise ValueError("current_page_index must stay within the page range")
+        return validated_current_page_index
 
     def _rotation_state_for_page(self, page_object: Any, page_index: int) -> PageRotationState:
         rotate_key = NameObject("/Rotate")
@@ -1836,10 +1900,9 @@ class PdfPageMutationService:
             before_snapshot,
             page_mapping=transition.cache_old_to_new,
         )
-        survivor_original_indexes = tuple(
-            index
-            for index in range(before_snapshot.page_count)
-            if index not in set(deleted_page_indexes)
+        survivor_original_indexes = self._survivor_original_indexes(
+            before_snapshot.page_count,
+            deleted_page_indexes,
         )
         if len(after_snapshot.pages) != len(survivor_original_indexes):
             raise PdfPageMutationError("更新後のページ順序検証に失敗しました")
@@ -1860,19 +1923,14 @@ class PdfPageMutationService:
 
     def _validate_delete_undo_snapshot(
         self,
+        working_copy_path: Path,
         receipt: PageDeletionReceipt,
-        *,
-        expected_parent: Path | None = None,
     ) -> None:
-        snapshot_path = receipt.undo_snapshot_path.expanduser().resolve()
-        if expected_parent is not None:
-            try:
-                if not snapshot_path.is_relative_to(expected_parent.expanduser().resolve()):
-                    raise PdfPageMutationError("削除前スナップショットの場所が不正です")
-            except ValueError as exc:
-                raise PdfPageMutationError("削除前スナップショットの場所が不正です") from exc
-        if not snapshot_path.exists():
-            raise PdfPageMutationError("削除前スナップショットが見つかりません")
+        snapshot_path = self._validate_delete_undo_snapshot_ownership(
+            working_copy_path,
+            receipt,
+            require_exists=True,
+        )
         current_sha = self._sha256_file(snapshot_path)
         if current_sha != receipt.undo_snapshot_sha256:
             raise PdfPageMutationError("削除前スナップショットの整合性検証に失敗しました")
@@ -1883,6 +1941,39 @@ class PdfPageMutationService:
         snapshot = self._snapshot_document_structure(snapshot_path)
         if snapshot != receipt.before_snapshot:
             raise PdfPageMutationError("削除前スナップショットの構造検証に失敗しました")
+
+    def _validate_delete_undo_snapshot_ownership(
+        self,
+        working_copy_path: Path,
+        receipt: PageDeletionReceipt,
+        *,
+        require_exists: bool,
+    ) -> Path:
+        resolved_working_copy_path = working_copy_path.expanduser().resolve()
+        receipt_working_copy_path = receipt.working_copy_path.expanduser().resolve()
+        if receipt_working_copy_path != resolved_working_copy_path:
+            raise PdfPageMutationError("削除前スナップショットの所有者が一致しません")
+        snapshot_path = receipt.undo_snapshot_path.expanduser()
+        if not snapshot_path.is_absolute():
+            raise PdfPageMutationError("削除前スナップショットの場所が不正です")
+        if snapshot_path == resolved_working_copy_path:
+            raise PdfPageMutationError("削除前スナップショットの場所が不正です")
+        if snapshot_path.parent != resolved_working_copy_path.parent:
+            raise PdfPageMutationError("削除前スナップショットの場所が不正です")
+        expected_prefix = f".{resolved_working_copy_path.stem}.delete-undo."
+        if (
+            not snapshot_path.name.startswith(expected_prefix)
+            or snapshot_path.suffix.lower() != ".pdf"
+        ):
+            raise PdfPageMutationError("削除前スナップショットの場所が不正です")
+        if snapshot_path.is_symlink():
+            raise PdfPageMutationError("削除前スナップショットの場所が不正です")
+        if snapshot_path.exists():
+            if not snapshot_path.is_file():
+                raise PdfPageMutationError("削除前スナップショットの場所が不正です")
+        elif require_exists:
+            raise PdfPageMutationError("削除前スナップショットが見つかりません")
+        return snapshot_path
 
     def _validate_undo_page_deletion_candidate(
         self,

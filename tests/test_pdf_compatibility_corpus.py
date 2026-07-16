@@ -383,7 +383,11 @@ def test_delete_round_trip_preserves_surviving_fixture_structure_and_rendering(
     before_pdfium = inspect_pdfium_pages(fixture_path)
     source_images = render_pdf_pages(fixture_path, scale=0.4)
     try:
-        mutation = service.delete_pages(working_copy_path, deleted_page_indexes)
+        mutation = service.delete_pages(
+            working_copy_path,
+            deleted_page_indexes,
+            current_page_index=0,
+        )
 
         assert file_sha256(fixture_path) == fixture_sha_before
         assert mutation.receipt.survivor_original_indexes == survivor_indexes
@@ -448,7 +452,11 @@ def test_delete_rejects_all_page_selection_for_single_page_annotations_fixture(
     working_sha_before = file_sha256(working_copy_path)
 
     with pytest.raises(PdfPageMutationError, match="少なくとも1ページは残す必要があります"):
-        PdfPageMutationService().delete_pages(working_copy_path, (0,))
+        PdfPageMutationService().delete_pages(
+            working_copy_path,
+            (0,),
+            current_page_index=0,
+        )
 
     assert file_sha256(fixture_path) == fixture_sha_before
     assert file_sha256(working_copy_path) == working_sha_before

@@ -40,10 +40,13 @@ from pdf_workbench.domain.command_history import (
     DocumentCommand,
 )
 from pdf_workbench.domain.document_session import DocumentSession, FileFingerprint, SourceStatus
-from pdf_workbench.domain.mutation import WorkingCopyMutationResult
+from pdf_workbench.domain.mutation import PageIndexTransition, WorkingCopyMutationResult
 from pdf_workbench.domain.page_commands import DeletePagesCommand, RotatePagesCommand
 from pdf_workbench.services.page_coordinates import PageMetadata
-from pdf_workbench.services.pdf_page_mutation import PdfPageMutationService
+from pdf_workbench.services.pdf_page_mutation import (
+    PdfPageMutationError,
+    PdfPageMutationService,
+)
 from pdf_workbench.services.pdf_renderer import (
     DocumentMetadata,
     DocumentReleaseResult,
@@ -69,7 +72,7 @@ from pdf_workbench.services.source_change_monitor import (
     SourceCheckResult,
 )
 from pdf_workbench.ui.main_window import DocumentTab, MainWindow, RestoreSessionResult
-from pdf_workbench.ui.pdf_view import PdfView
+from pdf_workbench.ui.pdf_view import PdfView, PdfViewMutationSnapshot
 from pdf_workbench.ui.widgets.search_bar import SearchBar, SearchInputSurface
 
 
@@ -2047,6 +2050,54 @@ def test_main_window_close_document_cleans_delete_undo_snapshot(
     qtbot.waitUntil(lambda: not window._render_service._thread.isRunning())
 
 
+def test_main_window_close_document_falls_back_to_workspace_cleanup_after_dispose_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    window = create_real_main_window(qtbot, tmp_path)
+    document_path = create_simple_text_pdf(tmp_path / "delete-close-fallback.pdf", ["A", "B", "C"])
+    source_sha_before = file_sha256(document_path)
+    window.open_document(document_path)
+    qtbot.waitUntil(lambda: window._documents[0].view.page_count == 3)
+    document = window._documents[0]
+    document.view._page_organizer.set_selected_page_indexes((1,), current_index=1)
+
+    window._delete_selected_pages()
+
+    qtbot.waitUntil(lambda: document.command_history.can_undo)
+    undo_command = document.command_history.undo_command
+    assert isinstance(undo_command, DeletePagesCommand)
+    receipt = undo_command._receipt
+    assert receipt is not None
+    snapshot_path = receipt.undo_snapshot_path
+    working_copy_path = document.session.document_path
+    assert snapshot_path.exists()
+    assert working_copy_path.exists()
+
+    def fail_discard(_working_copy_path: Path, _receipt: object) -> None:
+        raise PdfPageMutationError("cleanup failed")
+
+    monkeypatch.setattr(
+        undo_command._mutation_service,
+        "discard_page_deletion_receipt",
+        fail_discard,
+    )
+
+    assert window.close_document_at(0) is True
+    assert not snapshot_path.exists()
+    assert not working_copy_path.exists()
+    assert document_path.exists()
+    assert file_sha256(document_path) == source_sha_before
+    window.close()
+    qtbot.waitUntil(lambda: not window._render_service._thread.isRunning())
+
+
 def test_main_window_rotate_page_noops_when_selection_is_empty(
     monkeypatch: pytest.MonkeyPatch,
     qtbot: QtBot,
@@ -2192,6 +2243,92 @@ def test_main_window_mutation_flag_blocks_close_save_undo_redo(
     document.mutation_in_progress = False
     assert window._render_service.shutdown() is True
     window.deleteLater()
+
+
+@pytest.mark.parametrize("current_page_override", [0, 2])
+def test_transform_mutation_snapshot_applies_valid_current_page_override(
+    qtbot: QtBot,
+    tmp_path: Path,
+    current_page_override: int,
+) -> None:
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    document_path = create_blank_pdf(tmp_path / "transform-valid.pdf", 3)
+    revision = DocumentRevision.from_path(document_path)
+    snapshot = PdfViewMutationSnapshot(
+        current_page_index=1,
+        selected_page_indexes=(1,),
+        logical_zoom=1.5,
+        search_query="Alpha",
+    )
+    change = CommandChange(
+        affected_pages=frozenset(),
+        mutation_result=WorkingCopyMutationResult(
+            old_revision=revision,
+            new_revision=revision,
+            page_count=3,
+            affected_pages=frozenset(),
+            page_index_transition=PageIndexTransition(
+                old_page_count=4,
+                new_page_count=3,
+                cache_old_to_new=(0, None, 1, 2),
+                current_page_old_to_new=(0, 0, 1, 2),
+            ),
+        ),
+        current_page_index_after=current_page_override,
+    )
+
+    transformed = window._transform_mutation_snapshot(snapshot, change)
+
+    assert transformed.current_page_index == current_page_override
+    window.close()
+
+
+@pytest.mark.parametrize("current_page_override", [-1, 3])
+def test_transform_mutation_snapshot_rejects_invalid_current_page_override(
+    qtbot: QtBot,
+    tmp_path: Path,
+    current_page_override: int,
+) -> None:
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    document_path = create_blank_pdf(tmp_path / "transform-invalid.pdf", 3)
+    revision = DocumentRevision.from_path(document_path)
+    snapshot = PdfViewMutationSnapshot(
+        current_page_index=1,
+        selected_page_indexes=(1,),
+        logical_zoom=1.5,
+        search_query="Alpha",
+    )
+    change = CommandChange(
+        affected_pages=frozenset(),
+        mutation_result=WorkingCopyMutationResult(
+            old_revision=revision,
+            new_revision=revision,
+            page_count=3,
+            affected_pages=frozenset(),
+            page_index_transition=PageIndexTransition(
+                old_page_count=4,
+                new_page_count=3,
+                cache_old_to_new=(0, None, 1, 2),
+                current_page_old_to_new=(0, 0, 1, 2),
+            ),
+        ),
+        current_page_index_after=current_page_override,
+    )
+
+    with pytest.raises(ValueError, match="outside the new page range"):
+        window._transform_mutation_snapshot(snapshot, change)
+
+    window.close()
 
 
 def test_main_window_save_as_does_not_open_dialog_during_mutation(
