@@ -12,6 +12,7 @@ class CommandChange:
     affected_pages: frozenset[int] | None
     requires_reload: bool = False
     mutation_result: WorkingCopyMutationResult | None = None
+    selected_page_indexes_after: tuple[int, ...] | None = None
 
     @classmethod
     def from_command(cls, command: DocumentCommand) -> CommandChange:
@@ -19,6 +20,11 @@ class CommandChange:
             affected_pages=command.affected_pages,
             requires_reload=bool(getattr(command, "requires_document_reload", False)),
             mutation_result=getattr(command, "last_mutation_result", None),
+            selected_page_indexes_after=getattr(
+                command,
+                "last_selected_page_indexes_after",
+                None,
+            ),
         )
 
 

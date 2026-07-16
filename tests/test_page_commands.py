@@ -6,9 +6,10 @@ import pikepdf
 import pytest
 from pypdf import PdfReader
 
+from pdf_regression_utils import file_sha256
 from pdf_test_utils import create_blank_pdf
-from pdf_workbench.domain.page_commands import RotatePagesCommand
-from pdf_workbench.services.pdf_page_mutation import PdfPageMutationService
+from pdf_workbench.domain.page_commands import DuplicatePagesCommand, RotatePagesCommand
+from pdf_workbench.services.pdf_page_mutation import PdfPageMutationError, PdfPageMutationService
 from pdf_workbench.services.pdf_renderer import DocumentRevision
 
 
@@ -62,6 +63,10 @@ def raw_page_rotate_values(path: Path) -> tuple[object | None, ...]:
     reader = PdfReader(str(path))
     root_pages = reader.trailer["/Root"]["/Pages"].get_object()
     return tuple(kid.get_object().get("/Rotate", None) for kid in root_pages["/Kids"])
+
+
+def page_count(path: Path) -> int:
+    return len(PdfReader(str(path)).pages)
 
 
 def set_direct_rotate(path: Path, page_index: int, rotation: int) -> None:
@@ -150,3 +155,108 @@ def test_rotate_pages_command_rejects_non_integer_indexes(tmp_path: Path) -> Non
 
     with pytest.raises(TypeError, match="integers"):
         RotatePagesCommand(document_path, (1.9,), service)
+
+
+def test_duplicate_pages_command_executes_undoes_and_redoes(tmp_path: Path) -> None:
+    document_path = create_blank_pdf(tmp_path / "duplicate-command.pdf", 5)
+    command = DuplicatePagesCommand(
+        document_path,
+        (1, 3),
+        PdfPageMutationService(),
+    )
+
+    execute_change = command.execute()
+    assert execute_change.requires_reload is True
+    assert execute_change.selected_page_indexes_after == (2, 5)
+    assert execute_change.mutation_result is not None
+    assert execute_change.mutation_result.page_count == 7
+    assert execute_change.mutation_result.page_index_transition is not None
+    assert page_count(document_path) == 7
+
+    undo_change = command.undo()
+    assert undo_change.requires_reload is True
+    assert undo_change.selected_page_indexes_after == (1, 3)
+    assert undo_change.mutation_result is not None
+    assert undo_change.mutation_result.page_count == 5
+    assert undo_change.mutation_result.page_index_transition is not None
+    assert page_count(document_path) == 5
+
+    redo_change = command.redo()
+    assert redo_change.requires_reload is True
+    assert redo_change.selected_page_indexes_after == (2, 5)
+    assert redo_change.mutation_result is not None
+    assert redo_change.mutation_result.page_count == 7
+    assert page_count(document_path) == 7
+
+
+def test_duplicate_pages_command_rejects_invalid_configuration(tmp_path: Path) -> None:
+    document_path = create_blank_pdf(tmp_path / "duplicate-invalid.pdf", 1)
+    service = PdfPageMutationService()
+
+    with pytest.raises(ValueError, match="must not be empty"):
+        DuplicatePagesCommand(document_path, (), service)
+    with pytest.raises(ValueError, match="non-negative"):
+        DuplicatePagesCommand(document_path, (-1,), service)
+    with pytest.raises(TypeError, match="integers"):
+        DuplicatePagesCommand(document_path, (1.5,), service)
+    with pytest.raises(TypeError, match="integers"):
+        DuplicatePagesCommand(document_path, ("1",), service)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="integers"):
+        DuplicatePagesCommand(document_path, (True,), service)  # type: ignore[arg-type]
+
+
+def test_duplicate_pages_command_normalizes_selection_and_description(tmp_path: Path) -> None:
+    document_path = create_blank_pdf(tmp_path / "duplicate-normalize.pdf", 4)
+    command = DuplicatePagesCommand(
+        document_path,
+        (3, 1, 1),
+        PdfPageMutationService(),
+    )
+
+    assert command.description == "2ページを複製"
+    assert command.affected_pages == frozenset({1, 3})
+
+    execute_change = command.execute()
+    assert execute_change.selected_page_indexes_after == (2, 5)
+
+
+def test_duplicate_pages_command_rejects_out_of_range_indexes_on_execute(tmp_path: Path) -> None:
+    document_path = create_blank_pdf(tmp_path / "duplicate-range.pdf", 1)
+    command = DuplicatePagesCommand(document_path, (1,), PdfPageMutationService())
+
+    with pytest.raises(ValueError, match="out of range"):
+        command.execute()
+
+
+def test_duplicate_pages_command_rejects_undo_and_redo_before_execute(tmp_path: Path) -> None:
+    document_path = create_blank_pdf(tmp_path / "duplicate-before-execute.pdf", 1)
+    command = DuplicatePagesCommand(document_path, (0,), PdfPageMutationService())
+
+    with pytest.raises(RuntimeError, match="not been executed"):
+        command.undo()
+    with pytest.raises(RuntimeError, match="not been executed"):
+        command.redo()
+
+
+def test_duplicate_pages_command_redo_preflight_failure_preserves_working_copy(
+    tmp_path: Path,
+) -> None:
+    document_path = create_blank_pdf(tmp_path / "duplicate-redo-preflight.pdf", 3)
+    command = DuplicatePagesCommand(document_path, (1,), PdfPageMutationService())
+
+    command.execute()
+    command.undo()
+    pristine_sha = file_sha256(document_path)
+
+    with pikepdf.open(document_path, allow_overwriting_input=True) as pdf:
+        pdf.pages[0].obj["/Rotate"] = 90
+        pdf.save(document_path)
+
+    changed_sha = file_sha256(document_path)
+    assert changed_sha != pristine_sha
+
+    with pytest.raises(PdfPageMutationError, match="前提状態"):
+        command.redo()
+
+    assert file_sha256(document_path) == changed_sha
+    assert page_count(document_path) == 3

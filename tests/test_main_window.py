@@ -27,12 +27,13 @@ from PySide6.QtWidgets import (
 )
 from pytestqt.qtbot import QtBot
 
-from pdf_regression_utils import file_sha256
+from pdf_regression_utils import extract_pdfium_text, file_sha256
 from pdf_test_utils import (
     copy_pdf_fixture,
     create_blank_pdf,
     create_image_only_pdf,
     create_qt_text_pdf,
+    create_simple_text_pdf,
 )
 from pdf_workbench.domain.command_history import (
     CommandChange,
@@ -1617,6 +1618,11 @@ def working_copy_effective_rotations(path: Path) -> tuple[int, ...]:
         return tuple(rotations)
 
 
+def working_copy_page_count(path: Path) -> int:
+    with pikepdf.open(str(path)) as pdf:
+        return len(pdf.pages)
+
+
 def test_main_window_rotate_selected_pages_persists_into_working_copy_and_restores_selection(
     monkeypatch: pytest.MonkeyPatch,
     qtbot: QtBot,
@@ -1652,6 +1658,174 @@ def test_main_window_rotate_selected_pages_persists_into_working_copy_and_restor
     render_service = window._render_service
     window.close()
     qtbot.waitUntil(lambda: not render_service._thread.isRunning())
+
+
+def test_main_window_duplicate_toolbar_button_persists_into_working_copy_and_restores_duplicates(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    window = create_real_main_window(qtbot, tmp_path)
+    document_path = create_simple_text_pdf(
+        tmp_path / "duplicate-selected.pdf",
+        ["A", "B", "C", "D", "E"],
+    )
+    window.open_document(document_path)
+    qtbot.waitUntil(lambda: window._documents[0].view.page_count == 5)
+    document = window._documents[0]
+    source_before = file_sha256(document_path)
+    working_copy_before = file_sha256(document.session.document_path)
+
+    assert window._toolbar_widget.duplicate_button.objectName() == "duplicatePagesButton"
+    assert window._toolbar_widget.duplicate_button.accessibleName() == "Duplicate selected pages"
+    assert window._toolbar_widget.duplicate_button.toolTip() == "選択したページを複製"
+    assert window.duplicate_pages_action.text() == "選択したページを複製"
+
+    document.view._page_organizer.set_selected_page_indexes((1, 3), current_index=1)
+    document.view.set_page(1)
+    qtbot.waitUntil(lambda: document.session.current_page_index == 1)
+    qtbot.waitUntil(window._toolbar_widget.duplicate_button.isEnabled)
+
+    QTest.mouseClick(window._toolbar_widget.duplicate_button, Qt.MouseButton.LeftButton)
+
+    qtbot.waitUntil(lambda: document.command_history.can_undo)
+    qtbot.waitUntil(lambda: document.view.page_count == 7)
+    qtbot.waitUntil(lambda: document.view.page_index == 2)
+
+    assert document.view.selected_page_indexes == (2, 5)
+    assert working_copy_page_count(document.session.document_path) == 7
+    assert extract_pdfium_text(document.session.document_path) == "A B B C D D E"
+    assert file_sha256(document_path) == source_before
+    assert file_sha256(document.session.document_path) != working_copy_before
+    assert document.session.is_modified is True
+    assert window.save_action.isEnabled() is True
+    assert window.undo_action.isEnabled() is True
+    assert window.redo_action.isEnabled() is False
+    assert window._tabs.tabText(0).endswith("*")
+    assert document.session.operation_history[-1] == "2ページを複製"
+
+    window.close()
+    qtbot.waitUntil(lambda: not window._render_service._thread.isRunning())
+
+
+def test_main_window_duplicate_menu_action_save_marks_clean_and_undo_restores_dirty(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    window = create_real_main_window(qtbot, tmp_path)
+    document_path = create_simple_text_pdf(tmp_path / "duplicate-save.pdf", ["A", "B"])
+    window.open_document(document_path)
+    qtbot.waitUntil(lambda: window._documents[0].view.page_count == 2)
+    document = window._documents[0]
+
+    document.view._page_organizer.set_selected_page_indexes((0,), current_index=0)
+    qtbot.waitUntil(lambda: window.duplicate_pages_action.isEnabled())
+
+    window.duplicate_pages_action.trigger()
+
+    qtbot.waitUntil(lambda: document.command_history.can_undo)
+    qtbot.waitUntil(lambda: document.view.page_count == 3)
+    assert document.view.selected_page_indexes == (1,)
+    assert extract_pdfium_text(document.session.document_path) == "A A B"
+    assert extract_pdfium_text(document_path) == "A B"
+    assert window._save_current_document() is True
+    assert document.session.is_modified is False
+    assert document.command_history.is_dirty is False
+    assert window.save_action.isEnabled() is False
+    assert extract_pdfium_text(document_path) == "A A B"
+
+    assert window._undo_current_command() is True
+    qtbot.waitUntil(lambda: document.view.page_count == 2)
+    assert document.session.is_modified is True
+    assert document.command_history.is_dirty is True
+    assert extract_pdfium_text(document.session.document_path) == "A B"
+    assert extract_pdfium_text(document_path) == "A A B"
+    assert document.session.operation_history[-1] == "Undo: 1ページを複製"
+
+    window.close()
+    qtbot.waitUntil(lambda: not window._render_service._thread.isRunning())
+
+
+def test_main_window_duplicate_page_noops_when_selection_is_empty(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    window = create_real_main_window(qtbot, tmp_path)
+    document_path = create_blank_pdf(tmp_path / "duplicate-empty-selection.pdf", 3)
+    window.open_document(document_path)
+    qtbot.waitUntil(lambda: window._documents[0].view.page_count == 3)
+    document = window._documents[0]
+    document.view._page_organizer.set_selected_page_indexes((), current_index=1)
+    calls: list[str] = []
+    monkeypatch.setattr(
+        window,
+        "execute_document_command",
+        lambda command: calls.append(command.description) or True,
+    )
+
+    window._duplicate_selected_pages()
+
+    assert calls == []
+    assert document.command_history.can_undo is False
+    assert working_copy_page_count(document.session.document_path) == 3
+
+    window.close()
+    qtbot.waitUntil(lambda: not window._render_service._thread.isRunning())
+
+
+def test_main_window_duplicate_controls_disable_during_mutation_and_save(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    window = create_real_main_window(qtbot, tmp_path)
+    document_path = create_blank_pdf(tmp_path / "duplicate-guard-controls.pdf", 1)
+    window.open_document(document_path)
+    qtbot.waitUntil(lambda: window._documents[0].view.page_count == 1)
+    document = window._documents[0]
+    document.view._page_organizer.set_selected_page_indexes((0,), current_index=0)
+    window._sync_toolbar(document)
+    window._update_actions()
+    assert window._toolbar_widget.duplicate_button.isEnabled() is True
+    assert window.duplicate_pages_action.isEnabled() is True
+
+    document.mutation_in_progress = True
+    window._sync_toolbar(document)
+    window._update_actions()
+    assert window._toolbar_widget.duplicate_button.isEnabled() is False
+    assert window.duplicate_pages_action.isEnabled() is False
+
+    document.mutation_in_progress = False
+    document.session.is_saving = True
+    window._sync_toolbar(document)
+    window._update_actions()
+    assert window._toolbar_widget.duplicate_button.isEnabled() is False
+    assert window.duplicate_pages_action.isEnabled() is False
+
+    window.close()
+    qtbot.waitUntil(lambda: not window._render_service._thread.isRunning())
 
 
 def test_main_window_rotate_page_noops_when_selection_is_empty(
@@ -2023,6 +2197,52 @@ def test_main_window_recovers_view_after_failed_persistent_rotation(
     qtbot.waitUntil(lambda: not window._render_service._thread.isRunning())
 
 
+def test_main_window_duplicate_failure_preserves_history_dirty_and_viewer_state(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    window = create_real_main_window(qtbot, tmp_path)
+    document_path = create_qt_text_pdf(tmp_path / "duplicate-failure.pdf", ["A", "B", "C"])
+    window.open_document(document_path)
+    qtbot.waitUntil(lambda: window._documents[0].view.page_count == 3)
+    document = window._documents[0]
+    document.view._page_organizer.set_selected_page_indexes((1,), current_index=1)
+    document.view.set_page(1)
+    qtbot.waitUntil(lambda: document.session.current_page_index == 1)
+    working_copy_before = file_sha256(document.session.document_path)
+    errors: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        window,
+        "_report_error",
+        lambda title, message: errors.append((title, message)),
+    )
+
+    def fail_duplicate(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("duplication failed")
+
+    monkeypatch.setattr(window._page_mutation_service, "duplicate_pages", fail_duplicate)
+
+    window._duplicate_selected_pages()
+
+    qtbot.waitUntil(lambda: bool(errors))
+    assert document.command_history.can_undo is False
+    assert document.session.is_modified is False
+    assert document.view.page_index == 1
+    assert document.view.selected_page_indexes == (1,)
+    assert working_copy_page_count(document.session.document_path) == 3
+    assert file_sha256(document.session.document_path) == working_copy_before
+    assert errors[-1][1] == "duplication failed"
+
+    window.close()
+    qtbot.waitUntil(lambda: not window._render_service._thread.isRunning())
+
+
 def test_main_window_toolbar_search_button_opens_search_ui(
     qtbot: QtBot,
     tmp_path: Path,
@@ -2083,6 +2303,7 @@ def test_main_window_responsive_toolbar_keeps_controls_visible_at_800_width(
         window._toolbar_widget.zoom_field,
         window._toolbar_widget.zoom_in_button,
         window._toolbar_widget.rotate_button,
+        window._toolbar_widget.duplicate_button,
     ):
         assert widget.geometry().width() > 0
         assert widget.geometry().height() > 0

@@ -8,6 +8,7 @@ from PySide6.QtGui import QImage
 from pytestqt.qtbot import QtBot
 
 import pdf_workbench.services.pdf_renderer as pdf_renderer_module
+from pdf_workbench.domain.mutation import PageIndexTransition
 from pdf_workbench.services.page_coordinates import PageMetadata
 from pdf_workbench.services.pdf_renderer import (
     DocumentMetadata,
@@ -374,6 +375,180 @@ def test_render_cache_transition_prefers_existing_new_revision_entries_on_collis
     assert cache.get(new_thumb_key) is new_thumb_image
     assert cache.get(old_main_key) is None
     assert cache.get(old_thumb_key) is None
+
+
+def test_render_cache_structural_transition_rekeys_originals_and_drops_duplicate_slots(
+    tmp_path: Path,
+) -> None:
+    cache = RenderImageCache(max_bytes=1024 * 1024)
+    old_revision = make_revision(tmp_path, name="before.pdf", content=b"before")
+    new_revision = make_revision(tmp_path, name="after.pdf", content=b"after")
+    unrelated_revision = make_revision(tmp_path, name="other.pdf", content=b"other")
+    transition = PageIndexTransition(
+        old_page_count=5,
+        new_page_count=7,
+        cache_old_to_new=(0, 1, 3, 4, 6),
+        current_page_old_to_new=(0, 2, 3, 5, 6),
+    )
+    selected_original_key = RenderCacheKey(old_revision, 1, 1.5, 0, 2.0)
+    shifted_original_key = RenderCacheKey(old_revision, 2, 0.25, 0, 1.0)
+    later_selected_key = RenderCacheKey(old_revision, 3, 1.0, 90, 1.0)
+    unrelated_key = RenderCacheKey(unrelated_revision, 0, 1.0, 0, 1.0)
+    selected_original_image = make_image(81, 81)
+    shifted_original_image = make_image(32, 48)
+    later_selected_image = make_image(96, 64)
+    unrelated_image = make_image(40, 40)
+
+    cache.put(selected_original_key, selected_original_image)
+    cache.put(shifted_original_key, shifted_original_image)
+    cache.put(later_selected_key, later_selected_image)
+    cache.put(unrelated_key, unrelated_image)
+
+    cache.transition_revision(
+        old_revision,
+        new_revision,
+        affected_pages=frozenset({1, 3}),
+        page_index_transition=transition,
+    )
+
+    assert cache.get(selected_original_key) is None
+    assert cache.get(shifted_original_key) is None
+    assert cache.get(later_selected_key) is None
+    assert cache.get(RenderCacheKey(new_revision, 1, 1.5, 0, 2.0)) is selected_original_image
+    assert cache.get(RenderCacheKey(new_revision, 3, 0.25, 0, 1.0)) is shifted_original_image
+    assert cache.get(RenderCacheKey(new_revision, 4, 1.0, 90, 1.0)) is later_selected_image
+    assert cache.get(RenderCacheKey(new_revision, 2, 1.5, 0, 2.0)) is None
+    assert cache.get(RenderCacheKey(new_revision, 5, 1.0, 90, 1.0)) is None
+    assert cache.get(unrelated_key) is unrelated_image
+    assert cache.total_bytes == (
+        selected_original_image.sizeInBytes()
+        + shifted_original_image.sizeInBytes()
+        + later_selected_image.sizeInBytes()
+        + unrelated_image.sizeInBytes()
+    )
+    assert all(key.revision != old_revision for key in cache._items)
+
+
+def test_page_index_transition_rejects_non_integer_and_duplicate_mappings() -> None:
+    with pytest.raises(ValueError, match="old_page_count must be an integer"):
+        PageIndexTransition(  # type: ignore[arg-type]
+            old_page_count=True,
+            new_page_count=1,
+            cache_old_to_new=(0,),
+            current_page_old_to_new=(0,),
+        )
+    with pytest.raises(ValueError, match="values must be integers or None"):
+        PageIndexTransition(  # type: ignore[arg-type]
+            old_page_count=1,
+            new_page_count=2,
+            cache_old_to_new=(False,),
+            current_page_old_to_new=(0,),
+        )
+    with pytest.raises(ValueError, match="must be unique"):
+        PageIndexTransition(
+            old_page_count=2,
+            new_page_count=3,
+            cache_old_to_new=(1, 1),
+            current_page_old_to_new=(1, 2),
+        )
+
+
+def test_render_cache_structural_undo_transition_drops_duplicate_entries(
+    tmp_path: Path,
+) -> None:
+    cache = RenderImageCache(max_bytes=1024 * 1024)
+    duplicated_revision = make_revision(tmp_path, name="duplicated.pdf", content=b"duplicated")
+    restored_revision = make_revision(tmp_path, name="restored.pdf", content=b"restored")
+    transition = PageIndexTransition(
+        old_page_count=7,
+        new_page_count=5,
+        cache_old_to_new=(0, 1, None, 2, 3, None, 4),
+        current_page_old_to_new=(0, 1, 1, 2, 3, 3, 4),
+    )
+    original_key = RenderCacheKey(duplicated_revision, 1, 1.5, 0, 1.0)
+    duplicate_key = RenderCacheKey(duplicated_revision, 2, 1.5, 0, 1.0)
+    shifted_key = RenderCacheKey(duplicated_revision, 3, 0.25, 0, 2.0)
+    original_image = make_image(80, 80)
+    duplicate_image = make_image(81, 81)
+    shifted_image = make_image(32, 32)
+
+    cache.put(original_key, original_image)
+    cache.put(duplicate_key, duplicate_image)
+    cache.put(shifted_key, shifted_image)
+
+    cache.transition_revision(
+        duplicated_revision,
+        restored_revision,
+        affected_pages=frozenset({1, 2}),
+        page_index_transition=transition,
+    )
+
+    assert cache.get(RenderCacheKey(restored_revision, 1, 1.5, 0, 1.0)) is original_image
+    assert cache.get(RenderCacheKey(restored_revision, 2, 0.25, 0, 2.0)) is shifted_image
+    assert cache.get(RenderCacheKey(restored_revision, 2, 1.5, 0, 1.0)) is None
+    assert cache.total_bytes == original_image.sizeInBytes() + shifted_image.sizeInBytes()
+    assert all(key.revision != duplicated_revision for key in cache._items)
+
+
+def test_render_cache_structural_transition_prefers_existing_new_revision_entry_on_collision(
+    tmp_path: Path,
+) -> None:
+    cache = RenderImageCache(max_bytes=1024 * 1024)
+    old_revision = make_revision(tmp_path, name="before.pdf", content=b"before")
+    new_revision = make_revision(tmp_path, name="after.pdf", content=b"after")
+    transition = PageIndexTransition(
+        old_page_count=5,
+        new_page_count=7,
+        cache_old_to_new=(0, 1, 3, 4, 6),
+        current_page_old_to_new=(0, 2, 3, 5, 6),
+    )
+    old_key = RenderCacheKey(old_revision, 2, 1.0, 0, 1.0)
+    new_key = RenderCacheKey(new_revision, 3, 1.0, 0, 1.0)
+    old_image = make_image(72, 72)
+    new_image = make_image(73, 73)
+
+    cache.put(new_key, new_image)
+    cache.put(old_key, old_image)
+
+    cache.transition_revision(
+        old_revision,
+        new_revision,
+        affected_pages=frozenset(),
+        page_index_transition=transition,
+    )
+
+    assert cache.get(new_key) is new_image
+    assert cache.total_bytes == new_image.sizeInBytes()
+
+
+def test_render_cache_structural_transition_rejects_out_of_range_keys_without_partial_update(
+    tmp_path: Path,
+) -> None:
+    cache = RenderImageCache(max_bytes=1024 * 1024)
+    old_revision = make_revision(tmp_path, name="before.pdf", content=b"before")
+    new_revision = make_revision(tmp_path, name="after.pdf", content=b"after")
+    transition = PageIndexTransition(
+        old_page_count=5,
+        new_page_count=7,
+        cache_old_to_new=(0, 1, 3, 4, 6),
+        current_page_old_to_new=(0, 2, 3, 5, 6),
+    )
+    invalid_key = RenderCacheKey(old_revision, 5, 1.0, 0, 1.0)
+    image = make_image(64, 64)
+    cache.put(invalid_key, image)
+    snapshot = list(cache._items.items())
+    total_before = cache.total_bytes
+
+    with pytest.raises(ValueError, match="outside the transition range"):
+        cache.transition_revision(
+            old_revision,
+            new_revision,
+            affected_pages=frozenset(),
+            page_index_transition=transition,
+        )
+
+    assert list(cache._items.items()) == snapshot
+    assert cache.total_bytes == total_before
 
 
 def test_render_service_release_document_waits_for_worker_close(
