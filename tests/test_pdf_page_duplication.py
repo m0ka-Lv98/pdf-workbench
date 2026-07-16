@@ -9,10 +9,16 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.generic import ArrayObject, DictionaryObject, FloatObject, NameObject, TextStringObject
 
 import pdf_workbench.services.pdf_page_mutation as mutation_module
-from pdf_regression_utils import compatibility_fixture_dir, extract_pdfium_text, file_sha256
+from pdf_regression_utils import (
+    compatibility_fixture_dir,
+    extract_pdfium_text,
+    file_sha256,
+    render_pdf_pages,
+)
 from pdf_workbench.services.pdf_page_mutation import (
     AnnotationParentState,
     PageDuplicationReceipt,
+    PdfAnnotationStructureSnapshot,
     PdfNamedDestinationSnapshot,
     PdfOutlineItemSnapshot,
     PdfPageMutationError,
@@ -176,6 +182,18 @@ def create_manual_annotation_pdf(
     return path
 
 
+def add_normal_appearance_to_first_annotation(path: Path) -> None:
+    with pikepdf.open(path, allow_overwriting_input=True) as pdf:
+        first_page = pdf.pages[0].obj
+        annot = annotation_objects(first_page.get("/Annots", None))[0]
+        appearance_stream = pdf.make_stream(b"q 0 0 20 20 re S Q")
+        appearance_stream["/Type"] = pikepdf.Name("/XObject")
+        appearance_stream["/Subtype"] = pikepdf.Name("/Form")
+        appearance_stream["/BBox"] = pikepdf.Array([0, 0, 20, 20])
+        annot["/AP"] = pikepdf.Dictionary({"/N": appearance_stream})
+        pdf.save(path)
+
+
 def page_count(path: Path) -> int:
     return len(PdfReader(str(path)).pages)
 
@@ -305,11 +323,27 @@ def test_duplicate_pages_preserve_page_boxes_and_rotation(tmp_path: Path) -> Non
 
 def test_duplicate_pages_create_independent_page_and_annotation_objects(tmp_path: Path) -> None:
     working_copy_path = copy_compatibility_fixture("annotations.pdf", tmp_path / "annotations.pdf")
+    add_normal_appearance_to_first_annotation(working_copy_path)
     service = PdfPageMutationService()
+    before_snapshot = service._snapshot_document_structure(working_copy_path)
 
     mutation = service.duplicate_pages(working_copy_path, (0,))
+    after_snapshot = service._snapshot_document_structure(working_copy_path)
 
     assert mutation.receipt.duplicate_page_indexes == (1,)
+    assert before_snapshot.pages[0].annotations
+    assert after_snapshot.pages[1].annotations
+    assert after_snapshot.pages[1].annotations == tuple(
+        PdfAnnotationStructureSnapshot(
+            subtype=annotation.subtype,
+            rect=annotation.rect,
+            has_appearance=annotation.has_appearance,
+            appearance_fingerprint=annotation.appearance_fingerprint,
+            parent_state=AnnotationParentState.POINTS_TO_OWN_PAGE,
+            fingerprint=annotation.fingerprint,
+        )
+        for annotation in before_snapshot.pages[0].annotations
+    )
     with pikepdf.open(working_copy_path) as pdf:
         original_page = pdf.pages[0].obj
         duplicate_page = pdf.pages[1].obj
@@ -318,15 +352,106 @@ def test_duplicate_pages_create_independent_page_and_annotation_objects(tmp_path
         duplicate_annots = duplicate_page.get("/Annots", None)
         assert original_annots is not None
         assert duplicate_annots is not None
+        assert getattr(duplicate_annots, "objgen", None) == (0, 0)
         original_items = annotation_objects(original_annots)
         duplicate_items = annotation_objects(duplicate_annots)
         assert len(original_items) == len(duplicate_items)
+        assert before_snapshot.pages[0].annotations[0].appearance_fingerprint is not None
         for original_annot, duplicate_annot in zip(original_items, duplicate_items, strict=True):
             assert original_annot.objgen != duplicate_annot.objgen
+            original_rect_before = tuple(float(value) for value in original_annot["/Rect"])
+            duplicate_rect_before = tuple(float(value) for value in duplicate_annot["/Rect"])
+            duplicate_annot[NameObject("/Rect")] = pikepdf.Array([80, 80, 120, 120])
+            assert tuple(float(value) for value in original_annot["/Rect"]) == original_rect_before
+            original_annot[NameObject("/Rect")] = pikepdf.Array([20, 20, 50, 50])
+            assert tuple(float(value) for value in duplicate_annot["/Rect"]) == (
+                80.0,
+                80.0,
+                120.0,
+                120.0,
+            )
+            assert duplicate_rect_before != tuple(
+                float(value) for value in duplicate_annot["/Rect"]
+            )
+            assert tuple(float(value) for value in original_annot["/Rect"]) == (
+                20.0,
+                20.0,
+                50.0,
+                50.0,
+            )
             duplicate_parent = duplicate_annot.get("/P", None)
             assert duplicate_parent is not None
             assert isinstance(duplicate_parent, pikepdf.Object)
             assert duplicate_parent.objgen == duplicate_page.objgen
+            assert service._appearance_fingerprint(original_annot) == (
+                service._appearance_fingerprint(duplicate_annot)
+            )
+            assert str(original_annot.get("/Subtype", "")) == str(
+                duplicate_annot.get("/Subtype", "")
+            )
+        original_count = len(original_items)
+        duplicate_count = len(duplicate_items)
+        del original_annots[-1]
+        assert len(annotation_objects(original_page.get("/Annots", None))) == original_count - 1
+        assert len(annotation_objects(duplicate_page.get("/Annots", None))) == duplicate_count
+        del duplicate_annots[-1]
+        assert len(annotation_objects(original_page.get("/Annots", None))) == original_count - 1
+        assert len(annotation_objects(duplicate_page.get("/Annots", None))) == duplicate_count - 1
+
+
+def test_duplicate_pages_annotation_round_trip_preserves_rendering_and_source_fixture(
+    tmp_path: Path,
+) -> None:
+    source_path = compatibility_fixture_dir() / "annotations.pdf"
+    working_copy_path = copy_compatibility_fixture(
+        "annotations.pdf",
+        tmp_path / "annotations-round-trip.pdf",
+    )
+    add_normal_appearance_to_first_annotation(working_copy_path)
+    service = PdfPageMutationService()
+    source_sha_before = file_sha256(source_path)
+    before_snapshot = service._snapshot_document_structure(working_copy_path)
+
+    mutation = service.duplicate_pages(working_copy_path, (0,))
+    execute_snapshot = service._snapshot_document_structure(working_copy_path)
+    execute_images = render_pdf_pages(working_copy_path, scale=0.4)
+
+    assert len(execute_images) == 2
+    assert all(image.width > 0 and image.height > 0 for image in execute_images)
+    assert execute_snapshot.pages[1].annotations
+    assert execute_snapshot.pages[1].annotations[0].appearance_fingerprint == (
+        before_snapshot.pages[0].annotations[0].appearance_fingerprint
+    )
+    assert file_sha256(source_path) == source_sha_before
+
+    undo_result = service.undo_page_duplication(working_copy_path, mutation.receipt)
+    undo_images = render_pdf_pages(working_copy_path, scale=0.4)
+
+    assert undo_result.page_count == 1
+    assert service._snapshot_document_structure(working_copy_path) == before_snapshot
+    assert len(undo_images) == 1
+    assert all(image.width > 0 and image.height > 0 for image in undo_images)
+    assert file_sha256(source_path) == source_sha_before
+
+    service.validate_duplication_redo_precondition(working_copy_path, mutation.receipt)
+    redo_mutation = service.duplicate_pages(
+        working_copy_path,
+        (0,),
+        expected_before_snapshot=mutation.receipt.before_snapshot,
+    )
+    redo_snapshot = service._snapshot_document_structure(working_copy_path)
+    redo_images = render_pdf_pages(working_copy_path, scale=0.4)
+
+    assert redo_mutation.receipt.duplicate_page_indexes == (1,)
+    assert redo_snapshot == execute_snapshot
+    assert len(redo_images) == 2
+    assert all(image.width > 0 and image.height > 0 for image in redo_images)
+    assert [image.tobytes() for image in redo_images] == [
+        image.tobytes() for image in execute_images
+    ]
+    with pikepdf.open(working_copy_path) as pdf:
+        assert len(pdf.pages) == 2
+    assert file_sha256(source_path) == source_sha_before
 
 
 def test_duplicate_pages_preserve_metadata_outlines_and_attachments(tmp_path: Path) -> None:

@@ -1158,10 +1158,10 @@ class PdfPageMutationService:
             return value
         return clone(writer, force_duplicate=True)
 
-    def _clone_annotations_into_writer(self, value: Any, writer: PdfWriter) -> Any:
+    def _clone_annotations_into_writer(self, value: Any, writer: PdfWriter) -> ArrayObject:
         resolved_value = self._dereference(value)
         if not isinstance(resolved_value, ArrayObject):
-            return self._clone_into_writer(value, writer)
+            raise PdfPageMutationError("注釈配列が不正です")
         cloned_annots = ArrayObject()
         for annot_ref in resolved_value:
             annot = self._dereference(annot_ref)
@@ -1170,7 +1170,7 @@ class PdfPageMutationService:
             cloned_annots.append(
                 indirect_reference if indirect_reference is not None else cloned_annot
             )
-        return writer._add_object(cloned_annots)
+        return cloned_annots
 
     def _set_duplicate_annotation_parent_references(self, page: Any) -> None:
         annots = page.get("/Annots", None)
