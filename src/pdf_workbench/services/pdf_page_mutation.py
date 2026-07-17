@@ -32,6 +32,30 @@ from pdf_workbench.services.pdf_renderer import DocumentRevision
 logger = logging.getLogger(__name__)
 
 _VOLATILE_STREAM_KEYS = frozenset({"/Length", "/Filter", "/DecodeParms", "/DL"})
+SUPPORTED_IMPORTED_ANNOTATION_SUBTYPES = frozenset(
+    {
+        "/Text",
+        "/Square",
+        "/Circle",
+        "/Highlight",
+        "/Underline",
+        "/StrikeOut",
+        "/Stamp",
+        "/Ink",
+    }
+)
+_PROHIBITED_IMPORTED_ANNOTATION_KEYS = (
+    "/A",
+    "/AA",
+    "/Dest",
+    "/FS",
+    "/RichMediaContent",
+    "/RichMediaSettings",
+    "/3DD",
+    "/3DV",
+    "/Sound",
+    "/Movie",
+)
 
 
 def _require_strict_int(value: object, *, label: str) -> int:
@@ -742,11 +766,11 @@ class PdfPageMutationService:
                 expected_page_count=source_snapshot_page_count,
                 render_page_indexes=plan.source_page_indexes,
             )
-            source_selected_page_snapshots = self._snapshot_selected_source_pages(
+            self._reject_unsupported_page_insertion_source_structures(
                 source_snapshot_path,
                 plan.source_page_indexes,
             )
-            self._reject_unsupported_page_insertion_source_structures(
+            source_selected_page_snapshots = self._snapshot_selected_source_pages(
                 source_snapshot_path,
                 plan.source_page_indexes,
             )
@@ -2590,26 +2614,11 @@ class PdfPageMutationService:
                 if not isinstance(annots, pikepdf.Array):
                     raise PdfPageMutationError("注釈配列が不正です")
                 for annot_ref in annots:
-                    annot = self._dereference(annot_ref)
-                    if str(annot.get("/Subtype", "")) == "/Widget":
-                        raise PdfPageMutationError("Widget注釈を含むページの挿入は未対応です")
-                    if "/Dest" in annot or self._annotation_has_internal_goto_action(annot):
-                        raise PdfPageMutationError("内部宛先注釈を含むページの挿入は未対応です")
-                    parent_object = annot.get("/P", None)
-                    if parent_object is None:
-                        continue
-                    parent = self._dereference(parent_object)
-                    parent_objgen = getattr(parent, "objgen", None)
-                    owning_objgen = getattr(page.obj, "objgen", None)
-                    if parent_objgen == owning_objgen:
-                        continue
-                    if (
-                        not self._has_indirect_objgen(parent_objgen)
-                        or cast(tuple[int, int], parent_objgen) not in page_index_by_objgen
-                        or str(parent.get("/Type", "")) != "/Page"
-                    ):
-                        raise PdfPageMutationError("注釈の/P参照を解決できません")
-                    raise PdfPageMutationError("他ページを参照する注釈の/P参照は未対応です")
+                    self._validate_importable_source_annotation(
+                        annot_ref,
+                        source_owning_page=page.obj,
+                        source_page_objgens=set(page_index_by_objgen),
+                    )
 
     @staticmethod
     def _annotation_has_internal_goto_action(annot: Any) -> bool:
@@ -2726,16 +2735,11 @@ class PdfPageMutationService:
         source_page_objgens: set[tuple[int, int]],
         inserted_page: Any,
     ) -> Any:
-        source_annot = self._dereference(source_annot_ref)
-        parent_state = self._annotation_parent_state(
-            source_annot,
-            owning_page=source_owning_page,
-            page_objgens=source_page_objgens,
+        source_annot, parent_state = self._validate_importable_source_annotation(
+            source_annot_ref,
+            source_owning_page=source_owning_page,
+            source_page_objgens=source_page_objgens,
         )
-        if parent_state is AnnotationParentState.POINTS_TO_OTHER_PAGE:
-            raise PdfPageMutationError("他ページを参照する注釈の/P参照は未対応です")
-        if parent_state is AnnotationParentState.INVALID:
-            raise PdfPageMutationError("注釈の/P参照を解決できません")
 
         source_handle = source_annot
         if not self._has_indirect_objgen(getattr(source_annot, "objgen", None)):
@@ -2773,6 +2777,63 @@ class PdfPageMutationService:
         )
         if getattr(resolved_parent, "objgen", None) != getattr(inserted_page, "objgen", None):
             raise PdfPageMutationError("注釈の/P参照の更新に失敗しました")
+
+    def _validate_importable_source_annotation(
+        self,
+        annot_ref: Any,
+        *,
+        source_owning_page: Any,
+        source_page_objgens: set[tuple[int, int]],
+    ) -> tuple[pikepdf.Dictionary, AnnotationParentState]:
+        source_annot = self._dereference(annot_ref)
+        if not isinstance(source_annot, pikepdf.Dictionary):
+            raise PdfPageMutationError("挿入元PDFの注釈構造が不正です")
+
+        subtype_object = source_annot.get("/Subtype", None)
+        if not isinstance(subtype_object, pikepdf.Name):
+            raise PdfPageMutationError("挿入元PDFの注釈subtypeが不正です")
+        subtype = str(subtype_object)
+        if subtype not in SUPPORTED_IMPORTED_ANNOTATION_SUBTYPES:
+            raise PdfPageMutationError(f"挿入元PDFの{subtype.removeprefix('/')}注釈は未対応です")
+
+        prohibited_key = self._first_prohibited_imported_annotation_key(source_annot)
+        if prohibited_key is not None:
+            raise PdfPageMutationError(
+                self._unsupported_imported_annotation_key_message(prohibited_key)
+            )
+
+        parent_state = self._annotation_parent_state(
+            source_annot,
+            owning_page=source_owning_page,
+            page_objgens=source_page_objgens,
+        )
+        if parent_state is AnnotationParentState.POINTS_TO_OTHER_PAGE:
+            raise PdfPageMutationError("他ページを参照する注釈の/P参照は未対応です")
+        if parent_state is AnnotationParentState.INVALID:
+            raise PdfPageMutationError("注釈の/P参照を解決できません")
+        return source_annot, parent_state
+
+    def _first_prohibited_imported_annotation_key(self, annot: pikepdf.Dictionary) -> str | None:
+        for key in _PROHIBITED_IMPORTED_ANNOTATION_KEYS:
+            if key in annot:
+                return key
+        return None
+
+    @staticmethod
+    def _unsupported_imported_annotation_key_message(key: str) -> str:
+        if key in {"/A", "/AA", "/Dest"}:
+            return "挿入元PDFのannotation actionは未対応です"
+        if key == "/FS":
+            return "挿入元PDFのFileSpec参照付き注釈は未対応です"
+        if key in {"/RichMediaContent", "/RichMediaSettings"}:
+            return "挿入元PDFのRichMedia注釈は未対応です"
+        if key in {"/3DD", "/3DV"}:
+            return "挿入元PDFの3D注釈は未対応です"
+        if key == "/Sound":
+            return "挿入元PDFのSound注釈は未対応です"
+        if key == "/Movie":
+            return "挿入元PDFのMovie注釈は未対応です"
+        return "挿入元PDFのactive contentを含む注釈は未対応です"
 
     def _materialize_imported_page_structure(
         self,
