@@ -449,8 +449,7 @@ def test_insert_pages_from_pdf_preserves_multiple_annotations_and_order(tmp_path
     service.undo_page_insertion(target_path, mutation.receipt)
     service.redo_page_insertion(target_path, mutation.receipt)
     assert [
-        annotation["subtype"]
-        for annotation in annotation_details(target_path, page_index=1)
+        annotation["subtype"] for annotation in annotation_details(target_path, page_index=1)
     ] == [
         "/Square",
         "/Highlight",
