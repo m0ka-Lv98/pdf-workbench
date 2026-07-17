@@ -70,6 +70,13 @@ PDF-writing PR の最低限の回帰チェック:
 - selected-page reordering では drag-and-drop 1 回を 1 件の command history entry とし、stable relative order、`insertion_slot` semantics、execute / undo / redo の permutation を検証する
 - selected-page reordering では page count 不変のまま cache remap が full permutation になること、current page と selection が page identity に追従することを検証する
 - selected-page reordering では optimistic model move を行わず、mutation failure 時に organizer order、selection、current page、working copy SHA が維持されることを確認する
+- insert-from-PDF では source page range parser を pure function または value object としてテストし、`all`、single、list、ascending range、mixed list/range、空白許容、duplicate / descending / non-ASCII digit rejection を確認する
+- insert-from-PDF では canonical `PageInsertionPlan` の `inserted_page_indexes_after` と `target_old_to_new` を UI 非依存で検証する
+- insert-from-PDF では source file dialog cancel、options dialog cancel、active document 変更時に command history、dirty state、selection、current page、working copy SHA が変わらないことを確認する
+- insert-from-PDF では execute / undo / redo の各経路で page order、imported page text、page boxes、rotation、supported annotations、target metadata / outlines / named destinations / attachments の保存を検証する
+- insert-from-PDF では source metadata / outlines / named destinations / attachments を統合しない方針を fixture で明示し、source PDF 自体が Save まで不変であることを確認する
+- insert-from-PDF では frozen source snapshot と target-before undo snapshot を working copy と同じ directory に保持し、redo が live source PDF の変更や削除に依存しないことを確認する
+- insert-from-PDF では source snapshot 改ざんや replace failure で fail-closed になり、working copy SHA が維持されることを確認する
 - page object と annotation object の独立性、annotation `/P` back-reference、raw/effective rotation、all page boxes の保存を検証する
 - execute / undo / redo の各経路で、pikepdf 再オープンと PDFium render を通して semantic restoration を確認する
 - form / widget page duplication は fail-closed とし、working copy hash が変わらないことを確認する

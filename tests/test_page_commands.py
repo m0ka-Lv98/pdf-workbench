@@ -17,9 +17,11 @@ from pdf_workbench.domain.command_history import (
 from pdf_workbench.domain.page_commands import (
     DeletePagesCommand,
     DuplicatePagesCommand,
+    InsertPagesCommand,
     ReorderPagesCommand,
     RotatePagesCommand,
 )
+from pdf_workbench.domain.page_insertion import build_page_insertion_plan
 from pdf_workbench.domain.page_reorder import build_page_reorder_plan
 from pdf_workbench.services.pdf_page_mutation import (
     PdfPageMutationError,
@@ -251,6 +253,56 @@ def test_duplicate_pages_command_rejects_undo_and_redo_before_execute(tmp_path: 
         command.undo()
     with pytest.raises(RuntimeError, match="not been executed"):
         command.redo()
+
+
+def test_insert_pages_command_executes_undoes_and_redoes(tmp_path: Path) -> None:
+    target_path = create_simple_text_pdf(tmp_path / "insert-target.pdf", ["A", "B"])
+    source_path = create_simple_text_pdf(tmp_path / "insert-source.pdf", ["X", "Y"])
+    service = PdfPageMutationService()
+    command = InsertPagesCommand(
+        target_path,
+        source_path,
+        build_page_insertion_plan(2, 2, (0, 1), 1),
+        service,
+        current_page_index_before=0,
+        selected_page_indexes_before=(0,),
+    )
+
+    execute_change = command.execute()
+    assert execute_change.requires_reload is True
+    assert execute_change.selected_page_indexes_after == (1, 2)
+    assert execute_change.current_page_index_after == 1
+
+    undo_change = command.undo()
+    assert undo_change.selected_page_indexes_after == (0,)
+    assert undo_change.current_page_index_after == 0
+
+    source_path.write_bytes(b"%PDF-1.4\nbroken")
+    redo_change = command.redo()
+    assert redo_change.selected_page_indexes_after == (1, 2)
+    assert redo_change.current_page_index_after == 1
+
+    command.dispose()
+    assert command._receipt is None
+
+
+def test_insert_pages_command_rejects_use_after_dispose(tmp_path: Path) -> None:
+    target_path = create_blank_pdf(tmp_path / "insert-dispose-target.pdf", 2)
+    source_path = create_blank_pdf(tmp_path / "insert-dispose-source.pdf", 1)
+    command = InsertPagesCommand(
+        target_path,
+        source_path,
+        build_page_insertion_plan(2, 1, (0,), 1),
+        PdfPageMutationService(),
+        current_page_index_before=0,
+        selected_page_indexes_before=(0,),
+    )
+
+    command.execute()
+    command.dispose()
+
+    with pytest.raises(RuntimeError, match="disposed"):
+        command.undo()
 
 
 def test_duplicate_pages_command_redo_preflight_failure_preserves_working_copy(
