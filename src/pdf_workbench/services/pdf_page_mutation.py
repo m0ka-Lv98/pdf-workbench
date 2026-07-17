@@ -771,12 +771,18 @@ class PdfPageMutationService:
                         source_pdf.pages[source_page_index],
                     )
                 for offset, source_page_snapshot in enumerate(source_selected_page_snapshots):
+                    source_page = source_pdf.pages[plan.source_page_indexes[offset]]
                     inserted_page = target_pdf.pages[plan.insertion_slot + offset]
                     self._materialize_imported_page_structure(
                         inserted_page,
                         source_page_snapshot,
                     )
-                    self._set_imported_annotation_parent_references(inserted_page.obj)
+                    self._copy_imported_page_annotations(
+                        target_pdf,
+                        source_pdf,
+                        source_page=source_page,
+                        inserted_page=inserted_page,
+                    )
                 candidate_path = self._create_candidate_path(resolved_target_path)
                 self._write_pikepdf_candidate(target_pdf, candidate_path)
 
@@ -930,12 +936,18 @@ class PdfPageMutationService:
                 for offset, source_page_snapshot in enumerate(
                     receipt.source_selected_page_snapshots
                 ):
+                    source_page = source_pdf.pages[plan.source_page_indexes[offset]]
                     inserted_page = target_pdf.pages[plan.insertion_slot + offset]
                     self._materialize_imported_page_structure(
                         inserted_page,
                         source_page_snapshot,
                     )
-                    self._set_imported_annotation_parent_references(inserted_page.obj)
+                    self._copy_imported_page_annotations(
+                        target_pdf,
+                        source_pdf,
+                        source_page=source_page,
+                        inserted_page=inserted_page,
+                    )
                 candidate_path = self._create_candidate_path(resolved_path)
                 self._write_pikepdf_candidate(target_pdf, candidate_path)
             self._validate_redo_page_insertion_candidate(candidate_path, receipt)
@@ -2025,10 +2037,7 @@ class PdfPageMutationService:
                         owning_page=owning_page,
                         page_objgens=page_objgens,
                     ),
-                    fingerprint=self._object_fingerprint(
-                        annot,
-                        exclude_keys=frozenset({"/P"}),
-                    ),
+                    fingerprint=self._annotation_fingerprint(annot),
                 )
             )
         return tuple(snapshots)
@@ -2075,6 +2084,31 @@ class PdfPageMutationService:
         if appearance is None:
             return None
         return self._object_fingerprint(appearance)
+
+    def _annotation_fingerprint(self, annot: Any) -> str:
+        dereferenced = self._dereference(annot)
+        if not isinstance(dereferenced, pikepdf.Dictionary):
+            raise PdfPageMutationError("注釈構造が不正です")
+        normalized = {
+            str(key): self._normalize_object(
+                item,
+                exclude_keys=frozenset(),
+                seen={},
+                active=set(),
+                next_local_id=[1],
+            )
+            for key, item in sorted(
+                ((str(key), item) for key, item in dereferenced.items() if str(key) != "/P"),
+                key=lambda entry: entry[0],
+            )
+        }
+        encoded = json.dumps(
+            normalized,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return sha256(encoded).hexdigest()
 
     def _object_fingerprint(
         self,
@@ -2647,15 +2681,98 @@ class PdfPageMutationService:
             annot = self._dereference(annot_ref)
             annot[NameObject("/P")] = page_reference
 
-    def _set_imported_annotation_parent_references(self, page: Any) -> None:
-        annots = page.get("/Annots", None)
-        page_reference = getattr(page, "indirect_reference", None)
-        if annots is None or page_reference is None:
+    def _copy_imported_page_annotations(
+        self,
+        target_pdf: pikepdf.Pdf,
+        source_pdf: pikepdf.Pdf,
+        *,
+        source_page: pikepdf.Page,
+        inserted_page: pikepdf.Page,
+    ) -> None:
+        source_annots_object = source_page.obj.get("/Annots", None)
+        if source_annots_object is None:
+            if "/Annots" in inserted_page.obj:
+                del inserted_page.obj["/Annots"]
             return
-        for annot_ref in annots:
-            annot = self._dereference(annot_ref)
-            if "/P" in annot:
-                annot[NameObject("/P")] = page_reference
+        source_annots = self._dereference(source_annots_object)
+        if not isinstance(source_annots, pikepdf.Array):
+            raise PdfPageMutationError("注釈配列のコピーに失敗しました")
+
+        page_objgens = {
+            page.obj.objgen
+            for page in source_pdf.pages
+            if self._has_indirect_objgen(getattr(page.obj, "objgen", None))
+        }
+        copied_annots = pikepdf.Array()
+        for source_annot_ref in source_annots:
+            copied_annot = self._copy_single_imported_annotation(
+                target_pdf,
+                source_pdf,
+                source_annot_ref=source_annot_ref,
+                source_owning_page=source_page.obj,
+                source_page_objgens=page_objgens,
+                inserted_page=inserted_page.obj,
+            )
+            copied_annots.append(copied_annot)
+        inserted_page.obj[NameObject("/Annots")] = target_pdf.make_indirect(copied_annots)
+
+    def _copy_single_imported_annotation(
+        self,
+        target_pdf: pikepdf.Pdf,
+        source_pdf: pikepdf.Pdf,
+        *,
+        source_annot_ref: Any,
+        source_owning_page: Any,
+        source_page_objgens: set[tuple[int, int]],
+        inserted_page: Any,
+    ) -> Any:
+        source_annot = self._dereference(source_annot_ref)
+        parent_state = self._annotation_parent_state(
+            source_annot,
+            owning_page=source_owning_page,
+            page_objgens=source_page_objgens,
+        )
+        if parent_state is AnnotationParentState.POINTS_TO_OTHER_PAGE:
+            raise PdfPageMutationError("他ページを参照する注釈の/P参照は未対応です")
+        if parent_state is AnnotationParentState.INVALID:
+            raise PdfPageMutationError("注釈の/P参照を解決できません")
+
+        source_handle = source_annot
+        if not self._has_indirect_objgen(getattr(source_annot, "objgen", None)):
+            source_handle = source_pdf.make_indirect(source_annot)
+        try:
+            copied_annot = target_pdf.copy_foreign(source_handle)
+        except Exception as exc:
+            raise PdfPageMutationError("注釈オブジェクトのコピーに失敗しました") from exc
+
+        copied_annot_object = self._dereference(copied_annot)
+        self._rewrite_imported_annotation_parent(
+            copied_annot_object,
+            inserted_page=inserted_page,
+            parent_state=parent_state,
+        )
+        return copied_annot
+
+    def _rewrite_imported_annotation_parent(
+        self,
+        annotation: Any,
+        *,
+        inserted_page: Any,
+        parent_state: AnnotationParentState,
+    ) -> None:
+        if parent_state is AnnotationParentState.ABSENT:
+            if "/P" in annotation:
+                del annotation["/P"]
+            return
+        if parent_state is not AnnotationParentState.POINTS_TO_OWN_PAGE:
+            raise PdfPageMutationError("注釈の/P参照の更新に失敗しました")
+        annotation[NameObject("/P")] = inserted_page
+        rewritten_parent = annotation.get("/P", None)
+        resolved_parent = (
+            self._dereference(rewritten_parent) if rewritten_parent is not None else None
+        )
+        if getattr(resolved_parent, "objgen", None) != getattr(inserted_page, "objgen", None):
+            raise PdfPageMutationError("注釈の/P参照の更新に失敗しました")
 
     def _materialize_imported_page_structure(
         self,

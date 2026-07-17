@@ -30,6 +30,232 @@ def create_outline_attachment_pdf(path: Path, *, title: str, attachment_name: st
     return path
 
 
+def _annotation_appearance_stream(
+    pdf: pikepdf.Pdf,
+    *,
+    color: tuple[float, float, float] = (1.0, 0.0, 0.0),
+) -> pikepdf.Object:
+    red, green, blue = color
+    stream = pdf.make_stream(f"q {red} {green} {blue} rg 20 20 60 60 re f Q".encode("ascii"))
+    stream["/Type"] = pikepdf.Name("/XObject")
+    stream["/Subtype"] = pikepdf.Name("/Form")
+    stream["/BBox"] = pikepdf.Array([20, 20, 80, 80])
+    return stream
+
+
+def create_supported_annotation_source_pdf(
+    path: Path,
+    *,
+    subtype: str = "/Square",
+    include_parent: bool,
+    direct_annots: bool,
+    indirect_annotation: bool,
+    contents: str = "annot",
+) -> Path:
+    pdf = pikepdf.Pdf.new()
+    page = pdf.add_blank_page(page_size=(200, 200))
+    page_contents = pdf.make_stream(b"BT /F1 24 Tf 48 96 Td (Annotated) Tj ET")
+    resources = pikepdf.Dictionary(
+        {
+            "/Font": pikepdf.Dictionary(
+                {
+                    "/F1": pdf.make_indirect(
+                        pikepdf.Dictionary(
+                            {
+                                "/Type": pikepdf.Name("/Font"),
+                                "/Subtype": pikepdf.Name("/Type1"),
+                                "/BaseFont": pikepdf.Name("/Helvetica"),
+                            }
+                        )
+                    )
+                }
+            )
+        }
+    )
+    page.obj["/Contents"] = page_contents
+    page.obj["/Resources"] = resources
+    annotation = pikepdf.Dictionary(
+        {
+            "/Type": pikepdf.Name("/Annot"),
+            "/Subtype": pikepdf.Name(subtype),
+            "/Rect": pikepdf.Array([20, 20, 80, 80]),
+            "/Contents": pikepdf.String(contents),
+            "/C": pikepdf.Array([1, 0, 0]),
+            "/F": 4,
+            "/Border": pikepdf.Array([0, 0, 1]),
+            "/AP": pikepdf.Dictionary({"/N": _annotation_appearance_stream(pdf)}),
+        }
+    )
+    if include_parent:
+        annotation["/P"] = page.obj
+    annotation_value: pikepdf.Object | pikepdf.Dictionary = (
+        pdf.make_indirect(annotation) if indirect_annotation else annotation
+    )
+    annots = pikepdf.Array([annotation_value])
+    if direct_annots:
+        page.obj["/Annots"] = annots
+    else:
+        page.obj["/Annots"] = pdf.make_indirect(annots)
+    pdf.save(path)
+    return path
+
+
+def create_supported_annotation_source_pdf_with_unresolved_parent(path: Path) -> Path:
+    pdf = pikepdf.Pdf.new()
+    page = pdf.add_blank_page(page_size=(200, 200))
+    annotation = pdf.make_indirect(
+        pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/Annot"),
+                "/Subtype": pikepdf.Name("/Square"),
+                "/Rect": pikepdf.Array([20, 20, 80, 80]),
+                "/Contents": pikepdf.String("invalid-parent"),
+                "/AP": pikepdf.Dictionary({"/N": _annotation_appearance_stream(pdf)}),
+                "/P": pikepdf.Dictionary({"/Type": pikepdf.Name("/Page")}),
+            }
+        )
+    )
+    page.obj["/Annots"] = pikepdf.Array([annotation])
+    pdf.save(path)
+    return path
+
+
+def create_mixed_annotation_source_pdf(path: Path) -> Path:
+    pdf = pikepdf.Pdf.new()
+    annotated_page = pdf.add_blank_page(page_size=(200, 200))
+    plain_page = pdf.add_blank_page(page_size=(200, 200))
+    for page, text in ((annotated_page, "Annotated"), (plain_page, "Plain")):
+        page.obj["/Contents"] = pdf.make_stream(
+            f"BT /F1 24 Tf 48 96 Td ({text}) Tj ET".encode("ascii")
+        )
+        page.obj["/Resources"] = pikepdf.Dictionary(
+            {
+                "/Font": pikepdf.Dictionary(
+                    {
+                        "/F1": pdf.make_indirect(
+                            pikepdf.Dictionary(
+                                {
+                                    "/Type": pikepdf.Name("/Font"),
+                                    "/Subtype": pikepdf.Name("/Type1"),
+                                    "/BaseFont": pikepdf.Name("/Helvetica"),
+                                }
+                            )
+                        )
+                    }
+                )
+            }
+        )
+    annotation = pdf.make_indirect(
+        pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/Annot"),
+                "/Subtype": pikepdf.Name("/Text"),
+                "/Rect": pikepdf.Array([20, 20, 80, 80]),
+                "/Contents": pikepdf.String("mixed"),
+                "/C": pikepdf.Array([1, 0, 0]),
+                "/Border": pikepdf.Array([0, 0, 1]),
+                "/AP": pikepdf.Dictionary({"/N": _annotation_appearance_stream(pdf)}),
+                "/P": annotated_page.obj,
+            }
+        )
+    )
+    annotated_page.obj["/Annots"] = pdf.make_indirect(pikepdf.Array([annotation]))
+    pdf.save(path)
+    return path
+
+
+def create_cross_page_parent_annotation_pdf(path: Path) -> Path:
+    pdf = pikepdf.Pdf.new()
+    first_page = pdf.add_blank_page(page_size=(200, 200))
+    second_page = pdf.add_blank_page(page_size=(200, 200))
+    annotation = pdf.make_indirect(
+        pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/Annot"),
+                "/Subtype": pikepdf.Name("/Square"),
+                "/Rect": pikepdf.Array([20, 20, 80, 80]),
+                "/Contents": pikepdf.String("cross-page"),
+                "/AP": pikepdf.Dictionary({"/N": _annotation_appearance_stream(pdf)}),
+                "/P": second_page.obj,
+            }
+        )
+    )
+    first_page.obj["/Annots"] = pikepdf.Array([annotation])
+    pdf.save(path)
+    return path
+
+
+def create_target_with_existing_annotation(path: Path) -> Path:
+    create_simple_text_pdf(path, ["Before", "Keep", "After"])
+    with pikepdf.open(path, allow_overwriting_input=True) as pdf:
+        page = pdf.pages[1]
+        annotation = pdf.make_indirect(
+            pikepdf.Dictionary(
+                {
+                    "/Type": pikepdf.Name("/Annot"),
+                    "/Subtype": pikepdf.Name("/Text"),
+                    "/Rect": pikepdf.Array([30, 30, 60, 60]),
+                    "/Contents": pikepdf.String("target"),
+                    "/C": pikepdf.Array([0, 0, 1]),
+                    "/Border": pikepdf.Array([0, 0, 1]),
+                    "/AP": pikepdf.Dictionary(
+                        {"/N": _annotation_appearance_stream(pdf, color=(0.0, 0.0, 1.0))}
+                    ),
+                    "/P": page.obj,
+                }
+            )
+        )
+        page.obj["/Annots"] = pikepdf.Array([annotation])
+        pdf.save(path)
+    return path
+
+
+def annotation_details(path: Path, *, page_index: int) -> tuple[dict[str, object], ...]:
+    service = PdfPageMutationService()
+    with pikepdf.open(path) as pdf:
+        page = pdf.pages[page_index]
+        annots_object = page.obj.get("/Annots", None)
+        if annots_object is None:
+            return ()
+        annots = (
+            annots_object
+            if isinstance(annots_object, pikepdf.Array)
+            else annots_object.get_object()
+        )
+        details: list[dict[str, object]] = []
+        for annot_ref in annots:
+            annot = annot_ref if isinstance(annot_ref, pikepdf.Object) else annot_ref.get_object()
+            appearance = annot.get("/AP", None)
+            appearance_fingerprint: str | None = None
+            if appearance is not None:
+                appearance_object = (
+                    appearance
+                    if isinstance(appearance, pikepdf.Object)
+                    else appearance.get_object()
+                )
+                appearance_fingerprint = service._object_fingerprint(appearance_object)
+            parent_object = annot.get("/P", None)
+            parent = None
+            if parent_object is not None:
+                parent = (
+                    parent_object
+                    if isinstance(parent_object, pikepdf.Object)
+                    else parent_object.get_object()
+                )
+            details.append(
+                {
+                    "subtype": str(annot.get("/Subtype", "")),
+                    "rect": tuple(float(value) for value in annot.get("/Rect", ())),
+                    "contents": str(annot.get("/Contents", "")),
+                    "has_appearance": "/AP" in annot,
+                    "appearance_fingerprint": appearance_fingerprint,
+                    "parent_objgen": getattr(parent, "objgen", None),
+                    "page_objgen": getattr(page.obj, "objgen", None),
+                }
+            )
+        return tuple(details)
+
+
 def create_inherited_crop_resources_pdf(path: Path) -> Path:
     create_simple_text_pdf(path, ["Inherited"])
     with pikepdf.open(path, allow_overwriting_input=True) as pdf:
@@ -46,6 +272,201 @@ def create_inherited_crop_resources_pdf(path: Path) -> Path:
 
 def clone_receipt(receipt: PageInsertionReceipt, **changes: object) -> PageInsertionReceipt:
     return replace(receipt, **changes)
+
+
+@pytest.mark.parametrize(
+    ("direct_annots", "indirect_annotation"),
+    [
+        (True, True),
+        (True, False),
+        (False, True),
+        (False, False),
+    ],
+)
+@pytest.mark.parametrize("include_parent", [False, True])
+@pytest.mark.parametrize("subtype", ["/Square", "/Text"])
+def test_insert_pages_from_pdf_preserves_supported_annotations(
+    tmp_path: Path,
+    direct_annots: bool,
+    indirect_annotation: bool,
+    include_parent: bool,
+    subtype: str,
+) -> None:
+    target_path = create_simple_text_pdf(tmp_path / "target-annot.pdf", ["A", "B"])
+    source_path = create_supported_annotation_source_pdf(
+        tmp_path / "source-annot.pdf",
+        subtype=subtype,
+        include_parent=include_parent,
+        direct_annots=direct_annots,
+        indirect_annotation=indirect_annotation,
+        contents=f"{subtype}-contents",
+    )
+    service = PdfPageMutationService()
+    source_sha_before = file_sha256(source_path)
+    source_annotation_before = annotation_details(source_path, page_index=0)
+
+    mutation = service.insert_pages_from_pdf(target_path, source_path, (0,), 1)
+
+    imported_annotation = annotation_details(target_path, page_index=1)
+    assert len(imported_annotation) == 1
+    assert imported_annotation[0]["subtype"] == subtype
+    assert imported_annotation[0]["rect"] == source_annotation_before[0]["rect"]
+    assert imported_annotation[0]["contents"] == source_annotation_before[0]["contents"]
+    assert imported_annotation[0]["has_appearance"] is True
+    assert (
+        imported_annotation[0]["appearance_fingerprint"]
+        == source_annotation_before[0]["appearance_fingerprint"]
+    )
+    if include_parent:
+        assert imported_annotation[0]["parent_objgen"] == imported_annotation[0]["page_objgen"]
+    else:
+        assert imported_annotation[0]["parent_objgen"] is None
+    assert file_sha256(source_path) == source_sha_before
+    assert extract_pdfium_text(target_path) == "A Annotated B"
+
+    service.undo_page_insertion(target_path, mutation.receipt)
+    assert annotation_details(target_path, page_index=0) == ()
+    assert extract_pdfium_text(target_path) == "A B"
+
+    source_path.write_bytes(b"%PDF-1.4\nchanged")
+    service.redo_page_insertion(target_path, mutation.receipt)
+    redone_annotation = annotation_details(target_path, page_index=1)
+    assert redone_annotation == imported_annotation
+    assert extract_pdfium_text(target_path) == "A Annotated B"
+
+
+def test_insert_pages_from_pdf_rejects_cross_page_annotation_parent(tmp_path: Path) -> None:
+    target_path = create_blank_pdf(tmp_path / "target-cross-parent.pdf", 1)
+    source_path = create_cross_page_parent_annotation_pdf(tmp_path / "source-cross-parent.pdf")
+    service = PdfPageMutationService()
+    target_sha_before = file_sha256(target_path)
+    source_sha_before = file_sha256(source_path)
+
+    with pytest.raises(PdfPageMutationError, match="他ページを参照する注釈の/P参照は未対応です"):
+        service.insert_pages_from_pdf(target_path, source_path, (0,), 1)
+
+    assert file_sha256(target_path) == target_sha_before
+    assert file_sha256(source_path) == source_sha_before
+
+
+def test_insert_pages_from_pdf_rejects_unresolved_annotation_parent(tmp_path: Path) -> None:
+    target_path = create_blank_pdf(tmp_path / "target-unresolved-parent.pdf", 1)
+    source_path = create_supported_annotation_source_pdf_with_unresolved_parent(
+        tmp_path / "source-unresolved-parent.pdf"
+    )
+    service = PdfPageMutationService()
+    target_sha_before = file_sha256(target_path)
+    source_sha_before = file_sha256(source_path)
+
+    with pytest.raises(PdfPageMutationError, match="注釈の/P参照を解決できません"):
+        service.insert_pages_from_pdf(target_path, source_path, (0,), 1)
+
+    assert file_sha256(target_path) == target_sha_before
+    assert file_sha256(source_path) == source_sha_before
+
+
+def test_insert_pages_from_pdf_preserves_target_annotations_across_undo_and_redo(
+    tmp_path: Path,
+) -> None:
+    target_path = create_target_with_existing_annotation(tmp_path / "target-existing-annot.pdf")
+    source_path = create_supported_annotation_source_pdf(
+        tmp_path / "source-existing-annot.pdf",
+        subtype="/Square",
+        include_parent=True,
+        direct_annots=False,
+        indirect_annotation=True,
+    )
+    service = PdfPageMutationService()
+    before_snapshot = service.snapshot_document_structure(target_path)
+    before_target_annotation = annotation_details(target_path, page_index=1)
+
+    mutation = service.insert_pages_from_pdf(target_path, source_path, (0,), 1)
+    after_snapshot = service.snapshot_document_structure(target_path)
+
+    assert after_snapshot.pages[2] == before_snapshot.pages[1]
+    imported_target_annotation = annotation_details(target_path, page_index=2)
+    assert len(imported_target_annotation) == 1
+    assert imported_target_annotation[0]["subtype"] == before_target_annotation[0]["subtype"]
+    assert imported_target_annotation[0]["rect"] == before_target_annotation[0]["rect"]
+    assert imported_target_annotation[0]["contents"] == before_target_annotation[0]["contents"]
+    assert imported_target_annotation[0]["has_appearance"] is True
+    assert (
+        imported_target_annotation[0]["appearance_fingerprint"]
+        == before_target_annotation[0]["appearance_fingerprint"]
+    )
+    assert (
+        imported_target_annotation[0]["parent_objgen"]
+        == imported_target_annotation[0]["page_objgen"]
+    )
+
+    service.undo_page_insertion(target_path, mutation.receipt)
+    assert service.snapshot_document_structure(target_path) == before_snapshot
+
+    source_path.unlink()
+    service.redo_page_insertion(target_path, mutation.receipt)
+    redone_snapshot = service.snapshot_document_structure(target_path)
+    assert redone_snapshot.pages[2] == before_snapshot.pages[1]
+    redone_target_annotation = annotation_details(target_path, page_index=2)
+    assert redone_target_annotation == imported_target_annotation
+
+
+def test_insert_pages_from_pdf_annotation_copy_failure_preserves_working_copy_sha(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target_path = create_blank_pdf(tmp_path / "target-annot-copy-fail.pdf", 1)
+    source_path = create_supported_annotation_source_pdf(
+        tmp_path / "source-annot-copy-fail.pdf",
+        subtype="/Square",
+        include_parent=True,
+        direct_annots=False,
+        indirect_annotation=True,
+    )
+    service = PdfPageMutationService()
+    target_sha_before = file_sha256(target_path)
+    source_sha_before = file_sha256(source_path)
+
+    def fail_copy(*_args: object, **_kwargs: object) -> object:
+        raise PdfPageMutationError("注釈オブジェクトのコピーに失敗しました")
+
+    monkeypatch.setattr(service, "_copy_single_imported_annotation", fail_copy)
+
+    with pytest.raises(PdfPageMutationError, match="注釈オブジェクトのコピーに失敗しました"):
+        service.insert_pages_from_pdf(target_path, source_path, (0,), 1)
+
+    assert file_sha256(target_path) == target_sha_before
+    assert file_sha256(source_path) == source_sha_before
+    assert list(target_path.parent.glob(".target-annot-copy-fail.insert-*.pdf")) == []
+
+
+def test_insert_pages_from_pdf_preserves_mixed_annotation_pages_across_redo(
+    tmp_path: Path,
+) -> None:
+    target_path = create_simple_text_pdf(tmp_path / "target-mixed-annot.pdf", ["A", "B"])
+    source_path = create_mixed_annotation_source_pdf(tmp_path / "source-mixed-annot.pdf")
+    service = PdfPageMutationService()
+    source_sha_before = file_sha256(source_path)
+
+    mutation = service.insert_pages_from_pdf(target_path, source_path, (0, 1), 1)
+
+    assert extract_pdfium_text(target_path) == "A Annotated Plain B"
+    assert len(annotation_details(target_path, page_index=1)) == 1
+    assert annotation_details(target_path, page_index=2) == ()
+    imported_annotation = annotation_details(target_path, page_index=1)
+
+    service.undo_page_insertion(target_path, mutation.receipt)
+    assert extract_pdfium_text(target_path) == "A B"
+
+    source_path.unlink()
+    service.redo_page_insertion(target_path, mutation.receipt)
+    assert extract_pdfium_text(target_path) == "A Annotated Plain B"
+    assert annotation_details(target_path, page_index=1) == imported_annotation
+    assert annotation_details(target_path, page_index=2) == ()
+    assert (
+        file_sha256(mutation.receipt.source_snapshot_path)
+        == mutation.receipt.source_snapshot_sha256
+    )
+    assert source_sha_before != file_sha256(target_path)
 
 
 def test_insert_pages_from_pdf_executes_undoes_and_redoes_exact_order(tmp_path: Path) -> None:
