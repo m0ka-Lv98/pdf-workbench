@@ -45,6 +45,33 @@ def _inverse_permutation(order: tuple[int, ...]) -> tuple[int, ...]:
     return tuple(inverse)
 
 
+def _require_int_tuple(
+    values: Sequence[object],
+    *,
+    label: str,
+) -> tuple[int, ...]:
+    return tuple(_require_int(value, label=label) for value in values)
+
+
+def _validate_permutation(
+    values: Sequence[object],
+    *,
+    label: str,
+    page_count: int,
+) -> tuple[int, ...]:
+    permutation = _require_int_tuple(values, label=label)
+    if len(permutation) != page_count:
+        raise ValueError(f"{label} length must match page_count")
+    seen: set[int] = set()
+    for value in permutation:
+        if not 0 <= value < page_count:
+            raise ValueError(f"{label} must stay within the page range")
+        if value in seen:
+            raise ValueError(f"{label} must be a valid permutation")
+        seen.add(value)
+    return permutation
+
+
 @dataclass(frozen=True, slots=True)
 class PageReorderPlan:
     page_count: int
@@ -66,22 +93,22 @@ class PageReorderPlan:
         insertion_slot = _require_int(self.insertion_slot, label="insertion_slot")
         if not 0 <= insertion_slot <= page_count:
             raise ValueError("insertion_slot must stay within 0..page_count")
-        if len(self.target_order) != page_count:
-            raise ValueError("target_order length must match page_count")
-        if len(self.old_to_new) != page_count:
-            raise ValueError("old_to_new length must match page_count")
-        if len(self.new_to_old) != page_count:
-            raise ValueError("new_to_old length must match page_count")
-
-        expected_identity = tuple(range(page_count))
-        expected_set = set(expected_identity)
-        if set(self.target_order) != expected_set or len(set(self.target_order)) != page_count:
-            raise ValueError("target_order must be a valid permutation")
-        if set(self.new_to_old) != expected_set or len(set(self.new_to_old)) != page_count:
-            raise ValueError("new_to_old must be a valid permutation")
-        if set(self.old_to_new) != expected_set or len(set(self.old_to_new)) != page_count:
-            raise ValueError("old_to_new must be a valid permutation")
-        if tuple(self.target_order) != tuple(self.new_to_old):
+        target_order = _validate_permutation(
+            self.target_order,
+            label="target_order",
+            page_count=page_count,
+        )
+        old_to_new = _validate_permutation(
+            self.old_to_new,
+            label="old_to_new",
+            page_count=page_count,
+        )
+        new_to_old = _validate_permutation(
+            self.new_to_old,
+            label="new_to_old",
+            page_count=page_count,
+        )
+        if target_order != new_to_old:
             raise ValueError("target_order and new_to_old must match")
 
         selected_set = set(source_page_indexes)
@@ -94,22 +121,31 @@ class PageReorderPlan:
         expected_target_order = (
             survivors[:adjusted_slot] + source_page_indexes + survivors[adjusted_slot:]
         )
-        if tuple(self.target_order) != expected_target_order:
+        if target_order != expected_target_order:
             raise ValueError("target_order does not match the requested page move")
         expected_old_to_new = _inverse_permutation(expected_target_order)
-        if tuple(self.old_to_new) != expected_old_to_new:
+        if old_to_new != expected_old_to_new:
             raise ValueError("old_to_new does not match target_order")
 
-        moved_page_indexes_after = tuple(
-            _require_int(value, label="moved_page_indexes_after")
-            for value in self.moved_page_indexes_after
+        moved_page_indexes_after = _require_int_tuple(
+            self.moved_page_indexes_after,
+            label="moved_page_indexes_after",
         )
-        if moved_page_indexes_after != tuple(
+        expected_moved_page_indexes_after = tuple(
             range(adjusted_slot, adjusted_slot + len(source_page_indexes))
-        ):
+        )
+        if moved_page_indexes_after != expected_moved_page_indexes_after:
             raise ValueError("moved_page_indexes_after does not match the expected moved block")
-        if tuple(self.target_order) == expected_identity:
+        if target_order == tuple(range(page_count)):
             raise PageReorderNoOpError("page reorder is a no-op")
+
+        object.__setattr__(self, "page_count", page_count)
+        object.__setattr__(self, "source_page_indexes", source_page_indexes)
+        object.__setattr__(self, "insertion_slot", insertion_slot)
+        object.__setattr__(self, "target_order", target_order)
+        object.__setattr__(self, "old_to_new", old_to_new)
+        object.__setattr__(self, "new_to_old", new_to_old)
+        object.__setattr__(self, "moved_page_indexes_after", moved_page_indexes_after)
 
 
 def build_page_reorder_plan(

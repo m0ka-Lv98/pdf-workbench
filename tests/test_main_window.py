@@ -2064,6 +2064,47 @@ def test_main_window_reorder_requests_are_blocked_while_saving_or_mutating(
     qtbot.waitUntil(lambda: not window._render_service._thread.isRunning())
 
 
+def test_main_window_ignores_stale_reorder_request_when_selection_no_longer_matches(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    window = create_real_main_window(qtbot, tmp_path)
+    document_path = create_blank_pdf(tmp_path / "reorder-stale.pdf", 5)
+    window.open_document(document_path)
+    qtbot.waitUntil(lambda: window._documents[0].view.page_count == 5)
+    document = window._documents[0]
+    document.view._page_organizer.set_selected_page_indexes((1, 3), current_index=3)
+    calls: list[str] = []
+    reported: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        window,
+        "execute_document_command",
+        lambda command: calls.append(command.description) or True,
+    )
+    monkeypatch.setattr(
+        window,
+        "_report_error",
+        lambda title, message: reported.append((title, message)),
+    )
+
+    document.view._page_organizer.pages_reorder_requested.emit((1, 2), 5)
+
+    assert calls == []
+    assert reported == []
+    assert document.command_history.can_undo is False
+    assert document.command_history.is_dirty is False
+    assert document.session.is_modified is False
+
+    window.close()
+    qtbot.waitUntil(lambda: not window._render_service._thread.isRunning())
+
+
 def test_main_window_delete_menu_action_save_marks_clean_and_undo_restores_dirty(
     monkeypatch: pytest.MonkeyPatch,
     qtbot: QtBot,

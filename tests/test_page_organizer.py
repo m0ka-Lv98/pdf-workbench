@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 import pytest
-from PySide6.QtCore import QMimeData, QPoint, QPointF, Qt
-from PySide6.QtGui import QImage
+from PySide6.QtCore import QEvent, QMimeData, QPoint, QPointF, Qt
+from PySide6.QtGui import QImage, QMouseEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QLabel, QListView, QWidget
+from PySide6.QtWidgets import QApplication, QLabel, QListView, QWidget
 from pytestqt.qtbot import QtBot
 
 from pdf_workbench.services.page_coordinates import PageMetadata
 from pdf_workbench.services.pdf_renderer import DocumentRevision, RenderCacheKey
-from pdf_workbench.ui.widgets.page_organizer import PageOrganizer
+from pdf_workbench.ui.widgets.page_organizer import PageOrganizer, PageOrganizerListView
 
 
 class _FakeDropEvent:
@@ -98,6 +98,14 @@ def _reorder_mime(rows: tuple[int, ...]) -> QMimeData:
     return mime_data
 
 
+def _custom_mime(payload: bytes) -> QMimeData:
+    from pdf_workbench.ui.widgets import page_organizer as organizer_module
+
+    mime_data = QMimeData()
+    mime_data.setData(organizer_module._REORDER_MIME, payload)
+    return mime_data
+
+
 def test_page_organizer_exposes_expected_object_names(qtbot: QtBot) -> None:
     organizer = PageOrganizer()
     _show_organizer(qtbot, organizer)
@@ -121,6 +129,23 @@ def test_page_organizer_initializes_row_count_display_text_and_selection(qtbot: 
     assert organizer.current_page_index == 0
     assert organizer.selected_page_indexes == (0,)
     assert organizer.list_view.currentIndex().row() == 0
+
+
+def test_page_organizer_model_flags_enable_drag_only_for_valid_rows(qtbot: QtBot) -> None:
+    organizer = PageOrganizer()
+    _show_organizer(qtbot, organizer)
+    organizer.set_document(_metadata(4))
+    model = organizer.list_view.model()
+    valid_index = model.index(0, 0)
+    invalid_index = model.index(-1, -1)
+
+    valid_flags = model.flags(valid_index)
+    invalid_flags = model.flags(invalid_index)
+
+    assert valid_flags & Qt.ItemFlag.ItemIsEnabled
+    assert valid_flags & Qt.ItemFlag.ItemIsSelectable
+    assert valid_flags & Qt.ItemFlag.ItemIsDragEnabled
+    assert not (invalid_flags & Qt.ItemFlag.ItemIsDragEnabled)
 
 
 def test_page_organizer_clear_resets_selection_cache_and_rows(
@@ -426,7 +451,7 @@ def test_page_organizer_drop_emits_sorted_reorder_request_without_reordering_mod
 
     event = _FakeDropEvent(
         source=organizer.list_view,
-        mime_data=_reorder_mime((4, 1, 3)),
+        mime_data=_reorder_mime((1, 3, 4)),
         point=_row_upper_point(organizer, 5),
     )
 
@@ -508,6 +533,66 @@ def test_page_organizer_start_drag_preserves_multi_selection_and_respects_guards
     assert exec_calls == [Qt.DropAction.MoveAction]
 
 
+def test_page_organizer_mouse_drag_path_calls_start_drag_with_move_action(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+) -> None:
+    from pdf_workbench.ui.widgets import page_organizer as organizer_module
+
+    organizer = PageOrganizer()
+    _show_organizer(qtbot, organizer)
+    organizer.set_document(_metadata(6))
+    organizer.set_reordering_enabled(True)
+    organizer.set_selected_page_indexes((1, 3, 4), current_index=4)
+
+    start_drag_calls: list[Qt.DropAction] = []
+    exec_calls: list[Qt.DropAction] = []
+    original_start_drag = PageOrganizerListView.startDrag
+
+    def wrapped_start_drag(self: PageOrganizerListView, supported_actions: Qt.DropAction) -> None:
+        start_drag_calls.append(supported_actions)
+        original_start_drag(self, supported_actions)
+
+    monkeypatch.setattr(
+        organizer_module.QDrag,
+        "exec",
+        lambda self, action: exec_calls.append(action) or action,
+    )
+    monkeypatch.setattr(PageOrganizerListView, "startDrag", wrapped_start_drag)
+
+    start_point = _row_center(organizer, 4)
+    end_point = QPoint(
+        start_point.x() + QApplication.startDragDistance() + 8,
+        start_point.y(),
+    )
+
+    QTest.mousePress(
+        organizer.list_view.viewport(),
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+        start_point,
+    )
+    move_event = QMouseEvent(
+        QEvent.Type.MouseMove,
+        QPointF(end_point),
+        QPointF(organizer.list_view.viewport().mapToGlobal(end_point)),
+        Qt.MouseButton.NoButton,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    QApplication.sendEvent(organizer.list_view.viewport(), move_event)
+    QTest.mouseRelease(
+        organizer.list_view.viewport(),
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+        end_point,
+    )
+
+    assert start_drag_calls
+    assert exec_calls == [Qt.DropAction.MoveAction]
+    assert organizer.selected_page_indexes == (1, 3, 4)
+
+
 def test_page_organizer_large_document_drag_does_not_expand_thumbnail_requests(
     monkeypatch: pytest.MonkeyPatch,
     qtbot: QtBot,
@@ -544,3 +629,76 @@ def test_page_organizer_large_document_drag_does_not_expand_thumbnail_requests(
     assert min(visible_requests[-1]) >= 496
     assert max(visible_requests[-1]) <= 504
     assert organizer.expected_key_count == 0
+
+
+@pytest.mark.parametrize(
+    ("mime_data_factory", "source"),
+    [
+        (lambda: _custom_mime(b"-1,2"), "self"),
+        (lambda: _custom_mime(b"6"), "self"),
+        (lambda: _custom_mime(b"7"), "self"),
+        (lambda: _custom_mime(b"1,,2"), "self"),
+        (lambda: _custom_mime("1,\u3042".encode("utf-8")), "self"),
+        (lambda: _custom_mime(b""), "self"),
+        (lambda: _custom_mime(b"1,1,2"), "self"),
+        (QMimeData, "self"),
+        (lambda: _reorder_mime((1, 2)), "foreign"),
+    ],
+)
+def test_page_organizer_invalid_drop_payloads_are_ignored_without_state_changes(
+    qtbot: QtBot,
+    mime_data_factory,
+    source: str,
+) -> None:
+    organizer = PageOrganizer()
+    _show_organizer(qtbot, organizer)
+    organizer.set_document(_metadata(6))
+    organizer.set_reordering_enabled(True)
+    organizer.set_selected_page_indexes((1, 3, 4), current_index=4)
+    captured: list[tuple[tuple[int, ...], int]] = []
+    organizer.pages_reorder_requested.connect(
+        lambda page_indexes, insertion_slot: captured.append((page_indexes, insertion_slot))
+    )
+    before_order = tuple(organizer.page_display_text(index) for index in range(organizer.row_count))
+    before_selection = organizer.selected_page_indexes
+    before_current_row = organizer.list_view.currentIndex().row()
+
+    event = _FakeDropEvent(
+        source=organizer.list_view if source == "self" else object(),
+        mime_data=mime_data_factory(),
+        point=_row_upper_point(organizer, 5),
+    )
+
+    organizer.list_view.dropEvent(event)  # type: ignore[arg-type]
+
+    assert captured == []
+    assert (
+        tuple(organizer.page_display_text(index) for index in range(organizer.row_count))
+        == before_order
+    )
+    assert organizer.selected_page_indexes == before_selection
+    assert organizer.list_view.currentIndex().row() == before_current_row
+
+
+def test_page_organizer_rejects_stale_payload_after_model_reset(qtbot: QtBot) -> None:
+    organizer = PageOrganizer()
+    _show_organizer(qtbot, organizer)
+    organizer.set_document(_metadata(6))
+    organizer.set_reordering_enabled(True)
+    organizer.list_view._drag_source_rows = (1, 3, 4)
+    organizer.set_document(_metadata(3))
+    captured: list[tuple[tuple[int, ...], int]] = []
+    organizer.pages_reorder_requested.connect(
+        lambda page_indexes, insertion_slot: captured.append((page_indexes, insertion_slot))
+    )
+
+    event = _FakeDropEvent(
+        source=organizer.list_view,
+        mime_data=_reorder_mime((1, 3, 4)),
+        point=_row_upper_point(organizer, 2),
+    )
+
+    organizer.list_view.dropEvent(event)  # type: ignore[arg-type]
+
+    assert captured == []
+    assert event.ignored is True

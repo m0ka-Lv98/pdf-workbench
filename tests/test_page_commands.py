@@ -562,11 +562,17 @@ def test_reorder_pages_command_description_and_affected_pages(tmp_path: Path) ->
         build_page_reorder_plan(5, (1, 3), 5),
         PdfPageMutationService(),
     )
+    canonicalized_multi_command = ReorderPagesCommand(
+        document_path,
+        build_page_reorder_plan(5, (3, 1, 3, 1), 5),
+        PdfPageMutationService(),
+    )
 
     assert single_command.description == "1ページを移動"
     assert single_command.affected_pages == frozenset({1, 2, 3, 4})
     assert multi_command.description == "2ページを移動"
     assert multi_command.affected_pages == frozenset({1, 2, 3, 4})
+    assert canonicalized_multi_command.description == "2ページを移動"
 
 
 def test_reorder_pages_command_rejects_undo_and_redo_before_execute(tmp_path: Path) -> None:

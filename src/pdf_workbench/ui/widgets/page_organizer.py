@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections import OrderedDict
 from contextlib import suppress
 from dataclasses import dataclass
@@ -49,6 +50,7 @@ from pdf_workbench.services.pdf_renderer import RenderCacheKey
 
 _INVALID_MODEL_INDEX = QModelIndex()
 _REORDER_MIME = "application/x-pdf-workbench-page-reorder"
+logger = logging.getLogger(__name__)
 
 
 class _OrganizerRoles:
@@ -105,6 +107,15 @@ class PageOrganizerModel(QAbstractListModel):
         if role == _OrganizerRoles.CURRENT:
             return entry.current
         return None
+
+    def flags(
+        self,
+        index: QModelIndex | QPersistentModelIndex,
+    ) -> Qt.ItemFlag:
+        flags = super().flags(index)
+        if index.isValid():
+            flags |= Qt.ItemFlag.ItemIsDragEnabled
+        return flags
 
     def set_entries(self, metadata: tuple[PageMetadata, ...]) -> None:
         self.beginResetModel()
@@ -263,20 +274,30 @@ class PageOrganizerListView(QListView):
         if not self._accept_reorder_event(event):
             event.ignore()
             return
-        source_rows = self._decode_reorder_rows(event.mimeData())
-        if not source_rows:
-            event.ignore()
-            return
-        insertion_slot = self.insertion_slot_for_position(event.position().toPoint())
         model = self.model()
         if model is None:
             event.ignore()
             return
+        source_rows = self._decode_reorder_rows(
+            event.mimeData(),
+            row_count=model.rowCount(),
+        )
+        if not source_rows:
+            event.ignore()
+            return
+        insertion_slot = self.insertion_slot_for_position(event.position().toPoint())
         try:
             build_page_reorder_plan(model.rowCount(), source_rows, insertion_slot)
         except PageReorderNoOpError:
             event.setDropAction(Qt.DropAction.MoveAction)
             event.accept()
+            return
+        except (TypeError, ValueError):
+            event.ignore()
+            return
+        except Exception:
+            logger.exception("Unexpected page reorder drop failure")
+            event.ignore()
             return
         self.page_reorder_requested.emit(source_rows, insertion_slot)
         event.setDropAction(Qt.DropAction.MoveAction)
@@ -388,25 +409,60 @@ class PageOrganizerListView(QListView):
             or model is None
             or model.rowCount() <= 1
             or event.source() is not self
+            or not self._has_only_reorder_mime(event.mimeData())
         ):
             return False
-        source_rows = self._decode_reorder_rows(event.mimeData())
+        source_rows = self._decode_reorder_rows(
+            event.mimeData(),
+            row_count=model.rowCount(),
+        )
         return bool(source_rows) and len(source_rows) < model.rowCount()
 
-    def _decode_reorder_rows(self, mime_data: QMimeData | None) -> tuple[int, ...]:
-        if mime_data is None or not mime_data.hasFormat(_REORDER_MIME):
+    def _has_only_reorder_mime(self, mime_data: QMimeData | None) -> bool:
+        if mime_data is None:
+            return False
+        formats = tuple(mime_data.formats())
+        return formats == (_REORDER_MIME,)
+
+    def _decode_reorder_rows(
+        self,
+        mime_data: QMimeData | None,
+        *,
+        row_count: int | None = None,
+    ) -> tuple[int, ...]:
+        if not self._has_only_reorder_mime(mime_data) or mime_data is None:
             return ()
         raw_payload = bytes(mime_data.data(_REORDER_MIME).data())
-        payload = raw_payload.decode("ascii", errors="ignore").strip()
-        if not payload:
-            return self._drag_source_rows
         try:
-            rows = tuple(sorted({int(chunk) for chunk in payload.split(",") if chunk}))
+            payload = raw_payload.decode("ascii").strip()
+        except UnicodeDecodeError:
+            return ()
+        if not payload:
+            return ()
+        chunks = payload.split(",")
+        if not chunks or any(not chunk for chunk in chunks):
+            return ()
+        rows: list[int] = []
+        seen: set[int] = set()
+        try:
+            for chunk in chunks:
+                if not chunk.isascii() or not chunk.isdigit():
+                    return ()
+                row = int(chunk)
+                if row < 0 or row in seen:
+                    return ()
+                seen.add(row)
+                rows.append(row)
         except ValueError:
             return ()
-        if rows:
-            return rows
-        return self._drag_source_rows
+        if rows != sorted(rows):
+            return ()
+        if row_count is not None and any(row >= row_count for row in rows):
+            return ()
+        decoded_rows = tuple(rows)
+        if self._drag_source_rows and decoded_rows != self._drag_source_rows:
+            return ()
+        return decoded_rows
 
 
 class PageThumbnailDelegate(QStyledItemDelegate):

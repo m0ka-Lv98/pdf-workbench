@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC
@@ -56,7 +56,11 @@ from pdf_workbench.domain.page_commands import (
     ReorderPagesCommand,
     RotatePagesCommand,
 )
-from pdf_workbench.domain.page_reorder import PageReorderNoOpError, build_page_reorder_plan
+from pdf_workbench.domain.page_reorder import (
+    PageReorderNoOpError,
+    PageReorderPlan,
+    build_page_reorder_plan,
+)
 from pdf_workbench.services.pdf_page_mutation import PdfPageMutationService
 from pdf_workbench.services.pdf_renderer import PdfRenderService
 from pdf_workbench.services.pdf_save_service import (
@@ -616,24 +620,14 @@ class MainWindow(QMainWindow):
 
     def _reorder_selected_pages(
         self,
-        source_page_indexes: Sequence[object],
-        insertion_slot: object,
+        plan: object,
     ) -> None:
         document = self._current_document()
         if document is None or document.session.is_saving or document.mutation_in_progress:
             return
         if document.view.page_count <= 1:
             return
-        try:
-            plan = build_page_reorder_plan(
-                document.view.page_count,
-                source_page_indexes,
-                insertion_slot,
-            )
-        except PageReorderNoOpError:
-            return
-        except (TypeError, ValueError) as exc:
-            self._report_error("ページの並べ替えに失敗しました", str(exc))
+        if not isinstance(plan, PageReorderPlan):
             return
         self.execute_document_command(
             ReorderPagesCommand(
@@ -1230,12 +1224,22 @@ class MainWindow(QMainWindow):
         if current_document is None or current_document.view is not view:
             return
         if not isinstance(source_page_indexes, tuple):
-            self._report_error(
-                "ページの並べ替えに失敗しました",
-                "並べ替え要求の形式が不正です",
-            )
             return
-        self._reorder_selected_pages(source_page_indexes, insertion_slot)
+        try:
+            plan = build_page_reorder_plan(
+                current_document.view.page_count,
+                source_page_indexes,
+                insertion_slot,
+            )
+        except PageReorderNoOpError:
+            return
+        except (TypeError, ValueError) as exc:
+            self._report_error("ページの並べ替えに失敗しました", str(exc))
+            return
+        current_selection = tuple(sorted(set(current_document.view.selected_page_indexes)))
+        if plan.source_page_indexes != current_selection:
+            return
+        self._reorder_selected_pages(plan)
 
     def _on_source_status_changed(self, session_id: str, result: object) -> None:
         if not isinstance(result, SourceCheckResult):

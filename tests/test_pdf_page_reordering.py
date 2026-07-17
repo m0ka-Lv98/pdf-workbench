@@ -364,6 +364,88 @@ def test_page_reorder_plan_rejects_invalid_permutations_and_moved_block_metadata
         )
 
 
+def test_page_reorder_plan_direct_constructor_canonicalizes_source_indexes() -> None:
+    plan = PageReorderPlan(
+        page_count=5,
+        source_page_indexes=(3, 1, 3, 1),
+        insertion_slot=5,
+        target_order=(0, 2, 4, 1, 3),
+        old_to_new=(0, 3, 1, 4, 2),
+        new_to_old=(0, 2, 4, 1, 3),
+        moved_page_indexes_after=(3, 4),
+    )
+
+    assert plan.source_page_indexes == (1, 3)
+
+
+def test_page_reorder_plan_builder_matches_direct_constructor_canonical_object() -> None:
+    built = build_page_reorder_plan(5, (3, 1, 3, 1), 5)
+    direct = PageReorderPlan(
+        page_count=5,
+        source_page_indexes=(3, 1, 3, 1),
+        insertion_slot=5,
+        target_order=(0, 2, 4, 1, 3),
+        old_to_new=(0, 3, 1, 4, 2),
+        new_to_old=(0, 2, 4, 1, 3),
+        moved_page_indexes_after=(3, 4),
+    )
+
+    assert built == direct
+
+
+@pytest.mark.parametrize(
+    ("field_name", "field_value"),
+    [
+        ("target_order", (0, True, 1)),
+        ("old_to_new", (0, True, 1)),
+        ("target_order", (0, 1.0, 2)),
+        ("old_to_new", (0, "1", 2)),
+    ],
+)
+def test_page_reorder_plan_rejects_noncanonical_permutation_values(
+    field_name: str,
+    field_value: tuple[object, ...],
+) -> None:
+    kwargs: dict[str, object] = {
+        "page_count": 3,
+        "source_page_indexes": (1,),
+        "insertion_slot": 3,
+        "target_order": (0, 2, 1),
+        "old_to_new": (0, 2, 1),
+        "new_to_old": (0, 2, 1),
+        "moved_page_indexes_after": (2,),
+    }
+    kwargs[field_name] = field_value
+
+    with pytest.raises(TypeError, match="integer"):
+        PageReorderPlan(**kwargs)
+
+
+def test_page_reorder_receipt_direct_constructor_canonicalizes_source_indexes(
+    tmp_path: Path,
+) -> None:
+    working_copy = create_simple_text_pdf(
+        tmp_path / "receipt-canonical.pdf",
+        ["A", "B", "C", "D", "E"],
+    )
+    service = PdfPageMutationService()
+    before_snapshot = service._snapshot_document_structure(working_copy)
+    mutation = service.reorder_pages(working_copy, (1, 3), 5)
+
+    receipt = PageReorderReceipt(
+        original_page_count=5,
+        source_page_indexes=(3, 1, 3),
+        insertion_slot=5,
+        target_order=(0, 2, 4, 1, 3),
+        old_to_new=(0, 3, 1, 4, 2),
+        moved_page_indexes_after=(3, 4),
+        before_snapshot=before_snapshot,
+        after_snapshot=mutation.receipt.after_snapshot,
+    )
+
+    assert receipt.source_page_indexes == (1, 3)
+
+
 def test_reorder_pages_executes_undoes_and_redoes_with_exact_permutation(tmp_path: Path) -> None:
     source_path = create_simple_text_pdf(tmp_path / "source.pdf", ["A", "B", "C", "D", "E", "F"])
     working_copy = tmp_path / "working.pdf"

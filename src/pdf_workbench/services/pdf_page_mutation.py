@@ -291,14 +291,15 @@ class PageReorderReceipt:
             Integral,
         ):
             raise ValueError("original_page_count must be an integer")
-        if self.original_page_count <= 0:
+        original_page_count = int(self.original_page_count)
+        if original_page_count <= 0:
             raise ValueError("original_page_count must be positive")
-        if self.before_snapshot.page_count != self.original_page_count:
+        if self.before_snapshot.page_count != original_page_count:
             raise ValueError("before_snapshot page count must match original_page_count")
-        if self.after_snapshot.page_count != self.original_page_count:
+        if self.after_snapshot.page_count != original_page_count:
             raise ValueError("after_snapshot page count must match original_page_count")
         plan = PageReorderPlan(
-            page_count=self.original_page_count,
+            page_count=original_page_count,
             source_page_indexes=self.source_page_indexes,
             insertion_slot=self.insertion_slot,
             target_order=self.target_order,
@@ -306,6 +307,12 @@ class PageReorderReceipt:
             new_to_old=self.target_order,
             moved_page_indexes_after=self.moved_page_indexes_after,
         )
+        object.__setattr__(self, "original_page_count", original_page_count)
+        object.__setattr__(self, "source_page_indexes", plan.source_page_indexes)
+        object.__setattr__(self, "insertion_slot", plan.insertion_slot)
+        object.__setattr__(self, "target_order", plan.target_order)
+        object.__setattr__(self, "old_to_new", plan.old_to_new)
+        object.__setattr__(self, "moved_page_indexes_after", plan.moved_page_indexes_after)
         for new_page_index, original_page_index in enumerate(plan.target_order):
             if (
                 self.after_snapshot.pages[new_page_index]
