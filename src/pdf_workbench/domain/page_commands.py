@@ -374,9 +374,7 @@ class InsertPagesCommand(DocumentCommand):
     ) -> None:
         inserted_count = len(plan.source_page_indexes)
         self.description = (
-            "1ページを挿入"
-            if inserted_count == 1
-            else f"{inserted_count}ページを挿入"
+            "1ページを挿入" if inserted_count == 1 else f"{inserted_count}ページを挿入"
         )
         self.affected_pages = frozenset(plan.inserted_page_indexes_after)
         self._working_copy_path = working_copy_path.expanduser().resolve()

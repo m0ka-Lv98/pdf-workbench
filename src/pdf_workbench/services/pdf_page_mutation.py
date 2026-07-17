@@ -85,8 +85,12 @@ class PageRotationState:
 
 @dataclass(frozen=True, slots=True)
 class PageBoxState:
+    media_box_direct_present: bool
     media_box: tuple[float, float, float, float]
-    crop_box: tuple[float, float, float, float] | None
+    crop_box: tuple[float, float, float, float]
+    crop_box_direct_present: bool
+    crop_box_inherited: bool
+    crop_box_falls_back_to_media_box: bool
     trim_box: tuple[float, float, float, float] | None
     bleed_box: tuple[float, float, float, float] | None
     art_box: tuple[float, float, float, float] | None
@@ -113,6 +117,8 @@ class PdfAnnotationStructureSnapshot:
 class PdfPageStructureSnapshot:
     content_fingerprint: str
     boxes: PageBoxState
+    direct_resources_present: bool
+    resources_fingerprint: str
     direct_rotate_present: bool
     direct_rotate_value: int | None
     effective_rotation: int
@@ -348,10 +354,28 @@ class PageInsertionReceipt:
             raise ValueError("execute_transition old_page_count is invalid")
         if self.execute_transition.new_page_count != self.target_after_snapshot.page_count:
             raise ValueError("execute_transition new_page_count is invalid")
+        if self.execute_transition.cache_old_to_new != plan.target_old_to_new:
+            raise ValueError("execute_transition cache_old_to_new is invalid")
+        if self.execute_transition.current_page_old_to_new != plan.target_old_to_new:
+            raise ValueError("execute_transition current_page_old_to_new is invalid")
         if self.undo_transition.old_page_count != self.target_after_snapshot.page_count:
             raise ValueError("undo_transition old_page_count is invalid")
         if self.undo_transition.new_page_count != self.target_page_count_before:
             raise ValueError("undo_transition new_page_count is invalid")
+        expected_undo_mapping = tuple(
+            None
+            if page_index in set(plan.inserted_page_indexes_after)
+            else (
+                page_index
+                if page_index < plan.insertion_slot
+                else page_index - len(plan.source_page_indexes)
+            )
+            for page_index in range(self.target_after_snapshot.page_count)
+        )
+        if self.undo_transition.cache_old_to_new != expected_undo_mapping:
+            raise ValueError("undo_transition cache_old_to_new is invalid")
+        if self.undo_transition.current_page_old_to_new != expected_undo_mapping:
+            raise ValueError("undo_transition current_page_old_to_new is invalid")
         object.__setattr__(self, "target_page_count_before", int(self.target_page_count_before))
         object.__setattr__(self, "source_page_indexes", plan.source_page_indexes)
         object.__setattr__(self, "insertion_slot", plan.insertion_slot)
@@ -686,6 +710,9 @@ class PdfPageMutationService:
                 create_error="挿入元スナップショットPDFの作成に失敗しました",
                 fsync_error="挿入元スナップショットPDFの同期に失敗しました",
             )
+            source_snapshot_sha256 = self._sha256_file(source_snapshot_path)
+            if source_snapshot_sha256 != source_original_sha256:
+                raise PdfPageMutationError("挿入元スナップショットPDFの整合性検証に失敗しました")
             source_current_fingerprint = self._source_snapshot_fingerprint(resolved_source_path)
             source_current_sha256 = self._sha256_file(resolved_source_path)
             if (
@@ -694,12 +721,7 @@ class PdfPageMutationService:
             ):
                 raise PdfPageMutationError("挿入元PDFが読み取り中に変更されました")
 
-            source_snapshot_sha256 = self._sha256_file(source_snapshot_path)
             source_snapshot_page_count = self.read_page_count(source_snapshot_path)
-            self._validate_insert_source_snapshot_path(
-                source_snapshot_path,
-                expected_page_count=source_snapshot_page_count,
-            )
             normalized_source_page_indexes = tuple(
                 _require_strict_int(page_index, label="source_page_indexes")
                 for page_index in source_page_indexes
@@ -715,6 +737,11 @@ class PdfPageMutationService:
                 source_selection,
                 insertion_slot,
             )
+            self._validate_insert_source_snapshot_path(
+                source_snapshot_path,
+                expected_page_count=source_snapshot_page_count,
+                render_page_indexes=plan.source_page_indexes,
+            )
             source_selected_page_snapshots = self._snapshot_selected_source_pages(
                 source_snapshot_path,
                 plan.source_page_indexes,
@@ -727,6 +754,10 @@ class PdfPageMutationService:
             target_undo_snapshot_path = self._create_insert_undo_snapshot(
                 resolved_target_path,
                 expected_page_count=target_before_snapshot.page_count,
+                render_page_indexes=self._target_snapshot_validation_page_indexes(
+                    target_before_snapshot.page_count,
+                    plan.insertion_slot,
+                ),
             )
             target_undo_snapshot_sha256 = self._sha256_file(target_undo_snapshot_path)
 
@@ -751,6 +782,7 @@ class PdfPageMutationService:
 
             target_after_snapshot = self._validate_page_insertion_candidate(
                 candidate_path,
+                source_snapshot_path=source_snapshot_path,
                 target_before_snapshot=target_before_snapshot,
                 source_selected_page_snapshots=source_selected_page_snapshots,
                 plan=plan,
@@ -1529,9 +1561,22 @@ class PdfPageMutationService:
                 )
 
     def _page_box_state(self, page: pikepdf.Page) -> PageBoxState:
+        direct_media_box = page.obj.get("/MediaBox", None)
+        inherited_crop_box = (
+            None
+            if page.obj.get("/CropBox", None) is not None
+            else self._resolve_inherited_value(page.obj, "/CropBox")
+        )
+        effective_crop_box = page.obj.get("/CropBox", None) or inherited_crop_box or page.cropbox
         return PageBoxState(
+            media_box_direct_present=direct_media_box is not None,
             media_box=self._normalize_box(page.mediabox),
-            crop_box=self._optional_box(page.obj.get("/CropBox", None)),
+            crop_box=self._normalize_box(effective_crop_box),
+            crop_box_direct_present=page.obj.get("/CropBox", None) is not None,
+            crop_box_inherited=inherited_crop_box is not None,
+            crop_box_falls_back_to_media_box=(
+                page.obj.get("/CropBox", None) is None and inherited_crop_box is None
+            ),
             trim_box=self._optional_box(page.obj.get("/TrimBox", None)),
             bleed_box=self._optional_box(page.obj.get("/BleedBox", None)),
             art_box=self._optional_box(page.obj.get("/ArtBox", None)),
@@ -1548,6 +1593,25 @@ class PdfPageMutationService:
         if value is None:
             return None
         return self._normalize_box(value)
+
+    def _resolve_inherited_value(self, page_object: Any, key: str) -> object | None:
+        current: Any = page_object
+        visited: set[tuple[int, int]] = set()
+        key_object = NameObject(key)
+        while current is not None:
+            parent_ref = current.get("/Parent", None)
+            if parent_ref is None:
+                return None
+            parent = self._dereference(parent_ref)
+            objgen = getattr(parent, "objgen", None)
+            if objgen in visited:
+                raise PdfPageMutationError("ページツリー継承を解決できません")
+            if objgen is not None:
+                visited.add(objgen)
+            if key_object in parent:
+                return cast(object, parent[key_object])
+            current = parent
+        return None
 
     def _create_candidate_path(self, target_path: Path) -> Path:
         prefix = f".{target_path.stem}.mutation."
@@ -1606,6 +1670,7 @@ class PdfPageMutationService:
         target_path: Path,
         *,
         expected_page_count: int,
+        render_page_indexes: tuple[int, ...],
     ) -> Path:
         snapshot_path = self._create_named_snapshot_path(target_path, label="insert-undo")
         try:
@@ -1618,6 +1683,7 @@ class PdfPageMutationService:
             self._validate_insert_target_undo_snapshot_path(
                 snapshot_path,
                 expected_page_count=expected_page_count,
+                render_page_indexes=render_page_indexes,
             )
             return snapshot_path
         except Exception:
@@ -1808,6 +1874,7 @@ class PdfPageMutationService:
         self,
         path: Path,
         *,
+        source_snapshot_path: Path,
         target_before_snapshot: PdfDocumentStructureSnapshot,
         source_selected_page_snapshots: tuple[PdfPageStructureSnapshot, ...],
         plan: PageInsertionPlan,
@@ -1835,6 +1902,12 @@ class PdfPageMutationService:
             if imported_page != expected_page:
                 raise PdfPageMutationError("挿入ページの構造検証に失敗しました")
         self._render_pages(path, self._page_insertion_render_page_indexes(plan))
+        self._validate_inserted_page_render_equivalence(
+            source_path=source_snapshot_path,
+            source_page_indexes=plan.source_page_indexes,
+            imported_path=path,
+            imported_page_indexes=plan.inserted_page_indexes_after,
+        )
         return after_snapshot
 
     def _validate_undo_duplication_candidate(
@@ -1914,6 +1987,8 @@ class PdfPageMutationService:
         return PdfPageStructureSnapshot(
             content_fingerprint=self._contents_fingerprint(page.obj.get("/Contents", None)),
             boxes=self._page_box_state(page),
+            direct_resources_present=page.obj.get("/Resources", None) is not None,
+            resources_fingerprint=self._resources_fingerprint(page),
             direct_rotate_present=rotation_state.direct_rotate_present,
             direct_rotate_value=rotation_state.direct_rotate_value,
             effective_rotation=rotation_state.effective_rotation,
@@ -1988,6 +2063,12 @@ class PdfPageMutationService:
         if contents is None:
             return "none"
         return self._object_fingerprint(contents)
+
+    def _resources_fingerprint(self, page: pikepdf.Page) -> str:
+        resources = page.resources
+        if resources is None:
+            return "none"
+        return self._object_fingerprint(resources)
 
     def _appearance_fingerprint(self, annot: Any) -> str | None:
         appearance = annot.get("/AP", None)
@@ -2583,10 +2664,13 @@ class PdfPageMutationService:
     ) -> None:
         media_box = pikepdf.Array(list(snapshot.boxes.media_box))
         page.obj[NameObject("/MediaBox")] = media_box
-        self._set_optional_page_box(page.obj, "/CropBox", snapshot.boxes.crop_box)
+        page.obj[NameObject("/CropBox")] = pikepdf.Array(list(snapshot.boxes.crop_box))
         self._set_optional_page_box(page.obj, "/TrimBox", snapshot.boxes.trim_box)
         self._set_optional_page_box(page.obj, "/BleedBox", snapshot.boxes.bleed_box)
         self._set_optional_page_box(page.obj, "/ArtBox", snapshot.boxes.art_box)
+        resources = page.resources
+        if resources is not None:
+            page.obj[NameObject("/Resources")] = resources
         if snapshot.direct_rotate_present:
             if snapshot.direct_rotate_value is None:
                 raise PdfPageMutationError("挿入ページの回転情報が不正です")
@@ -2733,6 +2817,8 @@ class PdfPageMutationService:
         return PdfPageStructureSnapshot(
             content_fingerprint=page.content_fingerprint,
             boxes=page.boxes,
+            direct_resources_present=page.direct_resources_present,
+            resources_fingerprint=page.resources_fingerprint,
             direct_rotate_present=page.direct_rotate_present,
             direct_rotate_value=page.direct_rotate_value,
             effective_rotation=page.effective_rotation,
@@ -2874,7 +2960,19 @@ class PdfPageMutationService:
     ) -> PdfPageStructureSnapshot:
         return PdfPageStructureSnapshot(
             content_fingerprint=page.content_fingerprint,
-            boxes=page.boxes,
+            boxes=PageBoxState(
+                media_box_direct_present=True,
+                media_box=page.boxes.media_box,
+                crop_box=page.boxes.crop_box,
+                crop_box_direct_present=True,
+                crop_box_inherited=False,
+                crop_box_falls_back_to_media_box=False,
+                trim_box=page.boxes.trim_box,
+                bleed_box=page.boxes.bleed_box,
+                art_box=page.boxes.art_box,
+            ),
+            direct_resources_present=True,
+            resources_fingerprint=page.resources_fingerprint,
             direct_rotate_present=page.direct_rotate_present or page.effective_rotation != 0,
             direct_rotate_value=(
                 page.direct_rotate_value
@@ -2909,8 +3007,50 @@ class PdfPageMutationService:
             indexes.add(plan.target_old_to_new[plan.insertion_slot])
         return tuple(sorted(indexes))
 
+    def _target_snapshot_validation_page_indexes(
+        self,
+        page_count: int,
+        insertion_slot: int,
+    ) -> tuple[int, ...]:
+        indexes: set[int] = set()
+        if page_count <= 0:
+            return ()
+        indexes.add(0)
+        indexes.add(page_count - 1)
+        if insertion_slot > 0:
+            indexes.add(insertion_slot - 1)
+        if insertion_slot < page_count:
+            indexes.add(insertion_slot)
+        return tuple(sorted(indexes))
+
+    def _normalize_render_page_indexes(
+        self,
+        page_count: int,
+        page_indexes: tuple[int, ...],
+    ) -> tuple[int, ...]:
+        normalized = {page_index for page_index in page_indexes if 0 <= page_index < page_count}
+        return tuple(sorted(normalized))
+
     def _render_pages(self, path: Path, page_indexes: tuple[int, ...]) -> None:
         self._render_page_digests(path, page_indexes)
+
+    def _validate_inserted_page_render_equivalence(
+        self,
+        *,
+        source_path: Path,
+        source_page_indexes: tuple[int, ...],
+        imported_path: Path,
+        imported_page_indexes: tuple[int, ...],
+    ) -> None:
+        source_render = self._render_page_digests(source_path, source_page_indexes)
+        imported_render = self._render_page_digests(imported_path, imported_page_indexes)
+        for source_page_index, imported_page_index in zip(
+            source_page_indexes,
+            imported_page_indexes,
+            strict=True,
+        ):
+            if source_render[source_page_index] != imported_render[imported_page_index]:
+                raise PdfPageMutationError("挿入ページの描画検証に失敗しました")
 
     def _validate_page_deletion_candidate(
         self,
@@ -3068,6 +3208,7 @@ class PdfPageMutationService:
         self._validate_insert_source_snapshot_path(
             snapshot_path,
             expected_page_count=receipt.source_snapshot_page_count,
+            render_page_indexes=receipt.source_page_indexes,
         )
         snapshot = self._snapshot_selected_source_pages(snapshot_path, receipt.source_page_indexes)
         if snapshot != receipt.source_selected_page_snapshots:
@@ -3088,6 +3229,10 @@ class PdfPageMutationService:
         self._validate_insert_target_undo_snapshot_path(
             snapshot_path,
             expected_page_count=receipt.target_page_count_before,
+            render_page_indexes=self._target_snapshot_validation_page_indexes(
+                receipt.target_page_count_before,
+                receipt.insertion_slot,
+            ),
         )
         snapshot = self._snapshot_document_structure(snapshot_path)
         if snapshot != receipt.target_before_snapshot:
@@ -3162,10 +3307,14 @@ class PdfPageMutationService:
         path: Path,
         *,
         expected_page_count: int,
+        render_page_indexes: tuple[int, ...],
     ) -> None:
         try:
             self._validate_basic_candidate(path, expected_page_count=expected_page_count)
-            self._render_pages(path, tuple(range(expected_page_count)))
+            self._render_pages(
+                path,
+                self._normalize_render_page_indexes(expected_page_count, render_page_indexes),
+            )
         except PdfPageMutationError as exc:
             raise PdfPageMutationError("挿入元スナップショットPDFの検証に失敗しました") from exc
 
@@ -3174,10 +3323,14 @@ class PdfPageMutationService:
         path: Path,
         *,
         expected_page_count: int,
+        render_page_indexes: tuple[int, ...],
     ) -> None:
         try:
             self._validate_basic_candidate(path, expected_page_count=expected_page_count)
-            self._render_pages(path, tuple(range(expected_page_count)))
+            self._render_pages(
+                path,
+                self._normalize_render_page_indexes(expected_page_count, render_page_indexes),
+            )
         except PdfPageMutationError as exc:
             raise PdfPageMutationError("挿入前スナップショットPDFの検証に失敗しました") from exc
 
@@ -3190,7 +3343,13 @@ class PdfPageMutationService:
         snapshot = self._snapshot_document_structure(path)
         if snapshot != receipt.target_before_snapshot:
             raise PdfPageMutationError("ページ挿入の取り消し検証に失敗しました")
-        self._render_pages(path, tuple(range(receipt.target_page_count_before)))
+        self._render_pages(
+            path,
+            self._target_snapshot_validation_page_indexes(
+                receipt.target_page_count_before,
+                receipt.insertion_slot,
+            ),
+        )
 
     def _validate_redo_page_insertion_candidate(
         self,
@@ -3211,6 +3370,12 @@ class PdfPageMutationService:
             receipt.insertion_slot,
         )
         self._render_pages(path, self._page_insertion_render_page_indexes(plan))
+        self._validate_inserted_page_render_equivalence(
+            source_path=receipt.source_snapshot_path,
+            source_page_indexes=receipt.source_page_indexes,
+            imported_path=path,
+            imported_page_indexes=plan.inserted_page_indexes_after,
+        )
 
     def _render_page_digests(
         self,

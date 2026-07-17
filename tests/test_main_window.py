@@ -6,8 +6,10 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pikepdf
 import pypdfium2 as pdfium  # type: ignore[import-untyped]
@@ -74,7 +76,7 @@ from pdf_workbench.services.source_change_monitor import (
 )
 from pdf_workbench.ui.main_window import DocumentTab, MainWindow, RestoreSessionResult
 from pdf_workbench.ui.pdf_view import PdfView, PdfViewMutationSnapshot
-from pdf_workbench.ui.widgets.insert_pages_dialog import InsertPagesDialogResult
+from pdf_workbench.ui.widgets.insert_pages_dialog import InsertPagesDialog, InsertPagesDialogResult
 from pdf_workbench.ui.widgets.search_bar import SearchBar, SearchInputSurface
 
 
@@ -366,6 +368,453 @@ def test_main_window_insert_pages_builds_insert_command_from_ui_flow(
     assert command.description == "2ページを挿入"
     assert command.requires_document_reload is True
     assert command.mutates_working_copy is True
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
+def test_main_window_insertion_targets_follow_selection_or_current_page(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    selected_document = SimpleNamespace(
+        view=SimpleNamespace(selected_page_indexes=(3, 1, 3), page_index=2, page_count=8),
+    )
+    current_document = SimpleNamespace(
+        view=SimpleNamespace(selected_page_indexes=(), page_index=4, page_count=8),
+    )
+
+    selected_targets, selected_default = window._insertion_targets_for_document(selected_document)
+    current_targets, current_default = window._insertion_targets_for_document(current_document)
+
+    assert selected_targets == (
+        ("先頭", 0),
+        ("選択ページまたは現在ページの前", 1),
+        ("選択ページまたは現在ページの後", 4),
+        ("末尾", 8),
+    )
+    assert selected_default == 2
+    assert current_targets == (
+        ("先頭", 0),
+        ("選択ページまたは現在ページの前", 4),
+        ("選択ページまたは現在ページの後", 5),
+        ("末尾", 8),
+    )
+    assert current_default == 2
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
+def test_main_window_resolve_insert_pages_document_rejects_stale_context(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    target_path = create_simple_text_pdf(tmp_path / "insert-context-target.pdf", ["A", "B"])
+    window.open_document(target_path)
+    qtbot.waitUntil(lambda: window._current_document() is not None)
+    document = window._current_document()
+    assert document is not None
+
+    context = window._capture_insert_pages_context(document)
+
+    assert window._resolve_insert_pages_document(context) is document
+    assert window._resolve_insert_pages_document(replace(context, session_id="other")) is None
+    assert (
+        window._resolve_insert_pages_document(
+            replace(context, working_copy_path=context.working_copy_path.with_name("other.pdf"))
+        )
+        is None
+    )
+    assert (
+        window._resolve_insert_pages_document(
+            replace(context, source_path=context.source_path.with_name("other-source.pdf"))
+        )
+        is None
+    )
+    assert window._resolve_insert_pages_document(replace(context, page_count=99)) is None
+
+    document.session.is_saving = True
+    assert window._resolve_insert_pages_document(context) is None
+    document.session.is_saving = False
+    document.mutation_in_progress = True
+    assert window._resolve_insert_pages_document(context) is None
+    document.mutation_in_progress = False
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
+def test_main_window_choose_insert_source_path_returns_resolved_path(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    window = MainWindow(create_settings(tmp_path))
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    target_path = create_simple_text_pdf(tmp_path / "insert-source-target.pdf", ["A"])
+    (tmp_path / "nested").mkdir()
+    source_path = create_simple_text_pdf(tmp_path / "nested" / "insert-source.pdf", ["X"])
+    window.open_document(target_path)
+    qtbot.waitUntil(lambda: window._current_document() is not None)
+    document = window._current_document()
+    assert document is not None
+
+    monkeypatch.setattr(
+        QFileDialog,
+        "getOpenFileName",
+        lambda *args, **kwargs: (str(source_path), "PDF files (*.pdf)"),
+    )
+
+    assert window._choose_insert_source_path(document) == source_path.resolve()
+
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *args, **kwargs: ("", ""))
+    assert window._choose_insert_source_path(document) is None
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
+def test_main_window_choose_insert_pages_options_returns_dialog_result(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    window = MainWindow(create_settings(tmp_path))
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    target_path = create_simple_text_pdf(tmp_path / "insert-options-target.pdf", ["A", "B"])
+    source_path = create_simple_text_pdf(tmp_path / "insert-options-source.pdf", ["X", "Y"])
+    window.open_document(target_path)
+    qtbot.waitUntil(lambda: window._current_document() is not None)
+    document = window._current_document()
+    assert document is not None
+    chosen = InsertPagesDialogResult(
+        page_selection=SourcePageSelection(2, (0, 1)),
+        insertion_slot=1,
+    )
+
+    def fake_exec(self: InsertPagesDialog) -> int:
+        self._dialog_result = chosen
+        return self.DialogCode.Accepted
+
+    monkeypatch.setattr(InsertPagesDialog, "exec", fake_exec)
+
+    result = window._choose_insert_pages_options(
+        document,
+        source_path=source_path,
+        source_page_count=2,
+    )
+
+    assert result == chosen
+
+    monkeypatch.setattr(
+        InsertPagesDialog,
+        "exec",
+        lambda self: self.DialogCode.Rejected,
+    )
+    assert (
+        window._choose_insert_pages_options(
+            document,
+            source_path=source_path,
+            source_page_count=2,
+        )
+        is None
+    )
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
+def test_main_window_insert_pages_reports_source_inspection_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    target_path = create_simple_text_pdf(tmp_path / "insert-error-target.pdf", ["A", "B"])
+    source_path = create_simple_text_pdf(tmp_path / "insert-error-source.pdf", ["X"])
+    window.open_document(target_path)
+    qtbot.waitUntil(lambda: window._current_document() is not None)
+    document = window._current_document()
+    assert document is not None
+    before_sha = file_sha256(document.session.document_path)
+    reported: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(window, "_choose_insert_source_path", lambda _document: source_path)
+    monkeypatch.setattr(
+        window._page_mutation_service,
+        "read_page_count",
+        lambda _path: (_ for _ in ()).throw(PdfPageMutationError("source invalid")),
+    )
+    monkeypatch.setattr(
+        window,
+        "_report_error",
+        lambda title, message: reported.append((title, message)),
+    )
+
+    window._insert_pages_from_pdf()
+
+    assert reported == [("ページ挿入に失敗しました", "source invalid")]
+    assert file_sha256(document.session.document_path) == before_sha
+    assert document.command_history.can_undo is False
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
+@pytest.mark.parametrize(
+    ("is_saving", "mutation_in_progress"),
+    [(True, False), (False, True)],
+)
+def test_main_window_insert_pages_returns_early_when_document_is_busy(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+    is_saving: bool,
+    mutation_in_progress: bool,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    window = MainWindow(create_settings(tmp_path))
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    target_path = create_simple_text_pdf(tmp_path / "insert-busy-target.pdf", ["A"])
+    window.open_document(target_path)
+    qtbot.waitUntil(lambda: window._current_document() is not None)
+    document = window._current_document()
+    assert document is not None
+    document.session.is_saving = is_saving
+    document.mutation_in_progress = mutation_in_progress
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        window._page_mutation_service,
+        "snapshot_document_structure",
+        lambda _path: calls.append("snapshot"),
+    )
+
+    window._insert_pages_from_pdf()
+
+    assert calls == []
+    document.mutation_in_progress = False
+    document.session.is_saving = False
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
+def test_main_window_insert_pages_reports_snapshot_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    window = MainWindow(create_settings(tmp_path))
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    target_path = create_simple_text_pdf(tmp_path / "insert-snapshot-target.pdf", ["A"])
+    window.open_document(target_path)
+    qtbot.waitUntil(lambda: window._current_document() is not None)
+    reported: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(
+        window._page_mutation_service,
+        "snapshot_document_structure",
+        lambda _path: (_ for _ in ()).throw(PdfPageMutationError("snapshot failed")),
+    )
+    monkeypatch.setattr(
+        window,
+        "_report_error",
+        lambda title, message: reported.append((title, message)),
+    )
+
+    window._insert_pages_from_pdf()
+
+    assert reported == [("ページ挿入に失敗しました", "snapshot failed")]
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
+def test_main_window_insert_pages_returns_when_context_turns_stale_before_options(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    window = MainWindow(create_settings(tmp_path))
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    target_path = create_simple_text_pdf(tmp_path / "insert-stale-before-options.pdf", ["A", "B"])
+    source_path = create_simple_text_pdf(tmp_path / "insert-stale-before-options-source.pdf", ["X"])
+    window.open_document(target_path)
+    qtbot.waitUntil(lambda: window._current_document() is not None)
+    executed: list[DocumentCommand] = []
+    source_choices: list[str] = []
+
+    monkeypatch.setattr(window, "_choose_insert_source_path", lambda _document: source_path)
+    monkeypatch.setattr(
+        window._page_mutation_service,
+        "read_page_count",
+        lambda _path: source_choices.append("count") or 1,
+    )
+    monkeypatch.setattr(
+        window,
+        "_resolve_insert_pages_document",
+        lambda _context: None,
+    )
+    monkeypatch.setattr(
+        window,
+        "_choose_insert_pages_options",
+        lambda *args, **kwargs: pytest.fail("options dialog should not open"),
+    )
+    monkeypatch.setattr(
+        window,
+        "execute_document_command",
+        lambda command: executed.append(command) or True,
+    )
+
+    window._insert_pages_from_pdf()
+
+    assert source_choices == ["count"]
+    assert executed == []
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
+def test_main_window_insert_pages_returns_when_options_are_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    window = MainWindow(create_settings(tmp_path))
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    target_path = create_simple_text_pdf(tmp_path / "insert-options-cancel-target.pdf", ["A", "B"])
+    source_path = create_simple_text_pdf(tmp_path / "insert-options-cancel-source.pdf", ["X"])
+    window.open_document(target_path)
+    qtbot.waitUntil(lambda: window._current_document() is not None)
+    executed: list[DocumentCommand] = []
+
+    monkeypatch.setattr(window, "_choose_insert_source_path", lambda _document: source_path)
+    monkeypatch.setattr(window._page_mutation_service, "read_page_count", lambda _path: 1)
+    monkeypatch.setattr(window, "_choose_insert_pages_options", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        window,
+        "execute_document_command",
+        lambda command: executed.append(command) or True,
+    )
+
+    window._insert_pages_from_pdf()
+
+    assert executed == []
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
+def test_main_window_insert_pages_returns_when_context_turns_stale_after_options(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    window = MainWindow(create_settings(tmp_path))
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    target_path = create_simple_text_pdf(tmp_path / "insert-stale-after-options.pdf", ["A", "B"])
+    source_path = create_simple_text_pdf(tmp_path / "insert-stale-after-options-source.pdf", ["X"])
+    window.open_document(target_path)
+    qtbot.waitUntil(lambda: window._current_document() is not None)
+    executed: list[DocumentCommand] = []
+    result = InsertPagesDialogResult(page_selection=SourcePageSelection(1, (0,)), insertion_slot=1)
+    resolve_calls = {"count": 0}
+
+    monkeypatch.setattr(window, "_choose_insert_source_path", lambda _document: source_path)
+    monkeypatch.setattr(window._page_mutation_service, "read_page_count", lambda _path: 1)
+    monkeypatch.setattr(window, "_choose_insert_pages_options", lambda *args, **kwargs: result)
+
+    def resolve_document(_context: object) -> DocumentTab | None:
+        resolve_calls["count"] += 1
+        return window._current_document() if resolve_calls["count"] == 1 else None
+
+    monkeypatch.setattr(window, "_resolve_insert_pages_document", resolve_document)
+    monkeypatch.setattr(
+        window,
+        "execute_document_command",
+        lambda command: executed.append(command) or True,
+    )
+
+    window._insert_pages_from_pdf()
+
+    assert resolve_calls["count"] == 2
+    assert executed == []
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
+def test_main_window_insert_pages_reports_invalid_plan(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    window = MainWindow(create_settings(tmp_path))
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    target_path = create_simple_text_pdf(tmp_path / "insert-invalid-plan-target.pdf", ["A", "B"])
+    source_path = create_simple_text_pdf(tmp_path / "insert-invalid-plan-source.pdf", ["X"])
+    window.open_document(target_path)
+    qtbot.waitUntil(lambda: window._current_document() is not None)
+    reported: list[tuple[str, str]] = []
+    executed: list[DocumentCommand] = []
+    bad_result = InsertPagesDialogResult(
+        page_selection=SourcePageSelection(1, (0,)),
+        insertion_slot=5,
+    )
+
+    monkeypatch.setattr(window, "_choose_insert_source_path", lambda _document: source_path)
+    monkeypatch.setattr(window._page_mutation_service, "read_page_count", lambda _path: 1)
+    monkeypatch.setattr(
+        window,
+        "_choose_insert_pages_options",
+        lambda *args, **kwargs: bad_result,
+    )
+    monkeypatch.setattr(
+        window,
+        "_report_error",
+        lambda title, message: reported.append((title, message)),
+    )
+    monkeypatch.setattr(
+        window,
+        "execute_document_command",
+        lambda command: executed.append(command) or True,
+    )
+
+    window._insert_pages_from_pdf()
+
+    assert reported == [
+        ("ページ挿入に失敗しました", "insertion_slot must stay within 0..target_page_count")
+    ]
+    assert executed == []
     window.close()
     qtbot.waitUntil(lambda: not window.isVisible())
 

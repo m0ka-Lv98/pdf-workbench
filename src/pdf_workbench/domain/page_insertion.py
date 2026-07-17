@@ -29,8 +29,7 @@ class SourcePageSelection:
         if source_page_count <= 0:
             raise ValueError("source_page_count must be positive")
         page_indexes = tuple(
-            _require_int(value, label="page_indexes")
-            for value in self.page_indexes
+            _require_int(value, label="page_indexes") for value in self.page_indexes
         )
         if not page_indexes:
             raise ValueError("page_indexes must not be empty")
@@ -144,8 +143,7 @@ class PageInsertionPlan:
                 "inserted_page_indexes_after does not match the requested insertion slot",
             )
         target_old_to_new = tuple(
-            _require_int(value, label="target_old_to_new")
-            for value in self.target_old_to_new
+            _require_int(value, label="target_old_to_new") for value in self.target_old_to_new
         )
         if len(target_old_to_new) != target_page_count:
             raise ValueError("target_old_to_new length must match target_page_count")

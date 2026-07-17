@@ -4,11 +4,13 @@ from pathlib import Path
 
 import pytest
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QFrame, QWidget
+from PySide6.QtWidgets import QFrame, QLabel, QMessageBox, QWidget
 from pytestqt.qtbot import QtBot
 
+from pdf_workbench.domain.page_insertion import SourcePageSelection
 from pdf_workbench.ui.widgets.document_toolbar import DocumentToolbar, ToolbarState, button_has_icon
 from pdf_workbench.ui.widgets.empty_state import EmptyState
+from pdf_workbench.ui.widgets.insert_pages_dialog import InsertPagesDialog
 
 
 def test_document_toolbar_updates_state_and_emits_signals(qtbot: QtBot) -> None:
@@ -230,6 +232,124 @@ def test_empty_state_shows_recent_files_and_emits_selection(qtbot: QtBot, tmp_pa
         is not None
     )
     assert empty_state.findChild(type(empty_state.open_button), "openPdfButton") is not None
+
+
+def test_insert_pages_dialog_accepts_valid_selection(qtbot: QtBot, tmp_path: Path) -> None:
+    dialog = InsertPagesDialog(
+        tmp_path / "source.pdf",
+        5,
+        (("先頭", 0), ("末尾", 3)),
+        default_index=1,
+    )
+    qtbot.addWidget(dialog)
+
+    assert dialog.page_range_edit.objectName() == "insertSourcePageRangeEdit"
+    assert dialog.insertion_combo.objectName() == "insertPositionCombo"
+    assert dialog.page_range_edit.placeholderText() == "all または 1,3-5"
+    assert dialog.page_range_edit.text() == "all"
+    assert dialog.insertion_combo.currentIndex() == 1
+
+    dialog.page_range_edit.setText("1,3-4")
+    dialog.insertion_combo.setCurrentIndex(0)
+    dialog._accept_with_validation()
+
+    assert dialog.result() == dialog.DialogCode.Accepted
+    assert dialog.dialog_result is not None
+    assert dialog.dialog_result.page_selection == SourcePageSelection(5, (0, 2, 3))
+    assert dialog.dialog_result.insertion_slot == 0
+
+
+def test_insert_pages_dialog_returns_structured_result(qtbot: QtBot, tmp_path: Path) -> None:
+    dialog = InsertPagesDialog(
+        tmp_path / "source.pdf",
+        4,
+        (("先頭", 0), ("選択後", 2), ("末尾", 4)),
+        default_index=5,
+    )
+    qtbot.addWidget(dialog)
+
+    dialog.page_range_edit.setText("2-3")
+    dialog.insertion_combo.setCurrentIndex(1)
+    dialog._accept_with_validation()
+
+    assert dialog.dialog_result is not None
+    assert dialog.dialog_result.page_selection == SourcePageSelection(4, (1, 2))
+    assert dialog.dialog_result.insertion_slot == 2
+
+
+def test_insert_pages_dialog_shows_warning_for_invalid_page_range(
+    qtbot: QtBot,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dialog = InsertPagesDialog(
+        tmp_path / "source.pdf",
+        3,
+        (("先頭", 0), ("末尾", 3)),
+    )
+    qtbot.addWidget(dialog)
+    warnings: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda _parent, title, message, *args, **kwargs: (
+            warnings.append((title, message)) or QMessageBox.StandardButton.Ok
+        ),
+    )
+
+    dialog.page_range_edit.setText("4")
+    dialog._accept_with_validation()
+
+    assert dialog.result() == dialog.DialogCode.Rejected
+    assert dialog.dialog_result is None
+    assert warnings == [("入力エラー", "page number is out of range")]
+
+
+def test_insert_pages_dialog_shows_warning_for_invalid_insertion_index(
+    qtbot: QtBot,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dialog = InsertPagesDialog(
+        tmp_path / "source.pdf",
+        2,
+        (("先頭", 0),),
+    )
+    qtbot.addWidget(dialog)
+    warnings: list[str] = []
+
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda _parent, _title, message, *args, **kwargs: (
+            warnings.append(message) or QMessageBox.StandardButton.Ok
+        ),
+    )
+
+    dialog.insertion_combo.setCurrentIndex(-1)
+    dialog._accept_with_validation()
+
+    assert dialog.dialog_result is None
+    assert warnings == ["挿入位置が不正です"]
+
+
+def test_insert_pages_dialog_summary_is_selectable(qtbot: QtBot, tmp_path: Path) -> None:
+    dialog = InsertPagesDialog(
+        tmp_path / "named-source.pdf",
+        7,
+        (("先頭", 0), ("末尾", 5)),
+    )
+    qtbot.addWidget(dialog)
+
+    summary = next(
+        label for label in dialog.findChildren(QLabel) if label.text().startswith("挿入元PDF:")
+    )
+    assert "named-source.pdf" in summary.text()
+    assert "全ページ数: 7" in summary.text()
+    assert (
+        summary.textInteractionFlags() & Qt.TextInteractionFlag.TextSelectableByMouse
+    ) == Qt.TextInteractionFlag.TextSelectableByMouse
 
 
 def test_empty_state_shows_muted_message_for_no_recent_files(qtbot: QtBot) -> None:
