@@ -2042,6 +2042,7 @@ def test_main_window_restoring_page_zero_does_not_schedule_duplicate_persist(
         "_schedule_recovery_metadata_persist",
         lambda restored_session: persist_calls.append(restored_session.current_page_index),
     )
+    monkeypatch.setattr(PdfView, "_update_current_page", lambda self: None)
 
     document_path = create_blank_pdf(tmp_path / "restore-zero.pdf", 2)
     session = workspace_manager.create_session(document_path)
@@ -2049,7 +2050,12 @@ def test_main_window_restoring_page_zero_does_not_schedule_duplicate_persist(
 
     assert window.restore_session(session) is RestoreSessionResult.ATTACHED
     qtbot.waitUntil(lambda: window._documents[0].view.page_count == 2)
-    QTest.qWait(20)
+    qtbot.waitUntil(
+        lambda: (
+            window._documents[0].session.current_page_index == 0
+            and window._documents[0].view.page_index == 0
+        )
+    )
 
     assert window._documents[0].session.current_page_index == 0
     assert persist_calls == []
