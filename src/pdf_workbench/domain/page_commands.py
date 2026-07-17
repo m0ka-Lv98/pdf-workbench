@@ -6,11 +6,14 @@ from pathlib import Path
 
 from pdf_workbench.domain.command_history import CommandChange, DocumentCommand
 from pdf_workbench.domain.mutation import WorkingCopyMutationResult
+from pdf_workbench.domain.page_reorder import PageReorderPlan
 from pdf_workbench.services.pdf_page_mutation import (
     PageDeletionMutation,
     PageDeletionReceipt,
     PageDuplicationMutation,
     PageDuplicationReceipt,
+    PageReorderMutation,
+    PageReorderReceipt,
     PageRotationState,
     PdfPageMutationService,
 )
@@ -274,3 +277,77 @@ class DeletePagesCommand(DocumentCommand):
     def _require_not_disposed(self) -> None:
         if self._disposed:
             raise RuntimeError("DeletePagesCommand has been disposed")
+
+
+class ReorderPagesCommand(DocumentCommand):
+    requires_document_reload = True
+    mutates_working_copy = True
+
+    def __init__(
+        self,
+        working_copy_path: Path,
+        plan: PageReorderPlan,
+        mutation_service: PdfPageMutationService,
+    ) -> None:
+        moved_page_count = len(plan.source_page_indexes)
+        self.description = (
+            "1ページを移動" if moved_page_count == 1 else f"{moved_page_count}ページを移動"
+        )
+        self.affected_pages = frozenset(
+            page_index
+            for page_index, mapped_page_index in enumerate(plan.old_to_new)
+            if mapped_page_index != page_index
+        )
+        self._working_copy_path = working_copy_path.expanduser().resolve()
+        self._plan = plan
+        self._mutation_service = mutation_service
+        self._receipt: PageReorderReceipt | None = None
+        self.last_mutation_result: WorkingCopyMutationResult | None = None
+        self.last_selected_page_indexes_after: tuple[int, ...] | None = None
+        self.last_current_page_index_after: int | None = None
+
+    def execute(self) -> CommandChange:
+        mutation = self._reorder()
+        self._receipt = mutation.receipt
+        self.last_mutation_result = mutation.mutation_result
+        self.last_selected_page_indexes_after = mutation.receipt.moved_page_indexes_after
+        self.last_current_page_index_after = None
+        return CommandChange.from_command(self)
+
+    def undo(self) -> CommandChange:
+        receipt = self._require_receipt()
+        mutation_result = self._mutation_service.undo_page_reordering(
+            self._working_copy_path,
+            receipt,
+        )
+        self.last_mutation_result = mutation_result
+        self.last_selected_page_indexes_after = receipt.source_page_indexes
+        self.last_current_page_index_after = None
+        return CommandChange.from_command(self)
+
+    def redo(self) -> CommandChange:
+        receipt = self._require_receipt()
+        self._mutation_service.validate_reordering_redo_precondition(
+            self._working_copy_path,
+            receipt,
+        )
+        mutation_result = self._mutation_service.redo_page_reordering(
+            self._working_copy_path,
+            receipt,
+        )
+        self.last_mutation_result = mutation_result
+        self.last_selected_page_indexes_after = receipt.moved_page_indexes_after
+        self.last_current_page_index_after = None
+        return CommandChange.from_command(self)
+
+    def _reorder(self) -> PageReorderMutation:
+        return self._mutation_service.reorder_pages(
+            self._working_copy_path,
+            self._plan.source_page_indexes,
+            self._plan.insertion_slot,
+        )
+
+    def _require_receipt(self) -> PageReorderReceipt:
+        if self._receipt is None:
+            raise RuntimeError("ReorderPagesCommand has not been executed")
+        return self._receipt

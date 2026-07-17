@@ -394,6 +394,7 @@ class PdfView(QWidget):
     error_occurred = Signal(str)
     search_state_changed = Signal()
     selection_changed = Signal()
+    page_reorder_requested = Signal(object, int)
     document_loaded = Signal()
     mutation_reload_completed = Signal(bool)
     current_page_changed = Signal(int)
@@ -469,6 +470,7 @@ class PdfView(QWidget):
         self._page_organizer = PageOrganizer(self)
         self._page_organizer.page_requested.connect(self._on_organizer_page_requested)
         self._page_organizer.page_selection_changed.connect(self._on_organizer_selection_changed)
+        self._page_organizer.pages_reorder_requested.connect(self.page_reorder_requested.emit)
         self._page_organizer.visible_thumbnail_pages_changed.connect(
             self._on_visible_thumbnail_pages_changed
         )
@@ -688,6 +690,9 @@ class PdfView(QWidget):
             affected_pages=affected_pages,
             page_index_transition=page_index_transition,
         )
+
+    def set_page_reordering_enabled(self, enabled: bool) -> None:
+        self._page_organizer.set_reordering_enabled(enabled and self.page_count > 1)
 
     def _advance_render_generation(self) -> None:
         self._generation += 1

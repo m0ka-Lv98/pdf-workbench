@@ -53,7 +53,13 @@ from pdf_workbench.domain.document_session import DocumentSession, SourceStatus
 from pdf_workbench.domain.page_commands import (
     DeletePagesCommand,
     DuplicatePagesCommand,
+    ReorderPagesCommand,
     RotatePagesCommand,
+)
+from pdf_workbench.domain.page_reorder import (
+    PageReorderNoOpError,
+    PageReorderPlan,
+    build_page_reorder_plan,
 )
 from pdf_workbench.services.pdf_page_mutation import PdfPageMutationService
 from pdf_workbench.services.pdf_renderer import PdfRenderService
@@ -71,10 +77,7 @@ from pdf_workbench.services.session_workspace import (
     SessionWorkspaceManager,
     WorkspaceCreationError,
 )
-from pdf_workbench.services.source_change_monitor import (
-    SourceChangeMonitor,
-    SourceCheckResult,
-)
+from pdf_workbench.services.source_change_monitor import SourceChangeMonitor, SourceCheckResult
 from pdf_workbench.ui.icon_provider import IconName, IconProvider, IconTone
 from pdf_workbench.ui.pdf_view import PdfView, PdfViewMutationSnapshot
 from pdf_workbench.ui.widgets.document_toolbar import DocumentToolbar, ToolbarState
@@ -615,6 +618,25 @@ class MainWindow(QMainWindow):
             )
         )
 
+    def _reorder_selected_pages(
+        self,
+        plan: object,
+    ) -> None:
+        document = self._current_document()
+        if document is None or document.session.is_saving or document.mutation_in_progress:
+            return
+        if document.view.page_count <= 1:
+            return
+        if not isinstance(plan, PageReorderPlan):
+            return
+        self.execute_document_command(
+            ReorderPagesCommand(
+                document.session.document_path,
+                plan,
+                self._page_mutation_service,
+            )
+        )
+
     def open_search_bar(self) -> bool:
         document = self._current_document()
         if document is None:
@@ -1055,6 +1077,10 @@ class MainWindow(QMainWindow):
         document = self._current_document()
         document_selection = bool(document and document.view.selected_text)
         mutation_blocked = bool(document and document.mutation_in_progress)
+        if document is not None:
+            document.view.set_page_reordering_enabled(
+                not document.session.is_saving and not document.mutation_in_progress
+            )
         self.close_action.setEnabled(has_document and not mutation_blocked)
         self._update_undo_redo_actions(document)
         self.save_action.setEnabled(
@@ -1187,6 +1213,33 @@ class MainWindow(QMainWindow):
         if current_document is not None and current_document.view is view:
             self._sync_toolbar(document)
             self._update_status()
+
+    def _on_view_page_reorder_requested(
+        self,
+        view: PdfView,
+        source_page_indexes: object,
+        insertion_slot: int,
+    ) -> None:
+        current_document = self._current_document()
+        if current_document is None or current_document.view is not view:
+            return
+        if not isinstance(source_page_indexes, tuple):
+            return
+        try:
+            plan = build_page_reorder_plan(
+                current_document.view.page_count,
+                source_page_indexes,
+                insertion_slot,
+            )
+        except PageReorderNoOpError:
+            return
+        except (TypeError, ValueError) as exc:
+            self._report_error("ページの並べ替えに失敗しました", str(exc))
+            return
+        current_selection = tuple(sorted(set(current_document.view.selected_page_indexes)))
+        if plan.source_page_indexes != current_selection:
+            return
+        self._reorder_selected_pages(plan)
 
     def _on_source_status_changed(self, session_id: str, result: object) -> None:
         if not isinstance(result, SourceCheckResult):
@@ -1376,6 +1429,13 @@ class MainWindow(QMainWindow):
         view.state_changed.connect(self._update_status)
         view.search_state_changed.connect(lambda: self._on_view_search_state_changed(view))
         view.selection_changed.connect(self._update_actions)
+        view.page_reorder_requested.connect(
+            lambda page_indexes, insertion_slot: self._on_view_page_reorder_requested(
+                view,
+                page_indexes,
+                insertion_slot,
+            )
+        )
         view.error_occurred.connect(lambda message: self._set_status_message(message, error=True))
         document = DocumentTab(
             session=session,
@@ -1707,6 +1767,7 @@ class MainWindow(QMainWindow):
 
     def _set_document_mutation_state(self, document: DocumentTab, active: bool) -> None:
         document.mutation_in_progress = active
+        document.view.set_page_reordering_enabled(not active and not document.session.is_saving)
         self._update_actions()
         if self._current_document() is document:
             self._sync_toolbar(document)
@@ -1769,6 +1830,9 @@ class MainWindow(QMainWindow):
             self.restoreGeometry(geometry)
 
     def _sync_toolbar(self, document: DocumentTab) -> None:
+        document.view.set_page_reordering_enabled(
+            not document.session.is_saving and not document.mutation_in_progress
+        )
         self._toolbar_widget.setState(
             ToolbarState(
                 has_document=True,

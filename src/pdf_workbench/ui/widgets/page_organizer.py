@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections import OrderedDict
 from contextlib import suppress
 from dataclasses import dataclass
@@ -9,16 +10,28 @@ from PySide6.QtCore import (
     QAbstractListModel,
     QEvent,
     QItemSelectionModel,
+    QMimeData,
     QModelIndex,
     QObject,
     QPersistentModelIndex,
+    QPoint,
     QRect,
     QSize,
     Qt,
     QTimer,
     Signal,
 )
-from PySide6.QtGui import QImage, QMouseEvent, QPainter, QPen, QResizeEvent
+from PySide6.QtGui import (
+    QDrag,
+    QDragEnterEvent,
+    QDragMoveEvent,
+    QDropEvent,
+    QImage,
+    QMouseEvent,
+    QPainter,
+    QPen,
+    QResizeEvent,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QHBoxLayout,
@@ -31,10 +44,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from pdf_workbench.domain.page_reorder import PageReorderNoOpError, build_page_reorder_plan
 from pdf_workbench.services.page_coordinates import PageMetadata
 from pdf_workbench.services.pdf_renderer import RenderCacheKey
 
 _INVALID_MODEL_INDEX = QModelIndex()
+_REORDER_MIME = "application/x-pdf-workbench-page-reorder"
+logger = logging.getLogger(__name__)
 
 
 class _OrganizerRoles:
@@ -91,6 +107,15 @@ class PageOrganizerModel(QAbstractListModel):
         if role == _OrganizerRoles.CURRENT:
             return entry.current
         return None
+
+    def flags(
+        self,
+        index: QModelIndex | QPersistentModelIndex,
+    ) -> Qt.ItemFlag:
+        flags = super().flags(index)
+        if index.isValid():
+            flags |= Qt.ItemFlag.ItemIsDragEnabled
+        return flags
 
     def set_entries(self, metadata: tuple[PageMetadata, ...]) -> None:
         self.beginResetModel()
@@ -168,6 +193,7 @@ class PageOrganizerModel(QAbstractListModel):
 class PageOrganizerListView(QListView):
     visible_thumbnail_pages_changed = Signal(object)
     page_requested = Signal(int)
+    page_reorder_requested = Signal(object, int)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -180,6 +206,11 @@ class PageOrganizerListView(QListView):
         self.setUniformItemSizes(True)
         self.setSpacing(10)
         self.setMouseTracking(True)
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
         self._visible_timer = QTimer(self)
         self._visible_timer.setSingleShot(True)
         self._visible_timer.setInterval(0)
@@ -187,6 +218,8 @@ class PageOrganizerListView(QListView):
         self.verticalScrollBar().valueChanged.connect(self._schedule_visible_pages)
         self._visible_rows: tuple[int, ...] = ()
         self._last_emitted_pages: tuple[int, ...] | None = None
+        self._reordering_enabled = True
+        self._drag_source_rows: tuple[int, ...] = ()
 
     def setModel(self, model: QAbstractItemModel | None) -> None:
         previous = self.selectionModel()
@@ -222,6 +255,76 @@ class PageOrganizerListView(QListView):
     def mousePressEvent(self, event: QMouseEvent) -> None:
         super().mousePressEvent(event)
         self._schedule_visible_pages()
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if self._accept_reorder_event(event):
+            event.setDropAction(Qt.DropAction.MoveAction)
+            event.accept()
+            return
+        event.ignore()
+
+    def dragMoveEvent(self, event: QDragMoveEvent) -> None:
+        if self._accept_reorder_event(event):
+            event.setDropAction(Qt.DropAction.MoveAction)
+            event.accept()
+            return
+        event.ignore()
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        if not self._accept_reorder_event(event):
+            event.ignore()
+            return
+        model = self.model()
+        if model is None:
+            event.ignore()
+            return
+        source_rows = self._decode_reorder_rows(
+            event.mimeData(),
+            row_count=model.rowCount(),
+        )
+        if not source_rows:
+            event.ignore()
+            return
+        insertion_slot = self.insertion_slot_for_position(event.position().toPoint())
+        try:
+            build_page_reorder_plan(model.rowCount(), source_rows, insertion_slot)
+        except PageReorderNoOpError:
+            event.setDropAction(Qt.DropAction.MoveAction)
+            event.accept()
+            return
+        except (TypeError, ValueError):
+            event.ignore()
+            return
+        except Exception:
+            logger.exception("Unexpected page reorder drop failure")
+            event.ignore()
+            return
+        self.page_reorder_requested.emit(source_rows, insertion_slot)
+        event.setDropAction(Qt.DropAction.MoveAction)
+        event.accept()
+
+    def startDrag(self, supported_actions: Qt.DropAction) -> None:
+        _ = supported_actions
+        if not self._reordering_enabled:
+            return
+        model = self.model()
+        if model is None or model.rowCount() <= 1:
+            return
+        source_rows = self.selected_rows_in_order()
+        if not source_rows or len(source_rows) >= model.rowCount():
+            return
+        mime_data = QMimeData()
+        mime_data.setData(
+            _REORDER_MIME,
+            ",".join(str(row) for row in source_rows).encode("ascii"),
+        )
+        drag = QDrag(self)
+        drag.setMimeData(mime_data)
+        self._drag_source_rows = source_rows
+        try:
+            drag.exec(Qt.DropAction.MoveAction)
+        finally:
+            self._drag_source_rows = ()
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
@@ -274,6 +377,92 @@ class PageOrganizerListView(QListView):
     @property
     def visible_rows(self) -> tuple[int, ...]:
         return self._visible_rows
+
+    def set_reordering_enabled(self, enabled: bool) -> None:
+        self._reordering_enabled = bool(enabled)
+
+    def selected_rows_in_order(self) -> tuple[int, ...]:
+        selection_model = self.selectionModel()
+        if selection_model is None:
+            return ()
+        return tuple(sorted({index.row() for index in selection_model.selectedRows()}))
+
+    def insertion_slot_for_position(self, point: QPoint) -> int:
+        model = self.model()
+        if model is None or model.rowCount() == 0:
+            return 0
+        index = self.indexAt(point)
+        if index.isValid():
+            rect = self.visualRect(index)
+            if point.y() < rect.center().y():
+                return index.row()
+            return index.row() + 1
+        first_rect = self.visualRect(model.index(0, 0))
+        if first_rect.isValid() and point.y() < first_rect.top():
+            return 0
+        return model.rowCount()
+
+    def _accept_reorder_event(self, event: QDragEnterEvent | QDragMoveEvent | QDropEvent) -> bool:
+        model = self.model()
+        if (
+            not self._reordering_enabled
+            or model is None
+            or model.rowCount() <= 1
+            or event.source() is not self
+            or not self._has_only_reorder_mime(event.mimeData())
+        ):
+            return False
+        source_rows = self._decode_reorder_rows(
+            event.mimeData(),
+            row_count=model.rowCount(),
+        )
+        return bool(source_rows) and len(source_rows) < model.rowCount()
+
+    def _has_only_reorder_mime(self, mime_data: QMimeData | None) -> bool:
+        if mime_data is None:
+            return False
+        formats = tuple(mime_data.formats())
+        return formats == (_REORDER_MIME,)
+
+    def _decode_reorder_rows(
+        self,
+        mime_data: QMimeData | None,
+        *,
+        row_count: int | None = None,
+    ) -> tuple[int, ...]:
+        if not self._has_only_reorder_mime(mime_data) or mime_data is None:
+            return ()
+        raw_payload = bytes(mime_data.data(_REORDER_MIME).data())
+        try:
+            payload = raw_payload.decode("ascii").strip()
+        except UnicodeDecodeError:
+            return ()
+        if not payload:
+            return ()
+        chunks = payload.split(",")
+        if not chunks or any(not chunk for chunk in chunks):
+            return ()
+        rows: list[int] = []
+        seen: set[int] = set()
+        try:
+            for chunk in chunks:
+                if not chunk.isascii() or not chunk.isdigit():
+                    return ()
+                row = int(chunk)
+                if row < 0 or row in seen:
+                    return ()
+                seen.add(row)
+                rows.append(row)
+        except ValueError:
+            return ()
+        if rows != sorted(rows):
+            return ()
+        if row_count is not None and any(row >= row_count for row in rows):
+            return ()
+        decoded_rows = tuple(rows)
+        if self._drag_source_rows and decoded_rows != self._drag_source_rows:
+            return ()
+        return decoded_rows
 
 
 class PageThumbnailDelegate(QStyledItemDelegate):
@@ -410,6 +599,7 @@ class ThumbnailImageCache:
 class PageOrganizer(QWidget):
     page_requested = Signal(int)
     page_selection_changed = Signal(object)
+    pages_reorder_requested = Signal(object, int)
     visible_thumbnail_pages_changed = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -452,10 +642,12 @@ class PageOrganizer(QWidget):
         self._thumbnail_cache = ThumbnailImageCache()
 
         self._list.page_requested.connect(self._on_page_requested)
+        self._list.page_reorder_requested.connect(self.pages_reorder_requested.emit)
         self._list.visible_thumbnail_pages_changed.connect(
             self.visible_thumbnail_pages_changed.emit
         )
         self._list.selectionModel().selectionChanged.connect(self._on_selection_changed)
+        self._list.set_reordering_enabled(False)
 
     @property
     def list_view(self) -> QListView:
@@ -610,6 +802,9 @@ class PageOrganizer(QWidget):
 
     def stop_pending_thumbnail_updates(self) -> None:
         self._list.stop_pending_visible_thumbnail_update()
+
+    def set_reordering_enabled(self, enabled: bool) -> None:
+        self._list.set_reordering_enabled(enabled and self._model.rowCount() > 1)
 
     def set_desired_thumbnail_pages(self, page_indexes: tuple[int, ...]) -> tuple[int, ...]:
         valid_indexes = tuple(

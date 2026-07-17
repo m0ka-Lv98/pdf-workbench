@@ -67,10 +67,14 @@ PDF-writing PR の最低限の回帰チェック:
 - selected-page deletion では少なくとも 1 ページが残ること、deleted current page が nearest survivor へ mapping されること、undo で original selection / current page が戻ることを検証する
 - selected-page deletion では undo snapshot を working copy と同じ directory に置き、SHA-256、pikepdf reopen、PDFium render を通してから receipt に保存する
 - selected-page deletion では execute failure、redo tail discard、tab close の各タイミングで undo snapshot cleanup が走ることを確認する
+- selected-page reordering では drag-and-drop 1 回を 1 件の command history entry とし、stable relative order、`insertion_slot` semantics、execute / undo / redo の permutation を検証する
+- selected-page reordering では page count 不変のまま cache remap が full permutation になること、current page と selection が page identity に追従することを検証する
+- selected-page reordering では optimistic model move を行わず、mutation failure 時に organizer order、selection、current page、working copy SHA が維持されることを確認する
 - page object と annotation object の独立性、annotation `/P` back-reference、raw/effective rotation、all page boxes の保存を検証する
 - execute / undo / redo の各経路で、pikepdf 再オープンと PDFium render を通して semantic restoration を確認する
 - form / widget page duplication は fail-closed とし、working copy hash が変わらないことを確認する
 - page deletion では deleted destination を自動補正せず、outline / named destination / OpenAction / annotation GoTo が deleted page を指す場合は fail-closed にする
+- page reordering でも `/AcroForm`、`/Widget` annotations、`/StructTreeRoot`、`/PageLabels`、`/Threads`、`/OpenAction`、annotation `/Dest`、annotation `/A /GoTo`、cross-page annotation `/P`、unresolved annotation `/P` は fail-closed にする
 - relevant English/Japanese text の抽出
 - source と round-trip output の platform-neutral visual comparison
 - byte equality は要求しない

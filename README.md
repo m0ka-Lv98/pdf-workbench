@@ -25,7 +25,8 @@ Acrobat Proの全機能再現ではなく、日常的に使う閲覧・ページ
 ## 現在の状態
 
 Viewer core は、タブUI、連続ページ表示、遅延レンダリング、検索、テキスト選択、コピーまで実装済みです。
-加えて、安全保存、セッション復旧、元ファイルの外部変更検知まで `main` に入っています。次の設計・実装ステップは command-based Undo/Redo で、本格的なページ編集はまだ未実装です。
+加えて、runtime command history、安全保存、セッション復旧、元ファイルの外部変更検知、selected-page rotation / duplication / deletion / reordering まで `main` に入っています。
+page organizer では複数選択と drag-and-drop reordering を扱い、1 回の drag を 1 件の undoable command として working copy にだけ反映します。
 
 ## 作業コピーと安全保存
 

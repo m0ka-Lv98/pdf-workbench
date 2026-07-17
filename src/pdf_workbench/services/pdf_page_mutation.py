@@ -20,6 +20,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.generic import ArrayObject, NameObject, NumberObject
 
 from pdf_workbench.domain.mutation import PageIndexTransition, WorkingCopyMutationResult
+from pdf_workbench.domain.page_reorder import PageReorderPlan, build_page_reorder_plan
 from pdf_workbench.services.pdf_document_validator import (
     PdfDocumentValidationError,
     PdfDocumentValidator,
@@ -27,6 +28,8 @@ from pdf_workbench.services.pdf_document_validator import (
 from pdf_workbench.services.pdf_renderer import DocumentRevision
 
 logger = logging.getLogger(__name__)
+
+_VOLATILE_STREAM_KEYS = frozenset({"/Length", "/Filter", "/DecodeParms", "/DL"})
 
 
 def _require_strict_int(value: object, *, label: str) -> int:
@@ -271,6 +274,59 @@ class PageDeletionMutation:
     receipt: PageDeletionReceipt
 
 
+@dataclass(frozen=True, slots=True)
+class PageReorderReceipt:
+    original_page_count: int
+    source_page_indexes: tuple[int, ...]
+    insertion_slot: int
+    target_order: tuple[int, ...]
+    old_to_new: tuple[int, ...]
+    moved_page_indexes_after: tuple[int, ...]
+    before_snapshot: PdfDocumentStructureSnapshot
+    after_snapshot: PdfDocumentStructureSnapshot
+
+    def __post_init__(self) -> None:
+        if isinstance(self.original_page_count, bool) or not isinstance(
+            self.original_page_count,
+            Integral,
+        ):
+            raise ValueError("original_page_count must be an integer")
+        original_page_count = int(self.original_page_count)
+        if original_page_count <= 0:
+            raise ValueError("original_page_count must be positive")
+        if self.before_snapshot.page_count != original_page_count:
+            raise ValueError("before_snapshot page count must match original_page_count")
+        if self.after_snapshot.page_count != original_page_count:
+            raise ValueError("after_snapshot page count must match original_page_count")
+        plan = PageReorderPlan(
+            page_count=original_page_count,
+            source_page_indexes=self.source_page_indexes,
+            insertion_slot=self.insertion_slot,
+            target_order=self.target_order,
+            old_to_new=self.old_to_new,
+            new_to_old=self.target_order,
+            moved_page_indexes_after=self.moved_page_indexes_after,
+        )
+        object.__setattr__(self, "original_page_count", original_page_count)
+        object.__setattr__(self, "source_page_indexes", plan.source_page_indexes)
+        object.__setattr__(self, "insertion_slot", plan.insertion_slot)
+        object.__setattr__(self, "target_order", plan.target_order)
+        object.__setattr__(self, "old_to_new", plan.old_to_new)
+        object.__setattr__(self, "moved_page_indexes_after", plan.moved_page_indexes_after)
+        for new_page_index, original_page_index in enumerate(plan.target_order):
+            if (
+                self.after_snapshot.pages[new_page_index]
+                != self.before_snapshot.pages[original_page_index]
+            ):
+                raise ValueError("after_snapshot does not match the expected reordered page order")
+
+
+@dataclass(frozen=True, slots=True)
+class PageReorderMutation:
+    mutation_result: WorkingCopyMutationResult
+    receipt: PageReorderReceipt
+
+
 class PdfPageMutationService:
     def __init__(self, validator: PdfDocumentValidator | None = None) -> None:
         self._validator = validator if validator is not None else PdfDocumentValidator()
@@ -479,6 +535,174 @@ class PdfPageMutationService:
                 affected_pages=frozenset(receipt.source_page_indexes),
                 page_index_transition=self._build_undo_transition(receipt),
             )
+        except PdfPageMutationError as exc:
+            primary_error = exc
+            raise
+        except OSError as exc:
+            primary_error = exc
+            raise PdfPageMutationError("作業コピーPDFの更新に失敗しました") from exc
+        except Exception as exc:
+            primary_error = exc
+            raise PdfPageMutationError("作業コピーPDFの更新に失敗しました") from exc
+        finally:
+            self._cleanup_candidate(candidate_path, primary_error=primary_error)
+
+    def reorder_pages(
+        self,
+        path: Path,
+        source_page_indexes: Sequence[object],
+        insertion_slot: object,
+        *,
+        expected_before_snapshot: PdfDocumentStructureSnapshot | None = None,
+    ) -> PageReorderMutation:
+        resolved_path = path.expanduser().resolve()
+        candidate_path: Path | None = None
+        primary_error: BaseException | None = None
+
+        try:
+            old_revision = DocumentRevision.from_path(resolved_path)
+            before_snapshot = self._snapshot_document_structure(resolved_path)
+            if expected_before_snapshot is not None and before_snapshot != expected_before_snapshot:
+                raise PdfPageMutationError("並べ替え対象ページの前提状態が変化しました")
+            plan = build_page_reorder_plan(
+                before_snapshot.page_count,
+                source_page_indexes,
+                insertion_slot,
+            )
+            self._reject_unsupported_page_reordering_structures(resolved_path)
+            with pikepdf.open(resolved_path) as pdf:
+                self._apply_page_order_to_pdf(pdf, plan.target_order)
+                candidate_path = self._create_candidate_path(resolved_path)
+                self._write_pikepdf_candidate(pdf, candidate_path)
+            after_snapshot = self._validate_page_reordering_candidate(
+                candidate_path,
+                before_snapshot=before_snapshot,
+                plan=plan,
+            )
+            new_revision = self._build_revision_from_candidate(candidate_path, resolved_path)
+            mutation_result = WorkingCopyMutationResult(
+                old_revision=old_revision,
+                new_revision=new_revision,
+                page_count=before_snapshot.page_count,
+                affected_pages=self._reorder_affected_pages(plan),
+                page_index_transition=self._build_reorder_execute_transition(plan),
+            )
+            receipt = PageReorderReceipt(
+                original_page_count=before_snapshot.page_count,
+                source_page_indexes=plan.source_page_indexes,
+                insertion_slot=plan.insertion_slot,
+                target_order=plan.target_order,
+                old_to_new=plan.old_to_new,
+                moved_page_indexes_after=plan.moved_page_indexes_after,
+                before_snapshot=before_snapshot,
+                after_snapshot=after_snapshot,
+            )
+            prepared_result = PageReorderMutation(
+                mutation_result=mutation_result,
+                receipt=receipt,
+            )
+            self._replace_atomically(candidate_path, resolved_path)
+            self._fsync_parent_directory(resolved_path.parent)
+            return prepared_result
+        except PdfPageMutationError as exc:
+            primary_error = exc
+            raise
+        except TypeError as exc:
+            primary_error = exc
+            raise
+        except ValueError as exc:
+            primary_error = exc
+            raise
+        except OSError as exc:
+            primary_error = exc
+            raise PdfPageMutationError("作業コピーPDFの更新に失敗しました") from exc
+        except Exception as exc:
+            primary_error = exc
+            raise PdfPageMutationError("作業コピーPDFの更新に失敗しました") from exc
+        finally:
+            self._cleanup_candidate(candidate_path, primary_error=primary_error)
+
+    def undo_page_reordering(
+        self,
+        path: Path,
+        receipt: PageReorderReceipt,
+    ) -> WorkingCopyMutationResult:
+        resolved_path = path.expanduser().resolve()
+        candidate_path: Path | None = None
+        primary_error: BaseException | None = None
+
+        try:
+            old_revision = DocumentRevision.from_path(resolved_path)
+            self._validate_current_reordering_state(resolved_path, receipt)
+            plan = self._reorder_plan_from_receipt(receipt)
+            with pikepdf.open(resolved_path) as pdf:
+                self._apply_page_order_to_pdf(pdf, plan.old_to_new)
+                candidate_path = self._create_candidate_path(resolved_path)
+                self._write_pikepdf_candidate(pdf, candidate_path)
+            self._validate_undo_page_reordering_candidate(candidate_path, receipt)
+            new_revision = self._build_revision_from_candidate(candidate_path, resolved_path)
+            mutation_result = WorkingCopyMutationResult(
+                old_revision=old_revision,
+                new_revision=new_revision,
+                page_count=receipt.original_page_count,
+                affected_pages=self._reorder_affected_pages(plan),
+                page_index_transition=self._build_reorder_undo_transition(receipt),
+            )
+            self._replace_atomically(candidate_path, resolved_path)
+            self._fsync_parent_directory(resolved_path.parent)
+            return mutation_result
+        except PdfPageMutationError as exc:
+            primary_error = exc
+            raise
+        except OSError as exc:
+            primary_error = exc
+            raise PdfPageMutationError("作業コピーPDFの更新に失敗しました") from exc
+        except Exception as exc:
+            primary_error = exc
+            raise PdfPageMutationError("作業コピーPDFの更新に失敗しました") from exc
+        finally:
+            self._cleanup_candidate(candidate_path, primary_error=primary_error)
+
+    def validate_reordering_redo_precondition(
+        self,
+        path: Path,
+        receipt: PageReorderReceipt,
+    ) -> None:
+        resolved_path = path.expanduser().resolve()
+        current_snapshot = self._snapshot_document_structure(resolved_path)
+        if current_snapshot != receipt.before_snapshot:
+            raise PdfPageMutationError("並べ替え対象ページの前提状態が変化しました")
+        self._reject_unsupported_page_reordering_structures(resolved_path)
+
+    def redo_page_reordering(
+        self,
+        path: Path,
+        receipt: PageReorderReceipt,
+    ) -> WorkingCopyMutationResult:
+        resolved_path = path.expanduser().resolve()
+        candidate_path: Path | None = None
+        primary_error: BaseException | None = None
+
+        try:
+            old_revision = DocumentRevision.from_path(resolved_path)
+            self.validate_reordering_redo_precondition(resolved_path, receipt)
+            plan = self._reorder_plan_from_receipt(receipt)
+            with pikepdf.open(resolved_path) as pdf:
+                self._apply_page_order_to_pdf(pdf, plan.target_order)
+                candidate_path = self._create_candidate_path(resolved_path)
+                self._write_pikepdf_candidate(pdf, candidate_path)
+            self._validate_redo_page_reordering_candidate(candidate_path, receipt)
+            new_revision = self._build_revision_from_candidate(candidate_path, resolved_path)
+            mutation_result = WorkingCopyMutationResult(
+                old_revision=old_revision,
+                new_revision=new_revision,
+                page_count=receipt.original_page_count,
+                affected_pages=self._reorder_affected_pages(plan),
+                page_index_transition=self._build_reorder_execute_transition(plan),
+            )
+            self._replace_atomically(candidate_path, resolved_path)
+            self._fsync_parent_directory(resolved_path.parent)
+            return mutation_result
         except PdfPageMutationError as exc:
             primary_error = exc
             raise
@@ -994,6 +1218,15 @@ class PdfPageMutationService:
         except Exception as exc:
             raise PdfPageMutationError("更新候補PDFの書き込みに失敗しました") from exc
 
+    def _write_pikepdf_candidate(self, pdf: pikepdf.Pdf, candidate_path: Path) -> None:
+        try:
+            pdf.save(candidate_path)
+            self._fsync_file(candidate_path)
+        except OSError as exc:
+            raise PdfPageMutationError("更新候補PDFの書き込みに失敗しました") from exc
+        except Exception as exc:
+            raise PdfPageMutationError("更新候補PDFの書き込みに失敗しました") from exc
+
     def _fsync_file(self, path: Path) -> None:
         try:
             with path.open("rb+") as handle:
@@ -1051,6 +1284,28 @@ class PdfPageMutationService:
         self._validate_duplicate_page_independence(path, receipt)
         self._validate_duplicate_renders(path, receipt)
 
+    def _validate_page_reordering_candidate(
+        self,
+        path: Path,
+        *,
+        before_snapshot: PdfDocumentStructureSnapshot,
+        plan: PageReorderPlan,
+    ) -> PdfDocumentStructureSnapshot:
+        self._validate_basic_candidate(path, expected_page_count=before_snapshot.page_count)
+        after_snapshot = self._snapshot_document_structure(path)
+        if after_snapshot.page_count != before_snapshot.page_count:
+            raise PdfPageMutationError("更新後のページ数検証に失敗しました")
+        self._validate_document_level_snapshots(
+            after_snapshot,
+            before_snapshot,
+            page_mapping=plan.old_to_new,
+        )
+        for new_page_index, original_page_index in enumerate(plan.target_order):
+            if after_snapshot.pages[new_page_index] != before_snapshot.pages[original_page_index]:
+                raise PdfPageMutationError("更新後のページ順序または構造の検証に失敗しました")
+        self._render_pages(path, self._reorder_execute_render_page_indexes(plan))
+        return after_snapshot
+
     def _validate_undo_duplication_candidate(
         self,
         path: Path,
@@ -1061,6 +1316,17 @@ class PdfPageMutationService:
         if after_snapshot != receipt.before_snapshot:
             raise PdfPageMutationError("複製の取り消し検証に失敗しました")
         self._render_pages(path, tuple(range(receipt.original_page_count)))
+
+    def _validate_undo_page_reordering_candidate(
+        self,
+        path: Path,
+        receipt: PageReorderReceipt,
+    ) -> None:
+        self._validate_basic_candidate(path, expected_page_count=receipt.original_page_count)
+        snapshot = self._snapshot_document_structure(path)
+        if snapshot != receipt.before_snapshot:
+            raise PdfPageMutationError("ページ並べ替えの取り消し検証に失敗しました")
+        self._render_pages(path, self._reorder_undo_render_page_indexes(receipt))
 
     def _validate_basic_candidate(
         self,
@@ -1241,10 +1507,11 @@ class PdfPageMutationService:
             active.add(typed_objgen)
         try:
             if isinstance(dereferenced, pikepdf.Stream):
+                stream_exclude_keys = exclude_keys | _VOLATILE_STREAM_KEYS
                 payload = {
                     key: self._normalize_object(
                         item,
-                        exclude_keys=exclude_keys,
+                        exclude_keys=stream_exclude_keys,
                         seen=seen,
                         active=active,
                         next_local_id=next_local_id,
@@ -1253,7 +1520,7 @@ class PdfPageMutationService:
                         (
                             (str(key), item)
                             for key, item in dereferenced.items()
-                            if str(key) not in exclude_keys
+                            if str(key) not in stream_exclude_keys
                         ),
                         key=lambda entry: entry[0],
                     )
@@ -1573,6 +1840,58 @@ class PdfPageMutationService:
                         )
                     raise PdfPageMutationError("他ページを参照する注釈の/P参照は未対応です")
 
+    def _reject_unsupported_page_reordering_structures(self, path: Path) -> None:
+        with pikepdf.open(path) as pdf:
+            root = pdf.Root
+            if "/AcroForm" in root:
+                raise PdfPageMutationError("フォームを含むPDFの並べ替えは未対応です")
+            if "/StructTreeRoot" in root:
+                raise PdfPageMutationError("タグ付きPDFの並べ替えは未対応です")
+            if "/PageLabels" in root:
+                raise PdfPageMutationError("PageLabelsを含むPDFの並べ替えは未対応です")
+            if "/Threads" in root:
+                raise PdfPageMutationError("Article Threadsを含むPDFの並べ替えは未対応です")
+            if "/OpenAction" in root:
+                raise PdfPageMutationError("OpenActionを含むPDFの並べ替えは未対応です")
+
+            page_index_by_objgen = {
+                page.obj.objgen: index
+                for index, page in enumerate(pdf.pages)
+                if self._has_indirect_objgen(getattr(page.obj, "objgen", None))
+            }
+            for page_index, page in enumerate(pdf.pages):
+                annots_object = page.obj.get("/Annots", None)
+                if annots_object is None:
+                    continue
+                annots = self._dereference(annots_object)
+                if not isinstance(annots, pikepdf.Array):
+                    raise PdfPageMutationError("注釈配列が不正です")
+                for annot_ref in annots:
+                    annot = self._dereference(annot_ref)
+                    if str(annot.get("/Subtype", "")) == "/Widget":
+                        raise PdfPageMutationError("Widget注釈を含むPDFの並べ替えは未対応です")
+                    if "/Dest" in annot or self._annotation_has_internal_goto_action(annot):
+                        raise PdfPageMutationError("内部宛先注釈を含むPDFの並べ替えは未対応です")
+                    parent_object = annot.get("/P", None)
+                    if parent_object is None:
+                        continue
+                    parent = self._dereference(parent_object)
+                    parent_objgen = getattr(parent, "objgen", None)
+                    owning_objgen = getattr(page.obj, "objgen", None)
+                    if parent_objgen == owning_objgen:
+                        continue
+                    if (
+                        not self._has_indirect_objgen(parent_objgen)
+                        or cast(tuple[int, int], parent_objgen) not in page_index_by_objgen
+                        or str(parent.get("/Type", "")) != "/Page"
+                    ):
+                        raise PdfPageMutationError("注釈の/P参照を解決できません")
+                    resolved_parent_index = page_index_by_objgen[
+                        cast(tuple[int, int], parent_objgen)
+                    ]
+                    if resolved_parent_index != page_index:
+                        raise PdfPageMutationError("他ページを参照する注釈の/P参照は未対応です")
+
     @staticmethod
     def _annotation_has_internal_goto_action(annot: Any) -> bool:
         action = annot.get("/A", None)
@@ -1642,6 +1961,22 @@ class PdfPageMutationService:
         for annot_ref in annots:
             annot = self._dereference(annot_ref)
             annot[NameObject("/P")] = page_reference
+
+    def _apply_page_order_to_pdf(
+        self,
+        pdf: pikepdf.Pdf,
+        target_order: tuple[int, ...],
+    ) -> None:
+        page_count = len(pdf.pages)
+        if len(target_order) != page_count:
+            raise PdfPageMutationError("ページ順序の長さが現在のページ数と一致しません")
+        if set(target_order) != set(range(page_count)):
+            raise PdfPageMutationError("ページ順序が不正です")
+        pages = [pdf.pages[index] for index in range(page_count)]
+        reordered_pages = [pages[index] for index in target_order]
+        for page_index in range(page_count - 1, -1, -1):
+            del pdf.pages[page_index]
+        pdf.pages.extend(reordered_pages)
 
     def _validate_document_level_snapshots(
         self,
@@ -1997,6 +2332,20 @@ class PdfPageMutationService:
             raise PdfPageMutationError("ページ削除の再適用検証に失敗しました")
         self._render_pages(path, tuple(range(receipt.after_snapshot.page_count)))
 
+    def _validate_redo_page_reordering_candidate(
+        self,
+        path: Path,
+        receipt: PageReorderReceipt,
+    ) -> None:
+        self._validate_basic_candidate(path, expected_page_count=receipt.original_page_count)
+        snapshot = self._snapshot_document_structure(path)
+        if snapshot != receipt.after_snapshot:
+            raise PdfPageMutationError("ページ並べ替えの再適用検証に失敗しました")
+        self._render_pages(
+            path,
+            self._reorder_execute_render_page_indexes(self._reorder_plan_from_receipt(receipt)),
+        )
+
     def _render_page_digests(
         self,
         path: Path,
@@ -2076,6 +2425,15 @@ class PdfPageMutationService:
             raise PdfPageMutationError("複製対象ページの前提状態が変化しました")
         self._reject_unsupported_forms(resolved_path, receipt.source_page_indexes)
 
+    def _validate_current_reordering_state(
+        self,
+        path: Path,
+        receipt: PageReorderReceipt,
+    ) -> None:
+        current_snapshot = self._snapshot_document_structure(path)
+        if current_snapshot != receipt.after_snapshot:
+            raise PdfPageMutationError("並べ替え済みページの状態が変化しているため元に戻せません")
+
     def _build_delete_execute_transition(
         self,
         original_page_count: int,
@@ -2127,6 +2485,22 @@ class PdfPageMutationService:
             new_page_count=receipt.original_page_count,
             cache_old_to_new=survivor_indexes,
             current_page_old_to_new=survivor_indexes,
+        )
+
+    def _build_reorder_execute_transition(self, plan: PageReorderPlan) -> PageIndexTransition:
+        return PageIndexTransition(
+            old_page_count=plan.page_count,
+            new_page_count=plan.page_count,
+            cache_old_to_new=plan.old_to_new,
+            current_page_old_to_new=plan.old_to_new,
+        )
+
+    def _build_reorder_undo_transition(self, receipt: PageReorderReceipt) -> PageIndexTransition:
+        return PageIndexTransition(
+            old_page_count=receipt.original_page_count,
+            new_page_count=receipt.original_page_count,
+            cache_old_to_new=receipt.target_order,
+            current_page_old_to_new=receipt.target_order,
         )
 
     def _build_execute_transition(
@@ -2185,6 +2559,56 @@ class PdfPageMutationService:
             cache_old_to_new=tuple(cache_mapping),
             current_page_old_to_new=tuple(current_mapping),
         )
+
+    def _reorder_plan_from_receipt(self, receipt: PageReorderReceipt) -> PageReorderPlan:
+        return PageReorderPlan(
+            page_count=receipt.original_page_count,
+            source_page_indexes=receipt.source_page_indexes,
+            insertion_slot=receipt.insertion_slot,
+            target_order=receipt.target_order,
+            old_to_new=receipt.old_to_new,
+            new_to_old=receipt.target_order,
+            moved_page_indexes_after=receipt.moved_page_indexes_after,
+        )
+
+    def _reorder_affected_pages(self, plan: PageReorderPlan) -> frozenset[int]:
+        return frozenset(
+            page_index
+            for page_index, mapped_page_index in enumerate(plan.old_to_new)
+            if mapped_page_index != page_index
+        )
+
+    def _reorder_execute_render_page_indexes(self, plan: PageReorderPlan) -> tuple[int, ...]:
+        changed_indexes = {
+            new_page_index
+            for new_page_index, original_page_index in enumerate(plan.target_order)
+            if new_page_index != original_page_index
+        }
+        changed_indexes.update(plan.moved_page_indexes_after)
+        if plan.moved_page_indexes_after:
+            first = plan.moved_page_indexes_after[0]
+            last = plan.moved_page_indexes_after[-1]
+            if first > 0:
+                changed_indexes.add(first - 1)
+            if last + 1 < plan.page_count:
+                changed_indexes.add(last + 1)
+        return tuple(sorted(changed_indexes))
+
+    def _reorder_undo_render_page_indexes(self, receipt: PageReorderReceipt) -> tuple[int, ...]:
+        changed_indexes = {
+            page_index
+            for page_index, mapped_page_index in enumerate(receipt.old_to_new)
+            if mapped_page_index != page_index
+        }
+        changed_indexes.update(receipt.source_page_indexes)
+        if receipt.source_page_indexes:
+            first = receipt.source_page_indexes[0]
+            last = receipt.source_page_indexes[-1]
+            if first > 0:
+                changed_indexes.add(first - 1)
+            if last + 1 < receipt.original_page_count:
+                changed_indexes.add(last + 1)
+        return tuple(sorted(changed_indexes))
 
     def _build_revision_from_candidate(
         self,
