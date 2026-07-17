@@ -12,7 +12,17 @@ from enum import StrEnum
 from functools import partial
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QEventLoop, QMimeData, QObject, QRect, QSettings, Qt, QTimer
+from PySide6.QtCore import (
+    QEvent,
+    QEventLoop,
+    QMimeData,
+    QObject,
+    QPoint,
+    QRect,
+    QSettings,
+    Qt,
+    QTimer,
+)
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
@@ -29,6 +39,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QSizePolicy,
     QStackedWidget,
@@ -53,9 +64,11 @@ from pdf_workbench.domain.document_session import DocumentSession, SourceStatus
 from pdf_workbench.domain.page_commands import (
     DeletePagesCommand,
     DuplicatePagesCommand,
+    InsertPagesCommand,
     ReorderPagesCommand,
     RotatePagesCommand,
 )
+from pdf_workbench.domain.page_insertion import build_page_insertion_plan
 from pdf_workbench.domain.page_reorder import (
     PageReorderNoOpError,
     PageReorderPlan,
@@ -82,6 +95,10 @@ from pdf_workbench.ui.icon_provider import IconName, IconProvider, IconTone
 from pdf_workbench.ui.pdf_view import PdfView, PdfViewMutationSnapshot
 from pdf_workbench.ui.widgets.document_toolbar import DocumentToolbar, ToolbarState
 from pdf_workbench.ui.widgets.empty_state import EmptyState
+from pdf_workbench.ui.widgets.insert_pages_dialog import (
+    InsertPagesDialog,
+    InsertPagesDialogResult,
+)
 from pdf_workbench.ui.widgets.search_bar import SearchBar, SearchBarState
 from pdf_workbench.ui.widgets.source_change_banner import (
     SourceChangeBanner,
@@ -109,6 +126,14 @@ class RestoreSessionResult(StrEnum):
 class SaveIntent(StrEnum):
     SAVE = "save"
     SAVE_AS = "save_as"
+
+
+@dataclass(frozen=True, slots=True)
+class InsertPagesDocumentContext:
+    session_id: str
+    working_copy_path: Path
+    source_path: Path
+    page_count: int
 
 
 class MainWindow(QMainWindow):
@@ -331,6 +356,9 @@ class MainWindow(QMainWindow):
         self.duplicate_pages_action = QAction("選択したページを複製", self)
         self.duplicate_pages_action.triggered.connect(self._duplicate_selected_pages)
 
+        self.insert_pages_action = QAction("別のPDFからページを挿入…", self)
+        self.insert_pages_action.triggered.connect(self._insert_pages_from_pdf)
+
         self.copy_action = QAction("コピー", self)
         self.copy_action.setShortcut(QKeySequence.StandardKey.Copy)
         self.copy_action.triggered.connect(self._copy_selection)
@@ -341,6 +369,7 @@ class MainWindow(QMainWindow):
             self.redo_action,
             self.delete_pages_action,
             self.duplicate_pages_action,
+            self.insert_pages_action,
             self.save_action,
             self.save_as_action,
             self.close_action,
@@ -380,6 +409,7 @@ class MainWindow(QMainWindow):
         edit_menu.addSeparator()
         edit_menu.addAction(self.delete_pages_action)
         edit_menu.addAction(self.duplicate_pages_action)
+        edit_menu.addAction(self.insert_pages_action)
         edit_menu.addSeparator()
         edit_menu.addAction(self.find_action)
         edit_menu.addAction(self.find_next_action)
@@ -618,6 +648,62 @@ class MainWindow(QMainWindow):
             )
         )
 
+    def _insert_pages_from_pdf(self) -> None:
+        document = self._current_document()
+        if document is None or document.session.is_saving or document.mutation_in_progress:
+            return
+        context = self._capture_insert_pages_context(document)
+        try:
+            expected_target_snapshot = self._page_mutation_service.snapshot_document_structure(
+                document.session.document_path,
+            )
+        except Exception as exc:
+            logger.exception("Failed to snapshot target PDF before insertion")
+            self._report_error("ページ挿入に失敗しました", str(exc))
+            return
+        source_path = self._choose_insert_source_path(document)
+        if source_path is None:
+            return
+        try:
+            source_page_count = self._page_mutation_service.read_page_count(source_path)
+        except Exception as exc:
+            logger.exception("Failed to inspect source PDF for insertion: %s", source_path)
+            self._report_error("ページ挿入に失敗しました", str(exc))
+            return
+        if self._resolve_insert_pages_document(context) is None:
+            return
+        options = self._choose_insert_pages_options(
+            document,
+            source_path=source_path,
+            source_page_count=source_page_count,
+        )
+        if options is None:
+            return
+        target_document = self._resolve_insert_pages_document(context)
+        if target_document is None:
+            return
+        try:
+            plan = build_page_insertion_plan(
+                target_document.view.page_count,
+                source_page_count,
+                options.page_selection.page_indexes,
+                options.insertion_slot,
+            )
+        except (TypeError, ValueError) as exc:
+            self._report_error("ページ挿入に失敗しました", str(exc))
+            return
+        self.execute_document_command(
+            InsertPagesCommand(
+                target_document.session.document_path,
+                source_path,
+                plan,
+                self._page_mutation_service,
+                current_page_index_before=target_document.view.page_index,
+                selected_page_indexes_before=target_document.view.selected_page_indexes,
+                expected_target_snapshot=expected_target_snapshot,
+            )
+        )
+
     def _reorder_selected_pages(
         self,
         plan: object,
@@ -636,6 +722,85 @@ class MainWindow(QMainWindow):
                 self._page_mutation_service,
             )
         )
+
+    def _capture_insert_pages_context(self, document: DocumentTab) -> InsertPagesDocumentContext:
+        return InsertPagesDocumentContext(
+            session_id=document.session.session_id,
+            working_copy_path=document.session.document_path,
+            source_path=document.session.source_path,
+            page_count=document.view.page_count,
+        )
+
+    def _resolve_insert_pages_document(
+        self,
+        context: InsertPagesDocumentContext,
+    ) -> DocumentTab | None:
+        document = self._current_document()
+        if document is None:
+            return None
+        if document.session.session_id != context.session_id:
+            return None
+        if document.session.document_path != context.working_copy_path:
+            return None
+        if document.session.source_path != context.source_path:
+            return None
+        if document.view.page_count != context.page_count:
+            return None
+        if document.session.is_saving or document.mutation_in_progress:
+            return None
+        return document
+
+    def _choose_insert_source_path(self, document: DocumentTab) -> Path | None:
+        filename, _ = QFileDialog.getOpenFileName(
+            self,
+            "挿入元PDFを選択",
+            str(document.session.source_path.parent),
+            "PDF files (*.pdf)",
+        )
+        if not filename:
+            return None
+        return Path(filename).expanduser().resolve()
+
+    def _choose_insert_pages_options(
+        self,
+        document: DocumentTab,
+        *,
+        source_path: Path,
+        source_page_count: int,
+    ) -> InsertPagesDialogResult | None:
+        insertion_targets, default_index = self._insertion_targets_for_document(document)
+        dialog = InsertPagesDialog(
+            source_path,
+            source_page_count,
+            insertion_targets,
+            default_index=default_index,
+            parent=self,
+        )
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return None
+        return dialog.dialog_result
+
+    def _insertion_targets_for_document(
+        self,
+        document: DocumentTab,
+    ) -> tuple[tuple[tuple[str, int], ...], int]:
+        selection = tuple(sorted(set(document.view.selected_page_indexes)))
+        current_page_index = document.view.page_index
+        if selection:
+            before_slot = selection[0]
+            after_slot = selection[-1] + 1
+            default_index = 2
+        else:
+            before_slot = current_page_index
+            after_slot = current_page_index + 1
+            default_index = 2
+        targets = (
+            ("先頭", 0),
+            ("選択ページまたは現在ページの前", before_slot),
+            ("選択ページまたは現在ページの後", after_slot),
+            ("末尾", document.view.page_count),
+        )
+        return targets, default_index
 
     def open_search_bar(self) -> bool:
         document = self._current_document()
@@ -1111,6 +1276,9 @@ class MainWindow(QMainWindow):
                 and not document.mutation_in_progress
             )
         )
+        self.insert_pages_action.setEnabled(
+            bool(document and not document.session.is_saving and not document.mutation_in_progress)
+        )
         self.previous_action.setEnabled(has_document)
         self.next_action.setEnabled(has_document)
         self.zoom_in_action.setEnabled(has_document)
@@ -1240,6 +1408,18 @@ class MainWindow(QMainWindow):
         if plan.source_page_indexes != current_selection:
             return
         self._reorder_selected_pages(plan)
+
+    def _show_page_organizer_context_menu(self, view: PdfView, position: QPoint) -> None:
+        current_document = self._current_document()
+        if current_document is None or current_document.view is not view:
+            return
+        menu = QMenu(self)
+        menu.addAction(self.insert_pages_action)
+        menu.addSeparator()
+        menu.addAction(self.duplicate_pages_action)
+        menu.addAction(self.delete_pages_action)
+        global_position = view.organizer_list_view.viewport().mapToGlobal(position)
+        menu.exec(global_position)
 
     def _on_source_status_changed(self, session_id: str, result: object) -> None:
         if not isinstance(result, SourceCheckResult):
@@ -1435,6 +1615,10 @@ class MainWindow(QMainWindow):
                 page_indexes,
                 insertion_slot,
             )
+        )
+        view.organizer_list_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        view.organizer_list_view.customContextMenuRequested.connect(
+            lambda position: self._show_page_organizer_context_menu(view, position)
         )
         view.error_occurred.connect(lambda message: self._set_status_message(message, error=True))
         document = DocumentTab(

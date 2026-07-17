@@ -6,15 +6,19 @@ from pathlib import Path
 
 from pdf_workbench.domain.command_history import CommandChange, DocumentCommand
 from pdf_workbench.domain.mutation import WorkingCopyMutationResult
+from pdf_workbench.domain.page_insertion import PageInsertionPlan
 from pdf_workbench.domain.page_reorder import PageReorderPlan
 from pdf_workbench.services.pdf_page_mutation import (
     PageDeletionMutation,
     PageDeletionReceipt,
     PageDuplicationMutation,
     PageDuplicationReceipt,
+    PageInsertionMutation,
+    PageInsertionReceipt,
     PageReorderMutation,
     PageReorderReceipt,
     PageRotationState,
+    PdfDocumentStructureSnapshot,
     PdfPageMutationService,
 )
 
@@ -351,3 +355,102 @@ class ReorderPagesCommand(DocumentCommand):
         if self._receipt is None:
             raise RuntimeError("ReorderPagesCommand has not been executed")
         return self._receipt
+
+
+class InsertPagesCommand(DocumentCommand):
+    requires_document_reload = True
+    mutates_working_copy = True
+
+    def __init__(
+        self,
+        working_copy_path: Path,
+        source_pdf_path: Path,
+        plan: PageInsertionPlan,
+        mutation_service: PdfPageMutationService,
+        *,
+        current_page_index_before: int,
+        selected_page_indexes_before: Sequence[int],
+        expected_target_snapshot: PdfDocumentStructureSnapshot | None = None,
+    ) -> None:
+        inserted_count = len(plan.source_page_indexes)
+        self.description = (
+            "1ページを挿入"
+            if inserted_count == 1
+            else f"{inserted_count}ページを挿入"
+        )
+        self.affected_pages = frozenset(plan.inserted_page_indexes_after)
+        self._working_copy_path = working_copy_path.expanduser().resolve()
+        self._source_pdf_path = source_pdf_path.expanduser().resolve()
+        self._plan = plan
+        self._mutation_service = mutation_service
+        self._current_page_index_before = current_page_index_before
+        self._selected_page_indexes_before = _normalize_page_indexes(selected_page_indexes_before)
+        self._expected_target_snapshot = expected_target_snapshot
+        self._receipt: PageInsertionReceipt | None = None
+        self._disposed = False
+        self.last_mutation_result: WorkingCopyMutationResult | None = None
+        self.last_selected_page_indexes_after: tuple[int, ...] | None = None
+        self.last_current_page_index_after: int | None = None
+
+    def execute(self) -> CommandChange:
+        self._require_not_disposed()
+        mutation = self._insert()
+        self._receipt = mutation.receipt
+        self.last_mutation_result = mutation.mutation_result
+        self.last_selected_page_indexes_after = mutation.receipt.inserted_page_indexes
+        self.last_current_page_index_after = mutation.receipt.inserted_page_indexes[0]
+        return CommandChange.from_command(self)
+
+    def undo(self) -> CommandChange:
+        self._require_not_disposed()
+        receipt = self._require_receipt()
+        mutation_result = self._mutation_service.undo_page_insertion(
+            self._working_copy_path,
+            receipt,
+        )
+        self.last_mutation_result = mutation_result
+        self.last_selected_page_indexes_after = self._selected_page_indexes_before
+        self.last_current_page_index_after = self._current_page_index_before
+        return CommandChange.from_command(self)
+
+    def redo(self) -> CommandChange:
+        self._require_not_disposed()
+        receipt = self._require_receipt()
+        mutation_result = self._mutation_service.redo_page_insertion(
+            self._working_copy_path,
+            receipt,
+        )
+        self.last_mutation_result = mutation_result
+        self.last_selected_page_indexes_after = receipt.inserted_page_indexes
+        self.last_current_page_index_after = receipt.inserted_page_indexes[0]
+        return CommandChange.from_command(self)
+
+    def dispose(self) -> None:
+        if self._disposed:
+            return
+        receipt = self._receipt
+        if receipt is not None:
+            self._mutation_service.discard_page_insertion_receipt(
+                self._working_copy_path,
+                receipt,
+            )
+            self._receipt = None
+        self._disposed = True
+
+    def _insert(self) -> PageInsertionMutation:
+        return self._mutation_service.insert_pages_from_pdf(
+            self._working_copy_path,
+            self._source_pdf_path,
+            self._plan.source_page_indexes,
+            self._plan.insertion_slot,
+            expected_target_snapshot=self._expected_target_snapshot,
+        )
+
+    def _require_receipt(self) -> PageInsertionReceipt:
+        if self._receipt is None:
+            raise RuntimeError("InsertPagesCommand has not been executed")
+        return self._receipt
+
+    def _require_not_disposed(self) -> None:
+        if self._disposed:
+            raise RuntimeError("InsertPagesCommand has been disposed")

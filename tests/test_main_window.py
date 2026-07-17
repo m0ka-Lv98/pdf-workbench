@@ -42,6 +42,7 @@ from pdf_workbench.domain.command_history import (
 from pdf_workbench.domain.document_session import DocumentSession, FileFingerprint, SourceStatus
 from pdf_workbench.domain.mutation import PageIndexTransition, WorkingCopyMutationResult
 from pdf_workbench.domain.page_commands import DeletePagesCommand, RotatePagesCommand
+from pdf_workbench.domain.page_insertion import SourcePageSelection
 from pdf_workbench.services.page_coordinates import PageMetadata
 from pdf_workbench.services.pdf_page_mutation import (
     PdfPageMutationError,
@@ -73,6 +74,7 @@ from pdf_workbench.services.source_change_monitor import (
 )
 from pdf_workbench.ui.main_window import DocumentTab, MainWindow, RestoreSessionResult
 from pdf_workbench.ui.pdf_view import PdfView, PdfViewMutationSnapshot
+from pdf_workbench.ui.widgets.insert_pages_dialog import InsertPagesDialogResult
 from pdf_workbench.ui.widgets.search_bar import SearchBar, SearchInputSurface
 
 
@@ -263,6 +265,109 @@ class FakeSaveService(PdfSaveService):
             fingerprint=fingerprint,
             saved_at=saved_at,
         )
+
+
+def test_main_window_insert_pages_action_exists_and_is_enabled_with_document(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    target_path = create_simple_text_pdf(tmp_path / "insert-ui-target.pdf", ["A", "B"])
+
+    assert window.insert_pages_action.isEnabled() is False
+
+    window.open_document(target_path)
+    qtbot.waitUntil(lambda: window._current_document() is not None)
+
+    assert window.insert_pages_action.text() == "別のPDFからページを挿入…"
+    assert window.insert_pages_action.isEnabled() is True
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
+def test_main_window_insert_pages_cancel_keeps_history_and_dirty_state_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    target_path = create_simple_text_pdf(tmp_path / "insert-cancel-target.pdf", ["A", "B"])
+    window.open_document(target_path)
+    qtbot.waitUntil(lambda: window._current_document() is not None)
+    document = window._current_document()
+    assert document is not None
+    before_sha = file_sha256(document.session.document_path)
+    before_selection = document.view.selected_page_indexes
+
+    monkeypatch.setattr(window, "_choose_insert_source_path", lambda _document: None)
+
+    window._insert_pages_from_pdf()
+
+    assert document.command_history.can_undo is False
+    assert document.session.is_modified is False
+    assert document.view.selected_page_indexes == before_selection
+    assert file_sha256(document.session.document_path) == before_sha
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
+def test_main_window_insert_pages_builds_insert_command_from_ui_flow(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    target_path = create_simple_text_pdf(tmp_path / "insert-exec-target.pdf", ["A", "B"])
+    source_path = create_simple_text_pdf(tmp_path / "insert-exec-source.pdf", ["X", "Y"])
+    window.open_document(target_path)
+    qtbot.waitUntil(lambda: window._current_document() is not None)
+    document = window._current_document()
+    assert document is not None
+    executed_commands: list[DocumentCommand] = []
+
+    monkeypatch.setattr(window, "_choose_insert_source_path", lambda _document: source_path)
+    monkeypatch.setattr(
+        window,
+        "_choose_insert_pages_options",
+        lambda _document, **_kwargs: InsertPagesDialogResult(
+            page_selection=SourcePageSelection(2, (0, 1)),
+            insertion_slot=1,
+        ),
+    )
+    monkeypatch.setattr(
+        window,
+        "execute_document_command",
+        lambda command: executed_commands.append(command) or True,
+    )
+
+    window._insert_pages_from_pdf()
+
+    assert len(executed_commands) == 1
+    command = executed_commands[0]
+    assert command.description == "2ページを挿入"
+    assert command.requires_document_reload is True
+    assert command.mutates_working_copy is True
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
 
 
 class SnapshotRecordingSaveService(PdfSaveService):

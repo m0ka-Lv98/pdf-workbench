@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QFrame,
     QLabel,
+    QListView,
     QScrollArea,
     QSizePolicy,
     QSplitter,
@@ -535,6 +536,10 @@ class PdfView(QWidget):
     @property
     def selected_page_indexes(self) -> tuple[int, ...]:
         return self._page_organizer.selected_page_indexes
+
+    @property
+    def organizer_list_view(self) -> QListView:
+        return self._page_organizer.list_view
 
     @property
     def document_id(self) -> str:
