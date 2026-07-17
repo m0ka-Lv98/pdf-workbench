@@ -11,6 +11,7 @@ from pdf_workbench.domain.page_insertion import SourcePageSelection
 from pdf_workbench.ui.widgets.document_toolbar import DocumentToolbar, ToolbarState, button_has_icon
 from pdf_workbench.ui.widgets.empty_state import EmptyState
 from pdf_workbench.ui.widgets.insert_pages_dialog import InsertPagesDialog
+from pdf_workbench.ui.widgets.replace_pages_dialog import ReplacePagesDialog
 
 
 def test_document_toolbar_updates_state_and_emits_signals(qtbot: QtBot) -> None:
@@ -350,6 +351,51 @@ def test_insert_pages_dialog_summary_is_selectable(qtbot: QtBot, tmp_path: Path)
     assert (
         summary.textInteractionFlags() & Qt.TextInteractionFlag.TextSelectableByMouse
     ) == Qt.TextInteractionFlag.TextSelectableByMouse
+
+
+def test_replace_pages_dialog_accepts_matching_selection(qtbot: QtBot, tmp_path: Path) -> None:
+    dialog = ReplacePagesDialog(
+        tmp_path / "source.pdf",
+        5,
+        (2, 5),
+    )
+    qtbot.addWidget(dialog)
+
+    assert dialog.page_range_edit.objectName() == "replaceSourcePageRangeEdit"
+    dialog.page_range_edit.setText("1,3")
+    dialog._accept_with_validation()
+
+    assert dialog.result() == dialog.DialogCode.Accepted
+    assert dialog.dialog_result is not None
+    assert dialog.dialog_result.page_selection == SourcePageSelection(5, (0, 2))
+
+
+def test_replace_pages_dialog_rejects_mismatched_page_counts(
+    qtbot: QtBot,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dialog = ReplacePagesDialog(
+        tmp_path / "source.pdf",
+        5,
+        (1, 2, 3),
+    )
+    qtbot.addWidget(dialog)
+    warnings: list[str] = []
+
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda _parent, _title, message, *args, **kwargs: (
+            warnings.append(message) or QMessageBox.StandardButton.Ok
+        ),
+    )
+
+    dialog.page_range_edit.setText("1-2")
+    dialog._accept_with_validation()
+
+    assert dialog.dialog_result is None
+    assert warnings == ["置換元ページ数は置換対象ページ数と一致する必要があります"]
 
 
 def test_empty_state_shows_muted_message_for_no_recent_files(qtbot: QtBot) -> None:

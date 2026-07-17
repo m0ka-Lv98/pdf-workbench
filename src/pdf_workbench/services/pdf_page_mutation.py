@@ -23,6 +23,10 @@ from pdf_workbench.domain.document_session import FileFingerprint
 from pdf_workbench.domain.mutation import PageIndexTransition, WorkingCopyMutationResult
 from pdf_workbench.domain.page_insertion import PageInsertionPlan, build_page_insertion_plan
 from pdf_workbench.domain.page_reorder import PageReorderPlan, build_page_reorder_plan
+from pdf_workbench.domain.page_replacement import (
+    PageReplacementPlan,
+    build_page_replacement_plan,
+)
 from pdf_workbench.services.pdf_document_validator import (
     PdfDocumentValidationError,
     PdfDocumentValidator,
@@ -410,6 +414,94 @@ class PageInsertionReceipt:
 class PageInsertionMutation:
     mutation_result: WorkingCopyMutationResult
     receipt: PageInsertionReceipt
+
+
+@dataclass(frozen=True, slots=True)
+class PageReplacementReceipt:
+    working_copy_path: Path
+    target_page_count_before: int
+    source_snapshot_path: Path
+    source_snapshot_sha256: str
+    source_snapshot_page_count: int
+    target_undo_snapshot_path: Path
+    target_undo_snapshot_sha256: str
+    target_before_snapshot: PdfDocumentStructureSnapshot
+    target_after_snapshot: PdfDocumentStructureSnapshot
+    source_selected_page_snapshots: tuple[PdfPageStructureSnapshot, ...]
+    target_page_indexes: tuple[int, ...]
+    source_page_indexes: tuple[int, ...]
+    execute_transition: PageIndexTransition
+    undo_transition: PageIndexTransition
+
+    def __post_init__(self) -> None:
+        if not self.working_copy_path.is_absolute():
+            raise ValueError("working_copy_path must be absolute")
+        if self.working_copy_path.suffix.lower() != ".pdf":
+            raise ValueError("working_copy_path must point to a PDF")
+        if isinstance(self.target_page_count_before, bool) or not isinstance(
+            self.target_page_count_before,
+            Integral,
+        ):
+            raise ValueError("target_page_count_before must be an integer")
+        if self.target_page_count_before <= 0:
+            raise ValueError("target_page_count_before must be positive")
+        if self.target_before_snapshot.page_count != self.target_page_count_before:
+            raise ValueError(
+                "target_before_snapshot page count must match target_page_count_before"
+            )
+        if self.target_after_snapshot.page_count != self.target_page_count_before:
+            raise ValueError("target_after_snapshot page count must stay unchanged")
+        if not self.source_snapshot_path.is_absolute():
+            raise ValueError("source_snapshot_path must be absolute")
+        if not self.target_undo_snapshot_path.is_absolute():
+            raise ValueError("target_undo_snapshot_path must be absolute")
+        if self.source_snapshot_path == self.working_copy_path:
+            raise ValueError("source_snapshot_path must differ from working_copy_path")
+        if self.target_undo_snapshot_path == self.working_copy_path:
+            raise ValueError("target_undo_snapshot_path must differ from working_copy_path")
+        if self.source_snapshot_path == self.target_undo_snapshot_path:
+            raise ValueError("snapshot paths must differ")
+        if len(self.source_snapshot_sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in self.source_snapshot_sha256
+        ):
+            raise ValueError("source_snapshot_sha256 must be a lowercase SHA-256 hex digest")
+        if len(self.target_undo_snapshot_sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in self.target_undo_snapshot_sha256
+        ):
+            raise ValueError("target_undo_snapshot_sha256 must be a lowercase SHA-256 hex digest")
+        plan = build_page_replacement_plan(
+            self.target_page_count_before,
+            self.source_snapshot_page_count,
+            self.target_page_indexes,
+            self.source_page_indexes,
+        )
+        if len(self.source_selected_page_snapshots) != len(plan.source_page_indexes):
+            raise ValueError("source_selected_page_snapshots length must match source_page_indexes")
+        if self.execute_transition.old_page_count != self.target_page_count_before:
+            raise ValueError("execute_transition old_page_count is invalid")
+        if self.execute_transition.new_page_count != self.target_page_count_before:
+            raise ValueError("execute_transition new_page_count is invalid")
+        if self.execute_transition.cache_old_to_new != plan.execute_cache_old_to_new:
+            raise ValueError("execute_transition cache_old_to_new is invalid")
+        if self.execute_transition.current_page_old_to_new != plan.execute_current_page_old_to_new:
+            raise ValueError("execute_transition current_page_old_to_new is invalid")
+        if self.undo_transition.old_page_count != self.target_page_count_before:
+            raise ValueError("undo_transition old_page_count is invalid")
+        if self.undo_transition.new_page_count != self.target_page_count_before:
+            raise ValueError("undo_transition new_page_count is invalid")
+        if self.undo_transition.cache_old_to_new != plan.execute_cache_old_to_new:
+            raise ValueError("undo_transition cache_old_to_new is invalid")
+        if self.undo_transition.current_page_old_to_new != plan.execute_current_page_old_to_new:
+            raise ValueError("undo_transition current_page_old_to_new is invalid")
+        object.__setattr__(self, "target_page_count_before", int(self.target_page_count_before))
+        object.__setattr__(self, "target_page_indexes", plan.target_page_indexes)
+        object.__setattr__(self, "source_page_indexes", plan.source_page_indexes)
+
+
+@dataclass(frozen=True, slots=True)
+class PageReplacementMutation:
+    mutation_result: WorkingCopyMutationResult
+    receipt: PageReplacementReceipt
 
 
 @dataclass(frozen=True, slots=True)
@@ -1030,6 +1122,309 @@ class PdfPageMutationService:
             undo_error = exc
         except OSError as exc:
             undo_error = PdfPageMutationError("挿入前スナップショットPDFの削除に失敗しました")
+            undo_error.__cause__ = exc
+        if source_error is not None:
+            raise source_error
+        if undo_error is not None:
+            raise undo_error
+
+    def replace_pages_from_pdf(
+        self,
+        target_path: Path,
+        source_path: Path,
+        target_page_indexes: Sequence[object],
+        source_page_indexes: Sequence[object],
+        *,
+        expected_target_snapshot: PdfDocumentStructureSnapshot | None = None,
+    ) -> PageReplacementMutation:
+        resolved_target_path = target_path.expanduser().resolve()
+        resolved_source_path = source_path.expanduser().resolve()
+        candidate_path: Path | None = None
+        source_snapshot_path: Path | None = None
+        target_undo_snapshot_path: Path | None = None
+        primary_error: BaseException | None = None
+
+        try:
+            old_revision = DocumentRevision.from_path(resolved_target_path)
+            target_before_snapshot = self._snapshot_document_structure(resolved_target_path)
+            if (
+                expected_target_snapshot is not None
+                and target_before_snapshot != expected_target_snapshot
+            ):
+                raise PdfPageMutationError("置換対象PDFの前提状態が変化しました")
+            self._reject_unsupported_page_insertion_target_structures(resolved_target_path)
+
+            source_original_fingerprint = self._source_snapshot_fingerprint(resolved_source_path)
+            source_original_sha256 = self._sha256_file(resolved_source_path)
+            source_snapshot_path = self._create_replace_source_snapshot_path(resolved_target_path)
+            self._copy_named_snapshot(
+                resolved_source_path,
+                source_snapshot_path,
+                create_error="置換元スナップショットPDFの作成に失敗しました",
+                fsync_error="置換元スナップショットPDFの同期に失敗しました",
+            )
+            source_snapshot_sha256 = self._sha256_file(source_snapshot_path)
+            if source_snapshot_sha256 != source_original_sha256:
+                raise PdfPageMutationError("置換元スナップショットPDFの整合性検証に失敗しました")
+            source_current_fingerprint = self._source_snapshot_fingerprint(resolved_source_path)
+            source_current_sha256 = self._sha256_file(resolved_source_path)
+            if (
+                source_current_fingerprint != source_original_fingerprint
+                or source_current_sha256 != source_original_sha256
+            ):
+                raise PdfPageMutationError("置換元PDFが読み取り中に変更されました")
+
+            source_snapshot_page_count = self.read_page_count(source_snapshot_path)
+            plan = build_page_replacement_plan(
+                target_before_snapshot.page_count,
+                source_snapshot_page_count,
+                tuple(
+                    _require_strict_int(page_index, label="target_page_indexes")
+                    for page_index in target_page_indexes
+                ),
+                tuple(
+                    _require_strict_int(page_index, label="source_page_indexes")
+                    for page_index in source_page_indexes
+                ),
+            )
+            self._validate_replace_source_snapshot_path(
+                source_snapshot_path,
+                expected_page_count=source_snapshot_page_count,
+                render_page_indexes=plan.source_page_indexes,
+            )
+            self._reject_unsupported_page_insertion_source_structures(
+                source_snapshot_path,
+                plan.source_page_indexes,
+            )
+            source_selected_page_snapshots = self._snapshot_selected_source_pages(
+                source_snapshot_path,
+                plan.source_page_indexes,
+            )
+            target_undo_snapshot_path = self._create_replace_undo_snapshot(
+                resolved_target_path,
+                expected_page_count=target_before_snapshot.page_count,
+                render_page_indexes=plan.target_page_indexes,
+            )
+            target_undo_snapshot_sha256 = self._sha256_file(target_undo_snapshot_path)
+
+            with (
+                pikepdf.open(resolved_target_path) as target_pdf,
+                pikepdf.open(source_snapshot_path) as source_pdf,
+            ):
+                self._apply_page_replacement_pairs(
+                    target_pdf,
+                    source_pdf,
+                    plan=plan,
+                    source_selected_page_snapshots=source_selected_page_snapshots,
+                )
+                candidate_path = self._create_candidate_path(resolved_target_path)
+                self._write_pikepdf_candidate(target_pdf, candidate_path)
+
+            target_after_snapshot = self._validate_page_replacement_candidate(
+                candidate_path,
+                source_snapshot_path=source_snapshot_path,
+                target_before_snapshot=target_before_snapshot,
+                source_selected_page_snapshots=source_selected_page_snapshots,
+                plan=plan,
+            )
+            new_revision = self._build_revision_from_candidate(candidate_path, resolved_target_path)
+            execute_transition = self._build_replace_execute_transition(plan)
+            undo_transition = self._build_replace_undo_transition(plan)
+            receipt = PageReplacementReceipt(
+                working_copy_path=resolved_target_path,
+                target_page_count_before=target_before_snapshot.page_count,
+                source_snapshot_path=source_snapshot_path,
+                source_snapshot_sha256=source_snapshot_sha256,
+                source_snapshot_page_count=source_snapshot_page_count,
+                target_undo_snapshot_path=target_undo_snapshot_path,
+                target_undo_snapshot_sha256=target_undo_snapshot_sha256,
+                target_before_snapshot=target_before_snapshot,
+                target_after_snapshot=target_after_snapshot,
+                source_selected_page_snapshots=source_selected_page_snapshots,
+                target_page_indexes=plan.target_page_indexes,
+                source_page_indexes=plan.source_page_indexes,
+                execute_transition=execute_transition,
+                undo_transition=undo_transition,
+            )
+            mutation_result = WorkingCopyMutationResult(
+                old_revision=old_revision,
+                new_revision=new_revision,
+                page_count=target_after_snapshot.page_count,
+                affected_pages=frozenset(plan.replaced_page_indexes_after),
+                page_index_transition=execute_transition,
+            )
+            prepared_result = PageReplacementMutation(
+                mutation_result=mutation_result,
+                receipt=receipt,
+            )
+            self._replace_atomically(candidate_path, resolved_target_path)
+            self._fsync_parent_directory(resolved_target_path.parent)
+            return prepared_result
+        except PdfPageMutationError as exc:
+            primary_error = exc
+            raise
+        except TypeError as exc:
+            primary_error = exc
+            raise
+        except ValueError as exc:
+            primary_error = exc
+            raise
+        except OSError as exc:
+            primary_error = exc
+            raise PdfPageMutationError("作業コピーPDFの更新に失敗しました") from exc
+        except Exception as exc:
+            primary_error = exc
+            raise PdfPageMutationError("作業コピーPDFの更新に失敗しました") from exc
+        finally:
+            self._cleanup_candidate(candidate_path, primary_error=primary_error)
+            if primary_error is not None:
+                self._cleanup_insert_snapshot(source_snapshot_path, primary_error=primary_error)
+                self._cleanup_insert_snapshot(
+                    target_undo_snapshot_path,
+                    primary_error=primary_error,
+                )
+
+    def undo_page_replacement(
+        self,
+        path: Path,
+        receipt: PageReplacementReceipt,
+    ) -> WorkingCopyMutationResult:
+        resolved_path = path.expanduser().resolve()
+        candidate_path: Path | None = None
+        primary_error: BaseException | None = None
+        try:
+            old_revision = DocumentRevision.from_path(resolved_path)
+            self._validate_current_replacement_state(resolved_path, receipt)
+            self._validate_replace_target_undo_snapshot(resolved_path, receipt)
+            candidate_path = self._create_candidate_path(resolved_path)
+            self._copy_named_snapshot(
+                receipt.target_undo_snapshot_path,
+                candidate_path,
+                create_error="置換前スナップショットPDFの復元に失敗しました",
+                fsync_error="置換前スナップショットPDFの復元に失敗しました",
+            )
+            self._validate_undo_page_replacement_candidate(candidate_path, receipt)
+            new_revision = self._build_revision_from_candidate(candidate_path, resolved_path)
+            mutation_result = WorkingCopyMutationResult(
+                old_revision=old_revision,
+                new_revision=new_revision,
+                page_count=receipt.target_page_count_before,
+                affected_pages=frozenset(receipt.target_page_indexes),
+                page_index_transition=receipt.undo_transition,
+            )
+            self._replace_atomically(candidate_path, resolved_path)
+            self._fsync_parent_directory(resolved_path.parent)
+            return mutation_result
+        except PdfPageMutationError as exc:
+            primary_error = exc
+            raise
+        except OSError as exc:
+            primary_error = exc
+            raise PdfPageMutationError("作業コピーPDFの更新に失敗しました") from exc
+        except Exception as exc:
+            primary_error = exc
+            raise PdfPageMutationError("作業コピーPDFの更新に失敗しました") from exc
+        finally:
+            self._cleanup_candidate(candidate_path, primary_error=primary_error)
+
+    def validate_replacement_redo_precondition(
+        self,
+        path: Path,
+        receipt: PageReplacementReceipt,
+    ) -> None:
+        resolved_path = path.expanduser().resolve()
+        current_snapshot = self._snapshot_document_structure(resolved_path)
+        if current_snapshot != receipt.target_before_snapshot:
+            raise PdfPageMutationError("置換対象PDFの前提状態が変化しました")
+        self._validate_replace_source_snapshot(resolved_path, receipt)
+        self._validate_replace_target_undo_snapshot(resolved_path, receipt)
+        self._reject_unsupported_page_insertion_target_structures(resolved_path)
+
+    def redo_page_replacement(
+        self,
+        path: Path,
+        receipt: PageReplacementReceipt,
+    ) -> WorkingCopyMutationResult:
+        resolved_path = path.expanduser().resolve()
+        candidate_path: Path | None = None
+        primary_error: BaseException | None = None
+        try:
+            old_revision = DocumentRevision.from_path(resolved_path)
+            self.validate_replacement_redo_precondition(resolved_path, receipt)
+            plan = build_page_replacement_plan(
+                receipt.target_page_count_before,
+                receipt.source_snapshot_page_count,
+                receipt.target_page_indexes,
+                receipt.source_page_indexes,
+            )
+            with (
+                pikepdf.open(resolved_path) as target_pdf,
+                pikepdf.open(receipt.source_snapshot_path) as source_pdf,
+            ):
+                self._apply_page_replacement_pairs(
+                    target_pdf,
+                    source_pdf,
+                    plan=plan,
+                    source_selected_page_snapshots=receipt.source_selected_page_snapshots,
+                )
+                candidate_path = self._create_candidate_path(resolved_path)
+                self._write_pikepdf_candidate(target_pdf, candidate_path)
+            self._validate_redo_page_replacement_candidate(candidate_path, receipt)
+            new_revision = self._build_revision_from_candidate(candidate_path, resolved_path)
+            mutation_result = WorkingCopyMutationResult(
+                old_revision=old_revision,
+                new_revision=new_revision,
+                page_count=receipt.target_after_snapshot.page_count,
+                affected_pages=frozenset(receipt.target_page_indexes),
+                page_index_transition=receipt.execute_transition,
+            )
+            self._replace_atomically(candidate_path, resolved_path)
+            self._fsync_parent_directory(resolved_path.parent)
+            return mutation_result
+        except PdfPageMutationError as exc:
+            primary_error = exc
+            raise
+        except OSError as exc:
+            primary_error = exc
+            raise PdfPageMutationError("作業コピーPDFの更新に失敗しました") from exc
+        except Exception as exc:
+            primary_error = exc
+            raise PdfPageMutationError("作業コピーPDFの更新に失敗しました") from exc
+        finally:
+            self._cleanup_candidate(candidate_path, primary_error=primary_error)
+
+    def discard_page_replacement_receipt(
+        self,
+        working_copy_path: Path,
+        receipt: PageReplacementReceipt,
+    ) -> None:
+        source_error: PdfPageMutationError | None = None
+        undo_error: PdfPageMutationError | None = None
+        try:
+            snapshot_path = self._validate_replace_source_snapshot_ownership(
+                working_copy_path,
+                receipt,
+                require_exists=False,
+            )
+            if snapshot_path.exists():
+                snapshot_path.unlink()
+        except PdfPageMutationError as exc:
+            source_error = exc
+        except OSError as exc:
+            source_error = PdfPageMutationError("置換元スナップショットPDFの削除に失敗しました")
+            source_error.__cause__ = exc
+        try:
+            snapshot_path = self._validate_replace_target_undo_snapshot_ownership(
+                working_copy_path,
+                receipt,
+                require_exists=False,
+            )
+            if snapshot_path.exists():
+                snapshot_path.unlink()
+        except PdfPageMutationError as exc:
+            undo_error = exc
+        except OSError as exc:
+            undo_error = PdfPageMutationError("置換前スナップショットPDFの削除に失敗しました")
             undo_error.__cause__ = exc
         if source_error is not None:
             raise source_error
@@ -1717,6 +2112,41 @@ class PdfPageMutationService:
                 fsync_error="挿入前スナップショットPDFの同期に失敗しました",
             )
             self._validate_insert_target_undo_snapshot_path(
+                snapshot_path,
+                expected_page_count=expected_page_count,
+                render_page_indexes=render_page_indexes,
+            )
+            return snapshot_path
+        except Exception:
+            self._cleanup_insert_snapshot(snapshot_path, primary_error=None)
+            raise
+
+    def _create_replace_source_snapshot_path(self, target_path: Path) -> Path:
+        prefix = f".{target_path.stem}.replace-source."
+        file_descriptor, snapshot_name = tempfile.mkstemp(
+            dir=target_path.parent,
+            prefix=prefix,
+            suffix=".pdf",
+        )
+        os.close(file_descriptor)
+        return Path(snapshot_name)
+
+    def _create_replace_undo_snapshot(
+        self,
+        target_path: Path,
+        *,
+        expected_page_count: int,
+        render_page_indexes: tuple[int, ...],
+    ) -> Path:
+        snapshot_path = self._create_named_snapshot_path(target_path, label="replace-undo")
+        try:
+            self._copy_named_snapshot(
+                target_path,
+                snapshot_path,
+                create_error="置換前スナップショットPDFの作成に失敗しました",
+                fsync_error="置換前スナップショットPDFの同期に失敗しました",
+            )
+            self._validate_replace_target_undo_snapshot_path(
                 snapshot_path,
                 expected_page_count=expected_page_count,
                 render_page_indexes=render_page_indexes,
@@ -2757,6 +3187,53 @@ class PdfPageMutationService:
         )
         return copied_annot
 
+    def _replace_page_contents(
+        self,
+        target_pdf: pikepdf.Pdf,
+        source_pdf: pikepdf.Pdf,
+        *,
+        target_page: pikepdf.Page,
+        source_page: pikepdf.Page,
+        source_page_snapshot: PdfPageStructureSnapshot,
+    ) -> None:
+        imported_page_object = self._copy_foreign_page_object(
+            target_pdf,
+            source_pdf,
+            source_page=source_page,
+        )
+        contents = imported_page_object.get("/Contents", None)
+        if contents is None:
+            if "/Contents" in target_page.obj:
+                del target_page.obj["/Contents"]
+        else:
+            target_page.obj[NameObject("/Contents")] = contents
+        self._materialize_imported_page_structure(target_page, source_page_snapshot)
+        self._copy_imported_page_annotations(
+            target_pdf,
+            source_pdf,
+            source_page=source_page,
+            inserted_page=target_page,
+        )
+
+    def _copy_foreign_page_object(
+        self,
+        target_pdf: pikepdf.Pdf,
+        source_pdf: pikepdf.Pdf,
+        *,
+        source_page: pikepdf.Page,
+    ) -> pikepdf.Dictionary:
+        source_handle = source_page.obj
+        if not self._has_indirect_objgen(getattr(source_handle, "objgen", None)):
+            source_handle = source_pdf.make_indirect(source_handle)
+        try:
+            copied_page = target_pdf.copy_foreign(source_handle)
+        except Exception as exc:
+            raise PdfPageMutationError("置換元ページのコピーに失敗しました") from exc
+        resolved = self._dereference(copied_page)
+        if not isinstance(resolved, pikepdf.Dictionary):
+            raise PdfPageMutationError("置換元ページのコピーに失敗しました")
+        return resolved
+
     def _rewrite_imported_annotation_parent(
         self,
         annotation: Any,
@@ -2859,6 +3336,27 @@ class PdfPageMutationService:
             rotate_key = NameObject("/Rotate")
             if rotate_key in page.obj:
                 del page.obj[rotate_key]
+
+    def _apply_page_replacement_pairs(
+        self,
+        target_pdf: pikepdf.Pdf,
+        source_pdf: pikepdf.Pdf,
+        *,
+        plan: PageReplacementPlan,
+        source_selected_page_snapshots: tuple[PdfPageStructureSnapshot, ...],
+    ) -> None:
+        for (target_page_index, source_page_index), source_page_snapshot in zip(
+            plan.replacement_pairs,
+            source_selected_page_snapshots,
+            strict=True,
+        ):
+            self._replace_page_contents(
+                target_pdf,
+                source_pdf,
+                target_page=target_pdf.pages[target_page_index],
+                source_page=source_pdf.pages[source_page_index],
+                source_page_snapshot=source_page_snapshot,
+            )
 
     def _set_optional_page_box(
         self,
@@ -3230,6 +3728,46 @@ class PdfPageMutationService:
             if source_render[source_page_index] != imported_render[imported_page_index]:
                 raise PdfPageMutationError("挿入ページの描画検証に失敗しました")
 
+    def _validate_page_replacement_candidate(
+        self,
+        path: Path,
+        *,
+        source_snapshot_path: Path,
+        target_before_snapshot: PdfDocumentStructureSnapshot,
+        source_selected_page_snapshots: tuple[PdfPageStructureSnapshot, ...],
+        plan: PageReplacementPlan,
+    ) -> PdfDocumentStructureSnapshot:
+        self._validate_basic_candidate(path, expected_page_count=target_before_snapshot.page_count)
+        after_snapshot = self._snapshot_document_structure(path)
+        self._validate_document_level_snapshots(
+            after_snapshot,
+            target_before_snapshot,
+            page_mapping=tuple(range(target_before_snapshot.page_count)),
+        )
+        replaced_lookup = dict(
+            zip(
+                plan.target_page_indexes,
+                source_selected_page_snapshots,
+                strict=True,
+            )
+        )
+        for page_index, current_page in enumerate(after_snapshot.pages):
+            replacement_source = replaced_lookup.get(page_index)
+            if replacement_source is None:
+                if current_page != target_before_snapshot.pages[page_index]:
+                    raise PdfPageMutationError("更新後のページ順序または構造の検証に失敗しました")
+                continue
+            if current_page != self._expected_imported_page_snapshot(replacement_source):
+                raise PdfPageMutationError("置換ページの構造検証に失敗しました")
+        self._render_pages(path, plan.target_page_indexes)
+        self._validate_inserted_page_render_equivalence(
+            source_path=source_snapshot_path,
+            source_page_indexes=plan.source_page_indexes,
+            imported_path=path,
+            imported_page_indexes=plan.target_page_indexes,
+        )
+        return after_snapshot
+
     def _validate_page_deletion_candidate(
         self,
         path: Path,
@@ -3371,6 +3909,15 @@ class PdfPageMutationService:
         if current_snapshot != receipt.target_after_snapshot:
             raise PdfPageMutationError("挿入済みページの状態が変化しているため元に戻せません")
 
+    def _validate_current_replacement_state(
+        self,
+        path: Path,
+        receipt: PageReplacementReceipt,
+    ) -> None:
+        current_snapshot = self._snapshot_document_structure(path)
+        if current_snapshot != receipt.target_after_snapshot:
+            raise PdfPageMutationError("置換済みページの状態が変化しているため元に戻せません")
+
     def _validate_insert_source_snapshot(
         self,
         working_copy_path: Path,
@@ -3391,6 +3938,27 @@ class PdfPageMutationService:
         snapshot = self._snapshot_selected_source_pages(snapshot_path, receipt.source_page_indexes)
         if snapshot != receipt.source_selected_page_snapshots:
             raise PdfPageMutationError("挿入元スナップショットの構造検証に失敗しました")
+
+    def _validate_replace_source_snapshot(
+        self,
+        working_copy_path: Path,
+        receipt: PageReplacementReceipt,
+    ) -> None:
+        snapshot_path = self._validate_replace_source_snapshot_ownership(
+            working_copy_path,
+            receipt,
+            require_exists=True,
+        )
+        if self._sha256_file(snapshot_path) != receipt.source_snapshot_sha256:
+            raise PdfPageMutationError("置換元スナップショットの整合性検証に失敗しました")
+        self._validate_replace_source_snapshot_path(
+            snapshot_path,
+            expected_page_count=receipt.source_snapshot_page_count,
+            render_page_indexes=receipt.source_page_indexes,
+        )
+        snapshot = self._snapshot_selected_source_pages(snapshot_path, receipt.source_page_indexes)
+        if snapshot != receipt.source_selected_page_snapshots:
+            raise PdfPageMutationError("置換元スナップショットの構造検証に失敗しました")
 
     def _validate_insert_target_undo_snapshot(
         self,
@@ -3415,6 +3983,27 @@ class PdfPageMutationService:
         snapshot = self._snapshot_document_structure(snapshot_path)
         if snapshot != receipt.target_before_snapshot:
             raise PdfPageMutationError("挿入前スナップショットの構造検証に失敗しました")
+
+    def _validate_replace_target_undo_snapshot(
+        self,
+        working_copy_path: Path,
+        receipt: PageReplacementReceipt,
+    ) -> None:
+        snapshot_path = self._validate_replace_target_undo_snapshot_ownership(
+            working_copy_path,
+            receipt,
+            require_exists=True,
+        )
+        if self._sha256_file(snapshot_path) != receipt.target_undo_snapshot_sha256:
+            raise PdfPageMutationError("置換前スナップショットの整合性検証に失敗しました")
+        self._validate_replace_target_undo_snapshot_path(
+            snapshot_path,
+            expected_page_count=receipt.target_page_count_before,
+            render_page_indexes=receipt.target_page_indexes,
+        )
+        snapshot = self._snapshot_document_structure(snapshot_path)
+        if snapshot != receipt.target_before_snapshot:
+            raise PdfPageMutationError("置換前スナップショットの構造検証に失敗しました")
 
     def _validate_insert_source_snapshot_ownership(
         self,
@@ -3443,6 +4032,36 @@ class PdfPageMutationService:
             receipt.working_copy_path,
             receipt.target_undo_snapshot_path,
             expected_label="insert-undo",
+            require_exists=require_exists,
+        )
+
+    def _validate_replace_source_snapshot_ownership(
+        self,
+        working_copy_path: Path,
+        receipt: PageReplacementReceipt,
+        *,
+        require_exists: bool,
+    ) -> Path:
+        return self._validate_named_snapshot_ownership(
+            working_copy_path,
+            receipt.working_copy_path,
+            receipt.source_snapshot_path,
+            expected_label="replace-source",
+            require_exists=require_exists,
+        )
+
+    def _validate_replace_target_undo_snapshot_ownership(
+        self,
+        working_copy_path: Path,
+        receipt: PageReplacementReceipt,
+        *,
+        require_exists: bool,
+    ) -> Path:
+        return self._validate_named_snapshot_ownership(
+            working_copy_path,
+            receipt.working_copy_path,
+            receipt.target_undo_snapshot_path,
+            expected_label="replace-undo",
             require_exists=require_exists,
         )
 
@@ -3512,6 +4131,38 @@ class PdfPageMutationService:
         except PdfPageMutationError as exc:
             raise PdfPageMutationError("挿入前スナップショットPDFの検証に失敗しました") from exc
 
+    def _validate_replace_source_snapshot_path(
+        self,
+        path: Path,
+        *,
+        expected_page_count: int,
+        render_page_indexes: tuple[int, ...],
+    ) -> None:
+        try:
+            self._validate_basic_candidate(path, expected_page_count=expected_page_count)
+            self._render_pages(
+                path,
+                self._normalize_render_page_indexes(expected_page_count, render_page_indexes),
+            )
+        except PdfPageMutationError as exc:
+            raise PdfPageMutationError("置換元スナップショットPDFの検証に失敗しました") from exc
+
+    def _validate_replace_target_undo_snapshot_path(
+        self,
+        path: Path,
+        *,
+        expected_page_count: int,
+        render_page_indexes: tuple[int, ...],
+    ) -> None:
+        try:
+            self._validate_basic_candidate(path, expected_page_count=expected_page_count)
+            self._render_pages(
+                path,
+                self._normalize_render_page_indexes(expected_page_count, render_page_indexes),
+            )
+        except PdfPageMutationError as exc:
+            raise PdfPageMutationError("置換前スナップショットPDFの検証に失敗しました") from exc
+
     def _validate_undo_page_insertion_candidate(
         self,
         path: Path,
@@ -3553,6 +4204,34 @@ class PdfPageMutationService:
             source_page_indexes=receipt.source_page_indexes,
             imported_path=path,
             imported_page_indexes=plan.inserted_page_indexes_after,
+        )
+
+    def _validate_undo_page_replacement_candidate(
+        self,
+        path: Path,
+        receipt: PageReplacementReceipt,
+    ) -> None:
+        self._validate_basic_candidate(path, expected_page_count=receipt.target_page_count_before)
+        snapshot = self._snapshot_document_structure(path)
+        if snapshot != receipt.target_before_snapshot:
+            raise PdfPageMutationError("ページ置換の取り消し検証に失敗しました")
+        self._render_pages(path, receipt.target_page_indexes)
+
+    def _validate_redo_page_replacement_candidate(
+        self,
+        path: Path,
+        receipt: PageReplacementReceipt,
+    ) -> None:
+        self._validate_basic_candidate(path, expected_page_count=receipt.target_page_count_before)
+        snapshot = self._snapshot_document_structure(path)
+        if snapshot != receipt.target_after_snapshot:
+            raise PdfPageMutationError("ページ置換の再適用検証に失敗しました")
+        self._render_pages(path, receipt.target_page_indexes)
+        self._validate_inserted_page_render_equivalence(
+            source_path=receipt.source_snapshot_path,
+            source_page_indexes=receipt.source_page_indexes,
+            imported_path=path,
+            imported_page_indexes=receipt.target_page_indexes,
         )
 
     def _render_page_digests(
@@ -3728,6 +4407,28 @@ class PdfPageMutationService:
             new_page_count=plan.target_page_count,
             cache_old_to_new=tuple(cache_mapping),
             current_page_old_to_new=tuple(cache_mapping),
+        )
+
+    def _build_replace_execute_transition(
+        self,
+        plan: PageReplacementPlan,
+    ) -> PageIndexTransition:
+        return PageIndexTransition(
+            old_page_count=plan.target_page_count,
+            new_page_count=plan.target_page_count,
+            cache_old_to_new=plan.execute_cache_old_to_new,
+            current_page_old_to_new=plan.execute_current_page_old_to_new,
+        )
+
+    def _build_replace_undo_transition(
+        self,
+        plan: PageReplacementPlan,
+    ) -> PageIndexTransition:
+        return PageIndexTransition(
+            old_page_count=plan.target_page_count,
+            new_page_count=plan.target_page_count,
+            cache_old_to_new=plan.execute_cache_old_to_new,
+            current_page_old_to_new=plan.execute_current_page_old_to_new,
         )
 
     def _build_reorder_undo_transition(self, receipt: PageReorderReceipt) -> PageIndexTransition:
