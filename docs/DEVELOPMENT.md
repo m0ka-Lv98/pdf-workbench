@@ -84,6 +84,13 @@ PDF-writing PR の最低限の回帰チェック:
 - replace-from-PDF では source metadata / outlines / named destinations / attachments を統合しない方針を fixture で明示し、source PDF 自体が Save まで不変であることを確認する
 - replace-from-PDF では frozen source snapshot と target-before undo snapshot を working copy と同じ directory に保持し、redo が live source PDF の変更や削除に依存しないことを確認する
 - replace-from-PDF では source snapshot 改ざんや replace failure で fail-closed になり、working copy SHA が維持されることを確認する
+- crop-box editing では `/CropBox` だけを変更し、`/MediaBox`、`/Rotate`、content stream、annotation object、annotation `/Rect` が不変であることを確認する
+- crop-box editing では display-oriented margins を raw PDF user-space へ変換する pure helper を Qt UI から分離し、rotation 0 / 90 / 180 / 270 と non-zero origin の expected 値を固定した test を追加する
+- crop-box editing では direct / inherited / MediaBox fallback の各状態を fixture で分け、undo が元の direct presence を復元することを確認する
+- crop-box editing では execute / undo / redo の各経路で selection と current page を維持し、changed pages だけ cache remap が `None` になることを検証する
+- crop-box editing では numeric dialog cancel、active document 変更、save/mutation 開始後の stale context で command history、dirty state、working copy SHA が変わらないことを確認する
+- crop-box editing では content を削除せず annotation も移動しない方針を README と test に明記し、inside / partial / outside annotation で `/Rect` と fingerprint が不変なことを確認する
+- crop-box editing では drag overlay を追加せず、numeric dialog 方式だけを対象にする
 - page object と annotation object の独立性、annotation `/P` back-reference、raw/effective rotation、all page boxes の保存を検証する
 - execute / undo / redo の各経路で、pikepdf 再オープンと PDFium render を通して semantic restoration を確認する
 - form / widget page duplication は fail-closed とし、working copy hash が変わらないことを確認する

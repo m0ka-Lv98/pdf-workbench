@@ -18,16 +18,24 @@ from typing import Any, cast
 import pikepdf
 import pypdfium2 as pdfium  # type: ignore[import-untyped]
 from pypdf import PdfReader, PdfWriter
-from pypdf.generic import ArrayObject, NameObject, NumberObject
+from pypdf.generic import ArrayObject, FloatObject, NameObject, NumberObject
 
 from pdf_workbench.domain.document_session import FileFingerprint
 from pdf_workbench.domain.mutation import PageIndexTransition, WorkingCopyMutationResult
+from pdf_workbench.domain.page_crop import (
+    PageCropPlan,
+    PageCropTarget,
+)
+from pdf_workbench.domain.page_crop import (
+    PageCropState as CropPageState,
+)
 from pdf_workbench.domain.page_insertion import PageInsertionPlan, build_page_insertion_plan
 from pdf_workbench.domain.page_reorder import PageReorderPlan, build_page_reorder_plan
 from pdf_workbench.domain.page_replacement import (
     PageReplacementPlan,
     build_page_replacement_plan,
 )
+from pdf_workbench.services.page_coordinates import PdfRect
 from pdf_workbench.services.pdf_document_validator import (
     PdfDocumentValidationError,
     PdfDocumentValidator,
@@ -140,6 +148,68 @@ class PageRotationState:
     direct_rotate_present: bool
     direct_rotate_value: int | None
     effective_rotation: int
+
+
+@dataclass(frozen=True, slots=True)
+class PageCropReceipt:
+    working_copy_path: Path
+    before_snapshot: PdfDocumentStructureSnapshot
+    after_snapshot: PdfDocumentStructureSnapshot
+    original_crop_states: tuple[CropPageState, ...]
+    target_crop_states: tuple[PageCropTarget, ...]
+    changed_page_indexes: tuple[int, ...]
+    execute_transition: PageIndexTransition
+    undo_transition: PageIndexTransition
+
+    def __post_init__(self) -> None:
+        if not self.working_copy_path.is_absolute():
+            raise ValueError("working_copy_path must be absolute")
+        if self.working_copy_path.suffix.lower() != ".pdf":
+            raise ValueError("working_copy_path must point to a PDF")
+        if self.before_snapshot.page_count != self.after_snapshot.page_count:
+            raise ValueError("before and after snapshots must keep the same page count")
+        if not self.original_crop_states:
+            raise ValueError("original_crop_states must not be empty")
+        normalized_indexes = _validate_sorted_unique_page_indexes(
+            self.changed_page_indexes,
+            label="changed_page_indexes",
+            page_count=self.before_snapshot.page_count,
+        )
+        if len(self.original_crop_states) != len(normalized_indexes):
+            raise ValueError("original_crop_states length must match changed_page_indexes")
+        if len(self.target_crop_states) != len(normalized_indexes):
+            raise ValueError("target_crop_states length must match changed_page_indexes")
+        if tuple(state.page_index for state in self.original_crop_states) != normalized_indexes:
+            raise ValueError("original_crop_states must match changed_page_indexes")
+        if tuple(target.page_index for target in self.target_crop_states) != normalized_indexes:
+            raise ValueError("target_crop_states must match changed_page_indexes")
+        if self.execute_transition.old_page_count != self.before_snapshot.page_count:
+            raise ValueError("execute_transition old_page_count is invalid")
+        if self.execute_transition.new_page_count != self.before_snapshot.page_count:
+            raise ValueError("execute_transition new_page_count is invalid")
+        if self.undo_transition.old_page_count != self.before_snapshot.page_count:
+            raise ValueError("undo_transition old_page_count is invalid")
+        if self.undo_transition.new_page_count != self.before_snapshot.page_count:
+            raise ValueError("undo_transition new_page_count is invalid")
+        expected_cache_mapping = tuple(
+            None if page_index in set(normalized_indexes) else page_index
+            for page_index in range(self.before_snapshot.page_count)
+        )
+        expected_identity_mapping = tuple(range(self.before_snapshot.page_count))
+        if self.execute_transition.cache_old_to_new != expected_cache_mapping:
+            raise ValueError("execute_transition cache_old_to_new is invalid")
+        if self.execute_transition.current_page_old_to_new != expected_identity_mapping:
+            raise ValueError("execute_transition current_page_old_to_new is invalid")
+        if self.undo_transition.cache_old_to_new != expected_cache_mapping:
+            raise ValueError("undo_transition cache_old_to_new is invalid")
+        if self.undo_transition.current_page_old_to_new != expected_identity_mapping:
+            raise ValueError("undo_transition current_page_old_to_new is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class PageCropMutation:
+    mutation_result: WorkingCopyMutationResult
+    receipt: PageCropReceipt
 
 
 @dataclass(frozen=True, slots=True)
@@ -732,6 +802,212 @@ class PdfPageMutationService:
                 page_count=page_count,
                 affected_pages=frozenset(state.page_index for state in states),
             )
+        except PdfPageMutationError as exc:
+            primary_error = exc
+            raise
+        except OSError as exc:
+            primary_error = exc
+            raise PdfPageMutationError("作業コピーPDFの更新に失敗しました") from exc
+        except Exception as exc:
+            primary_error = exc
+            raise PdfPageMutationError("作業コピーPDFの更新に失敗しました") from exc
+        finally:
+            self._cleanup_candidate(candidate_path, primary_error=primary_error)
+
+    def read_crop_states(
+        self,
+        path: Path,
+        page_indexes: Sequence[object],
+    ) -> tuple[CropPageState, ...]:
+        normalized_indexes = tuple(
+            _require_strict_int(page_index, label="page_indexes") for page_index in page_indexes
+        )
+        resolved_path = path.expanduser().resolve()
+        try:
+            with resolved_path.open("rb") as source_stream:
+                reader = PdfReader(source_stream)
+                root = cast(Any, reader.trailer["/Root"])
+                root_pages = cast(Any, root["/Pages"]).get_object()
+                page_objects = self._collect_page_objects(root_pages)
+                validated_indexes = self._validate_page_indexes(
+                    normalized_indexes,
+                    len(page_objects),
+                )
+                return tuple(
+                    self._crop_state_for_page_object(page_objects[page_index], page_index)
+                    for page_index in validated_indexes
+                )
+        except PdfPageMutationError:
+            raise
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise PdfPageMutationError("PDFのトリミング状態を読み取れませんでした") from exc
+
+    def crop_pages(
+        self,
+        path: Path,
+        plan: PageCropPlan,
+        *,
+        expected_before_snapshot: PdfDocumentStructureSnapshot | None = None,
+    ) -> PageCropMutation:
+        resolved_path = path.expanduser().resolve()
+        candidate_path: Path | None = None
+        primary_error: BaseException | None = None
+
+        try:
+            old_revision = DocumentRevision.from_path(resolved_path)
+            before_snapshot = self._snapshot_document_structure(resolved_path)
+            if expected_before_snapshot is not None and before_snapshot != expected_before_snapshot:
+                raise PdfPageMutationError("トリミング対象ページの前提状態が変化しました")
+            original_crop_states = self.read_crop_states(resolved_path, plan.page_indexes)
+            with resolved_path.open("rb") as source_stream:
+                reader = PdfReader(source_stream)
+                writer = PdfWriter(clone_from=reader)
+                root_pages = cast(Any, writer.root_object["/Pages"]).get_object()
+                page_objects = self._collect_page_objects(root_pages)
+                candidate_path = self._create_candidate_path(resolved_path)
+                for target in plan.targets:
+                    page_object = cast(dict[object, object], page_objects[target.page_index])
+                    page_object[NameObject("/CropBox")] = self._crop_box_array_object(
+                        target.crop_box
+                    )
+                self._write_candidate(writer, candidate_path)
+            after_snapshot = self._validate_page_crop_candidate(
+                candidate_path,
+                before_snapshot=before_snapshot,
+                original_crop_states=original_crop_states,
+                target_crop_states=plan.targets,
+            )
+            new_revision = self._build_revision_from_candidate(candidate_path, resolved_path)
+            transition = self._build_crop_transition(before_snapshot.page_count, plan.page_indexes)
+            receipt = PageCropReceipt(
+                working_copy_path=resolved_path,
+                before_snapshot=before_snapshot,
+                after_snapshot=after_snapshot,
+                original_crop_states=original_crop_states,
+                target_crop_states=plan.targets,
+                changed_page_indexes=plan.page_indexes,
+                execute_transition=transition,
+                undo_transition=transition,
+            )
+            mutation_result = WorkingCopyMutationResult(
+                old_revision=old_revision,
+                new_revision=new_revision,
+                page_count=before_snapshot.page_count,
+                affected_pages=frozenset(plan.page_indexes),
+                page_index_transition=transition,
+            )
+            prepared = PageCropMutation(mutation_result=mutation_result, receipt=receipt)
+            self._replace_atomically(candidate_path, resolved_path)
+            self._fsync_parent_directory(resolved_path.parent)
+            return prepared
+        except PdfPageMutationError as exc:
+            primary_error = exc
+            raise
+        except TypeError as exc:
+            primary_error = exc
+            raise
+        except ValueError as exc:
+            primary_error = exc
+            raise
+        except OSError as exc:
+            primary_error = exc
+            raise PdfPageMutationError("作業コピーPDFの更新に失敗しました") from exc
+        except Exception as exc:
+            primary_error = exc
+            raise PdfPageMutationError("作業コピーPDFの更新に失敗しました") from exc
+        finally:
+            self._cleanup_candidate(candidate_path, primary_error=primary_error)
+
+    def undo_page_crop(
+        self,
+        path: Path,
+        receipt: PageCropReceipt,
+    ) -> WorkingCopyMutationResult:
+        resolved_path = path.expanduser().resolve()
+        candidate_path: Path | None = None
+        primary_error: BaseException | None = None
+        try:
+            old_revision = DocumentRevision.from_path(resolved_path)
+            self._validate_current_crop_state(resolved_path, receipt.after_snapshot)
+            with resolved_path.open("rb") as source_stream:
+                reader = PdfReader(source_stream)
+                writer = PdfWriter(clone_from=reader)
+                root_pages = cast(Any, writer.root_object["/Pages"]).get_object()
+                page_objects = self._collect_page_objects(root_pages)
+                candidate_path = self._create_candidate_path(resolved_path)
+                for state in receipt.original_crop_states:
+                    page_object = cast(dict[object, object], page_objects[state.page_index])
+                    if state.direct_crop_box_present:
+                        direct_value = state.direct_crop_box_value
+                        if direct_value is None:
+                            raise PdfPageMutationError("元のCropBox状態が不正です")
+                        page_object[NameObject("/CropBox")] = self._crop_box_array_object(
+                            direct_value
+                        )
+                    else:
+                        page_object.pop(NameObject("/CropBox"), None)
+                self._write_candidate(writer, candidate_path)
+            self._validate_undo_page_crop_candidate(candidate_path, receipt)
+            new_revision = self._build_revision_from_candidate(candidate_path, resolved_path)
+            result = WorkingCopyMutationResult(
+                old_revision=old_revision,
+                new_revision=new_revision,
+                page_count=receipt.before_snapshot.page_count,
+                affected_pages=frozenset(receipt.changed_page_indexes),
+                page_index_transition=receipt.undo_transition,
+            )
+            self._replace_atomically(candidate_path, resolved_path)
+            self._fsync_parent_directory(resolved_path.parent)
+            return result
+        except PdfPageMutationError as exc:
+            primary_error = exc
+            raise
+        except OSError as exc:
+            primary_error = exc
+            raise PdfPageMutationError("作業コピーPDFの更新に失敗しました") from exc
+        except Exception as exc:
+            primary_error = exc
+            raise PdfPageMutationError("作業コピーPDFの更新に失敗しました") from exc
+        finally:
+            self._cleanup_candidate(candidate_path, primary_error=primary_error)
+
+    def redo_page_crop(
+        self,
+        path: Path,
+        receipt: PageCropReceipt,
+    ) -> WorkingCopyMutationResult:
+        resolved_path = path.expanduser().resolve()
+        candidate_path: Path | None = None
+        primary_error: BaseException | None = None
+        try:
+            old_revision = DocumentRevision.from_path(resolved_path)
+            self._validate_current_crop_redo_state(resolved_path, receipt)
+            with resolved_path.open("rb") as source_stream:
+                reader = PdfReader(source_stream)
+                writer = PdfWriter(clone_from=reader)
+                root_pages = cast(Any, writer.root_object["/Pages"]).get_object()
+                page_objects = self._collect_page_objects(root_pages)
+                candidate_path = self._create_candidate_path(resolved_path)
+                for target in receipt.target_crop_states:
+                    page_object = cast(dict[object, object], page_objects[target.page_index])
+                    page_object[NameObject("/CropBox")] = self._crop_box_array_object(
+                        target.crop_box
+                    )
+                self._write_candidate(writer, candidate_path)
+            self._validate_redo_page_crop_candidate(candidate_path, receipt)
+            new_revision = self._build_revision_from_candidate(candidate_path, resolved_path)
+            result = WorkingCopyMutationResult(
+                old_revision=old_revision,
+                new_revision=new_revision,
+                page_count=receipt.after_snapshot.page_count,
+                affected_pages=frozenset(receipt.changed_page_indexes),
+                page_index_transition=receipt.execute_transition,
+            )
+            self._replace_atomically(candidate_path, resolved_path)
+            self._fsync_parent_directory(resolved_path.parent)
+            return result
         except PdfPageMutationError as exc:
             primary_error = exc
             raise
@@ -2089,6 +2365,141 @@ class PdfPageMutationService:
                     label="direct",
                 )
 
+    def _crop_state_for_page_object(self, page_object: Any, page_index: int) -> CropPageState:
+        direct_crop_value = page_object.get("/CropBox", None)
+        inherited_crop_value = (
+            None
+            if direct_crop_value is not None
+            else self._resolve_inherited_value(page_object, "/CropBox")
+        )
+        effective_media_box = self._normalized_effective_box(
+            self._require_effective_box(page_object, "/MediaBox", None),
+            label="MediaBox",
+            page_index=page_index,
+        )
+        effective_crop_source = direct_crop_value
+        if effective_crop_source is None:
+            effective_crop_source = inherited_crop_value
+        if effective_crop_source is None:
+            effective_crop_source = effective_media_box
+        effective_crop_box = self._normalized_effective_box(
+            effective_crop_source,
+            label="CropBox",
+            page_index=page_index,
+        )
+        self._ensure_box_within_media_box(
+            crop_box=effective_crop_box,
+            media_box=effective_media_box,
+            page_index=page_index,
+        )
+        return CropPageState(
+            page_index=page_index,
+            direct_crop_box_present=direct_crop_value is not None,
+            direct_crop_box_value=(
+                None
+                if direct_crop_value is None
+                else self._raw_box_tuple(direct_crop_value, label="CropBox", page_index=page_index)
+            ),
+            effective_crop_box=effective_crop_box,
+            effective_media_box=effective_media_box,
+            effective_rotation=self._page_effective_rotation(page_object, page_index),
+            crop_box_inherited=direct_crop_value is None and inherited_crop_value is not None,
+            crop_box_falls_back_to_media_box=(
+                direct_crop_value is None and inherited_crop_value is None
+            ),
+        )
+
+    def _page_effective_rotation(self, page_object: Any, page_index: int) -> int:
+        direct_rotate = page_object.get("/Rotate", None)
+        inherited_rotate = (
+            None
+            if direct_rotate is not None
+            else self._resolve_inherited_value(page_object, "/Rotate")
+        )
+        raw_rotation: object
+        if direct_rotate is None and inherited_rotate is None:
+            raw_rotation = 0
+        elif direct_rotate is not None:
+            raw_rotation = direct_rotate
+        else:
+            raw_rotation = inherited_rotate
+        return self._normalize_effective_rotation(
+            cast(int, raw_rotation),
+            page_index=page_index,
+            label="effective",
+        )
+
+    def _require_effective_box(self, page_object: Any, key: str, fallback: object | None) -> object:
+        direct_value = page_object.get(key, None)
+        if direct_value is not None:
+            return direct_value
+        inherited_value = self._resolve_inherited_value(page_object, key)
+        if inherited_value is not None:
+            return inherited_value
+        if key == "/CropBox" and fallback is not None:
+            return fallback
+        raise PdfPageMutationError("ページボックスが不正です")
+
+    def _raw_box_tuple(
+        self,
+        value: object,
+        *,
+        label: str,
+        page_index: int,
+    ) -> tuple[float, float, float, float]:
+        if not isinstance(value, (pikepdf.Array, list, tuple)):
+            raise PdfPageMutationError(f"{page_index + 1}ページ目の{label}が不正です")
+        values = tuple(value)
+        if len(values) != 4:
+            raise PdfPageMutationError(f"{page_index + 1}ページ目の{label}が不正です")
+        normalized_values: list[float] = []
+        for raw_value in values:
+            if isinstance(raw_value, bool) or not isinstance(raw_value, (Integral, float, Decimal)):
+                raise PdfPageMutationError(f"{page_index + 1}ページ目の{label}が不正です")
+            numeric_value = float(raw_value)
+            if not numeric_value == numeric_value or numeric_value in {float("inf"), float("-inf")}:
+                raise PdfPageMutationError(f"{page_index + 1}ページ目の{label}が不正です")
+            normalized_values.append(numeric_value)
+        return tuple(normalized_values)  # type: ignore[return-value]
+
+    def _normalized_effective_box(
+        self,
+        value: object,
+        *,
+        label: str,
+        page_index: int,
+    ) -> tuple[float, float, float, float]:
+        raw_box = self._raw_box_tuple(value, label=label, page_index=page_index)
+        try:
+            return PdfRect.normalized(raw_box).as_tuple()
+        except ValueError as exc:
+            raise PdfPageMutationError(f"{page_index + 1}ページ目の{label}が不正です") from exc
+
+    def _crop_box_array_object(
+        self,
+        box: tuple[float, float, float, float],
+    ) -> ArrayObject:
+        return ArrayObject([FloatObject(float(value)) for value in box])
+
+    def _ensure_box_within_media_box(
+        self,
+        *,
+        crop_box: tuple[float, float, float, float],
+        media_box: tuple[float, float, float, float],
+        page_index: int,
+    ) -> None:
+        crop_rect = PdfRect.from_tuple(crop_box)
+        media_rect = PdfRect.from_tuple(media_box)
+        if (
+            crop_rect.left < media_rect.left
+            or crop_rect.bottom < media_rect.bottom
+            or crop_rect.right > media_rect.right
+            or crop_rect.top > media_rect.top
+        ):
+            raise PdfPageMutationError(
+                f"{page_index + 1}ページ目のeffective CropBoxがeffective MediaBox外です"
+            )
+
     def _page_box_state(self, page: pikepdf.Page) -> PageBoxState:
         direct_media_box = page.obj.get("/MediaBox", None)
         inherited_crop_box = (
@@ -2429,6 +2840,233 @@ class PdfPageMutationService:
             if current_box_snapshot != original_box_snapshot:
                 raise PdfPageMutationError("ページボックスの検証に失敗しました")
         self._render_pages(path, tuple(state.page_index for state in expected_states))
+
+    def _validate_page_crop_candidate(
+        self,
+        path: Path,
+        *,
+        before_snapshot: PdfDocumentStructureSnapshot,
+        original_crop_states: tuple[CropPageState, ...],
+        target_crop_states: tuple[PageCropTarget, ...],
+    ) -> PdfDocumentStructureSnapshot:
+        self._validate_basic_candidate(path, expected_page_count=before_snapshot.page_count)
+        after_snapshot = self._snapshot_document_structure(path)
+        self._validate_document_level_snapshots(
+            after_snapshot,
+            before_snapshot,
+            page_mapping=tuple(range(before_snapshot.page_count)),
+        )
+        target_lookup = {target.page_index: target for target in target_crop_states}
+        original_lookup = {state.page_index: state for state in original_crop_states}
+        for page_index, current_page in enumerate(after_snapshot.pages):
+            target = target_lookup.get(page_index)
+            if target is None:
+                if current_page != before_snapshot.pages[page_index]:
+                    raise PdfPageMutationError("非対象ページの構造が変化しました")
+                continue
+            original_state = original_lookup[page_index]
+            expected_page = self._expected_cropped_page_snapshot(
+                before_snapshot.pages[page_index],
+                target_box=target.crop_box,
+            )
+            if current_page != expected_page:
+                raise PdfPageMutationError("更新後のCropBox検証に失敗しました")
+            if before_snapshot.pages[page_index].boxes.media_box != current_page.boxes.media_box:
+                raise PdfPageMutationError("MediaBoxの検証に失敗しました")
+            if (
+                before_snapshot.pages[page_index].effective_rotation
+                != current_page.effective_rotation
+            ):
+                raise PdfPageMutationError("回転状態の検証に失敗しました")
+            if (
+                before_snapshot.pages[page_index].content_fingerprint
+                != current_page.content_fingerprint
+            ):
+                raise PdfPageMutationError("Contents fingerprintの検証に失敗しました")
+            if (
+                before_snapshot.pages[page_index].resources_fingerprint
+                != current_page.resources_fingerprint
+            ):
+                raise PdfPageMutationError("Resources fingerprintの検証に失敗しました")
+            if before_snapshot.pages[page_index].annotations != current_page.annotations:
+                raise PdfPageMutationError("annotationの検証に失敗しました")
+            if current_page.boxes.crop_box != target.crop_box:
+                raise PdfPageMutationError("CropBoxの検証に失敗しました")
+            self._validate_rendered_crop_dimensions(
+                path,
+                page_index=page_index,
+                target_box=target.crop_box,
+                rotation=original_state.effective_rotation,
+            )
+        self._render_pages(path, tuple(target_lookup))
+        return after_snapshot
+
+    def _expected_cropped_page_snapshot(
+        self,
+        page: PdfPageStructureSnapshot,
+        *,
+        target_box: tuple[float, float, float, float],
+    ) -> PdfPageStructureSnapshot:
+        return PdfPageStructureSnapshot(
+            content_fingerprint=page.content_fingerprint,
+            boxes=PageBoxState(
+                media_box_direct_present=page.boxes.media_box_direct_present,
+                media_box=page.boxes.media_box,
+                crop_box=target_box,
+                crop_box_direct_present=True,
+                crop_box_inherited=False,
+                crop_box_falls_back_to_media_box=False,
+                trim_box=page.boxes.trim_box,
+                bleed_box=page.boxes.bleed_box,
+                art_box=page.boxes.art_box,
+            ),
+            direct_resources_present=page.direct_resources_present,
+            resources_fingerprint=page.resources_fingerprint,
+            direct_rotate_present=page.direct_rotate_present,
+            direct_rotate_value=page.direct_rotate_value,
+            effective_rotation=page.effective_rotation,
+            annotations=page.annotations,
+            direct_page_keys=self._crop_direct_page_keys(page.direct_page_keys),
+            extra_page_entries_fingerprint=page.extra_page_entries_fingerprint,
+        )
+
+    def _crop_direct_page_keys(self, keys: tuple[str, ...]) -> tuple[str, ...]:
+        key_set = set(keys)
+        key_set.add("/CropBox")
+        return tuple(sorted(key_set))
+
+    def _validate_current_crop_state(
+        self,
+        path: Path,
+        expected_snapshot: PdfDocumentStructureSnapshot,
+    ) -> None:
+        current_snapshot = self._snapshot_document_structure(path)
+        if current_snapshot != expected_snapshot:
+            raise PdfPageMutationError("トリミング対象ページの前提状態が変化しました")
+
+    def _validate_current_crop_redo_state(
+        self,
+        path: Path,
+        receipt: PageCropReceipt,
+    ) -> None:
+        current_snapshot = self._snapshot_document_structure(path)
+        self._validate_document_level_snapshots(
+            current_snapshot,
+            receipt.before_snapshot,
+            page_mapping=tuple(range(receipt.before_snapshot.page_count)),
+        )
+        current_states = self.read_crop_states(path, receipt.changed_page_indexes)
+        if current_states != receipt.original_crop_states:
+            raise PdfPageMutationError("トリミング対象ページの前提状態が変化しました")
+        for page_index, page in enumerate(current_snapshot.pages):
+            if page_index in receipt.changed_page_indexes:
+                if not self._page_snapshot_matches_non_crop_structure(
+                    page,
+                    receipt.before_snapshot.pages[page_index],
+                    expected_crop_box=receipt.original_crop_states[
+                        receipt.changed_page_indexes.index(page_index)
+                    ].effective_crop_box,
+                ):
+                    raise PdfPageMutationError("トリミング対象ページの前提状態が変化しました")
+                continue
+            if page != receipt.before_snapshot.pages[page_index]:
+                raise PdfPageMutationError("トリミング対象ページの前提状態が変化しました")
+
+    def _validate_undo_page_crop_candidate(
+        self,
+        path: Path,
+        receipt: PageCropReceipt,
+    ) -> None:
+        self._validate_basic_candidate(path, expected_page_count=receipt.before_snapshot.page_count)
+        snapshot = self._snapshot_document_structure(path)
+        self._validate_document_level_snapshots(
+            snapshot,
+            receipt.before_snapshot,
+            page_mapping=tuple(range(receipt.before_snapshot.page_count)),
+        )
+        current_states = self.read_crop_states(path, receipt.changed_page_indexes)
+        if current_states != receipt.original_crop_states:
+            raise PdfPageMutationError("トリミングの取り消し検証に失敗しました")
+        for page_index, page in enumerate(snapshot.pages):
+            if page_index in receipt.changed_page_indexes:
+                if not self._page_snapshot_matches_non_crop_structure(
+                    page,
+                    receipt.before_snapshot.pages[page_index],
+                    expected_crop_box=receipt.original_crop_states[
+                        receipt.changed_page_indexes.index(page_index)
+                    ].effective_crop_box,
+                ):
+                    raise PdfPageMutationError("トリミングの取り消し検証に失敗しました")
+                continue
+            if page != receipt.before_snapshot.pages[page_index]:
+                raise PdfPageMutationError("トリミングの取り消し検証に失敗しました")
+        self._render_pages(path, receipt.changed_page_indexes)
+
+    def _validate_redo_page_crop_candidate(
+        self,
+        path: Path,
+        receipt: PageCropReceipt,
+    ) -> None:
+        self._validate_basic_candidate(path, expected_page_count=receipt.after_snapshot.page_count)
+        snapshot = self._snapshot_document_structure(path)
+        if snapshot != receipt.after_snapshot:
+            raise PdfPageMutationError("トリミングの再適用検証に失敗しました")
+        self._render_pages(path, receipt.changed_page_indexes)
+
+    def _page_snapshot_matches_non_crop_structure(
+        self,
+        current: PdfPageStructureSnapshot,
+        expected: PdfPageStructureSnapshot,
+        *,
+        expected_crop_box: tuple[float, float, float, float],
+    ) -> bool:
+        return (
+            current.content_fingerprint == expected.content_fingerprint
+            and current.boxes.media_box_direct_present == expected.boxes.media_box_direct_present
+            and current.boxes.media_box == expected.boxes.media_box
+            and current.boxes.crop_box == expected_crop_box
+            and current.boxes.trim_box == expected.boxes.trim_box
+            and current.boxes.bleed_box == expected.boxes.bleed_box
+            and current.boxes.art_box == expected.boxes.art_box
+            and current.direct_resources_present == expected.direct_resources_present
+            and current.resources_fingerprint == expected.resources_fingerprint
+            and current.direct_rotate_present == expected.direct_rotate_present
+            and current.direct_rotate_value == expected.direct_rotate_value
+            and current.effective_rotation == expected.effective_rotation
+            and current.annotations == expected.annotations
+            and current.extra_page_entries_fingerprint == expected.extra_page_entries_fingerprint
+        )
+
+    def _validate_rendered_crop_dimensions(
+        self,
+        path: Path,
+        *,
+        page_index: int,
+        target_box: tuple[float, float, float, float],
+        rotation: int,
+    ) -> None:
+        document: Any | None = None
+        try:
+            document = pdfium.PdfDocument(str(path))
+            page = document[page_index]
+            try:
+                width, height = page.get_size()
+                target_rect = PdfRect.from_tuple(target_box)
+                expected_width = target_rect.width if rotation in {0, 180} else target_rect.height
+                expected_height = target_rect.height if rotation in {0, 180} else target_rect.width
+                if abs(float(width) - expected_width) > 1.0:
+                    raise PdfPageMutationError("更新後ページの表示幅検証に失敗しました")
+                if abs(float(height) - expected_height) > 1.0:
+                    raise PdfPageMutationError("更新後ページの表示高さ検証に失敗しました")
+            finally:
+                page.close()
+        except PdfPageMutationError:
+            raise
+        except Exception as exc:
+            raise PdfPageMutationError("更新後ページの描画検証に失敗しました") from exc
+        finally:
+            if document is not None:
+                document.close()
 
     def _validate_page_duplication_candidate(
         self,
@@ -4856,6 +5494,23 @@ class PdfPageMutationService:
             new_page_count=plan.target_page_count,
             cache_old_to_new=plan.execute_cache_old_to_new,
             current_page_old_to_new=plan.execute_current_page_old_to_new,
+        )
+
+    def _build_crop_transition(
+        self,
+        page_count: int,
+        changed_page_indexes: tuple[int, ...],
+    ) -> PageIndexTransition:
+        changed_set = set(changed_page_indexes)
+        cache_mapping = tuple(
+            None if page_index in changed_set else page_index for page_index in range(page_count)
+        )
+        identity_mapping = tuple(range(page_count))
+        return PageIndexTransition(
+            old_page_count=page_count,
+            new_page_count=page_count,
+            cache_old_to_new=cache_mapping,
+            current_page_old_to_new=identity_mapping,
         )
 
     def _build_reorder_undo_transition(self, receipt: PageReorderReceipt) -> PageIndexTransition:

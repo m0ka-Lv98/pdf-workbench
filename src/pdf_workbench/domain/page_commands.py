@@ -6,10 +6,13 @@ from pathlib import Path
 
 from pdf_workbench.domain.command_history import CommandChange, DocumentCommand
 from pdf_workbench.domain.mutation import WorkingCopyMutationResult
+from pdf_workbench.domain.page_crop import PageCropPlan
 from pdf_workbench.domain.page_insertion import PageInsertionPlan
 from pdf_workbench.domain.page_reorder import PageReorderPlan
 from pdf_workbench.domain.page_replacement import PageReplacementPlan
 from pdf_workbench.services.pdf_page_mutation import (
+    PageCropMutation,
+    PageCropReceipt,
     PageDeletionMutation,
     PageDeletionReceipt,
     PageDuplicationMutation,
@@ -115,6 +118,77 @@ class RotatePagesCommand(DocumentCommand):
         self.last_selected_page_indexes_after = None
         self.last_current_page_index_after = None
         return CommandChange.from_command(self)
+
+
+class CropPagesCommand(DocumentCommand):
+    requires_document_reload = True
+    mutates_working_copy = True
+
+    def __init__(
+        self,
+        working_copy_path: Path,
+        plan: PageCropPlan,
+        mutation_service: PdfPageMutationService,
+        *,
+        current_page_index_before: int,
+        selected_page_indexes_before: Sequence[int],
+        expected_target_snapshot: PdfDocumentStructureSnapshot | None = None,
+    ) -> None:
+        cropped_count = len(plan.page_indexes)
+        self.description = (
+            "1ページをトリミング" if cropped_count == 1 else f"{cropped_count}ページをトリミング"
+        )
+        self.affected_pages = frozenset(plan.page_indexes)
+        self._working_copy_path = working_copy_path.expanduser().resolve()
+        self._plan = plan
+        self._mutation_service = mutation_service
+        self._current_page_index_before = current_page_index_before
+        self._selected_page_indexes_before = _normalize_page_indexes(selected_page_indexes_before)
+        self._expected_target_snapshot = expected_target_snapshot
+        self._receipt: PageCropReceipt | None = None
+        self.last_mutation_result: WorkingCopyMutationResult | None = None
+        self.last_selected_page_indexes_after: tuple[int, ...] | None = None
+        self.last_current_page_index_after: int | None = None
+
+    def execute(self) -> CommandChange:
+        mutation = self._crop()
+        self._receipt = mutation.receipt
+        self.last_mutation_result = mutation.mutation_result
+        self.last_selected_page_indexes_after = self._selected_page_indexes_before
+        self.last_current_page_index_after = self._current_page_index_before
+        return CommandChange.from_command(self)
+
+    def undo(self) -> CommandChange:
+        receipt = self._require_receipt()
+        self.last_mutation_result = self._mutation_service.undo_page_crop(
+            self._working_copy_path,
+            receipt,
+        )
+        self.last_selected_page_indexes_after = self._selected_page_indexes_before
+        self.last_current_page_index_after = self._current_page_index_before
+        return CommandChange.from_command(self)
+
+    def redo(self) -> CommandChange:
+        receipt = self._require_receipt()
+        self.last_mutation_result = self._mutation_service.redo_page_crop(
+            self._working_copy_path,
+            receipt,
+        )
+        self.last_selected_page_indexes_after = self._selected_page_indexes_before
+        self.last_current_page_index_after = self._current_page_index_before
+        return CommandChange.from_command(self)
+
+    def _crop(self) -> PageCropMutation:
+        return self._mutation_service.crop_pages(
+            self._working_copy_path,
+            self._plan,
+            expected_before_snapshot=self._expected_target_snapshot,
+        )
+
+    def _require_receipt(self) -> PageCropReceipt:
+        if self._receipt is None:
+            raise RuntimeError("CropPagesCommand has not been executed")
+        return self._receipt
 
 
 class DuplicatePagesCommand(DocumentCommand):

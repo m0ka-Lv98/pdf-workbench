@@ -15,6 +15,7 @@ from pdf_workbench.domain.command_history import (
     CommandUndoError,
 )
 from pdf_workbench.domain.page_commands import (
+    CropPagesCommand,
     DeletePagesCommand,
     DuplicatePagesCommand,
     InsertPagesCommand,
@@ -22,6 +23,7 @@ from pdf_workbench.domain.page_commands import (
     ReplacePagesCommand,
     RotatePagesCommand,
 )
+from pdf_workbench.domain.page_crop import PageCropMargins, build_page_crop_plan
 from pdf_workbench.domain.page_insertion import build_page_insertion_plan
 from pdf_workbench.domain.page_reorder import build_page_reorder_plan
 from pdf_workbench.domain.page_replacement import build_page_replacement_plan
@@ -175,6 +177,68 @@ def test_rotate_pages_command_rejects_non_integer_indexes(tmp_path: Path) -> Non
 
     with pytest.raises(TypeError, match="integers"):
         RotatePagesCommand(document_path, (1.9,), service)
+
+
+def test_crop_pages_command_executes_undoes_and_redoes(tmp_path: Path) -> None:
+    document_path = create_blank_pdf(tmp_path / "crop-command.pdf", 2)
+    service = PdfPageMutationService()
+    states = service.read_crop_states(document_path, (0,))
+    plan = build_page_crop_plan(states, margins=PageCropMargins(10.0, 20.0, 30.0, 40.0))
+    command = CropPagesCommand(
+        document_path,
+        plan,
+        service,
+        current_page_index_before=0,
+        selected_page_indexes_before=(0,),
+    )
+
+    execute_change = command.execute()
+    assert execute_change.requires_reload is True
+    assert execute_change.selected_page_indexes_after == (0,)
+    assert execute_change.current_page_index_after == 0
+    assert execute_change.mutation_result is not None
+
+    with pikepdf.open(str(document_path)) as pdf:
+        assert tuple(float(component) for component in pdf.pages[0].obj["/CropBox"]) == (
+            10.0,
+            40.0,
+            170.0,
+            180.0,
+        )
+
+    undo_change = command.undo()
+    assert undo_change.requires_reload is True
+    with pikepdf.open(str(document_path)) as pdf:
+        assert pdf.pages[0].obj.get("/CropBox", None) is None
+
+    redo_change = command.redo()
+    assert redo_change.requires_reload is True
+    with pikepdf.open(str(document_path)) as pdf:
+        assert tuple(float(component) for component in pdf.pages[0].obj["/CropBox"]) == (
+            10.0,
+            40.0,
+            170.0,
+            180.0,
+        )
+
+
+def test_crop_pages_command_requires_execute_before_undo_or_redo(tmp_path: Path) -> None:
+    document_path = create_blank_pdf(tmp_path / "crop-command-guard.pdf", 1)
+    service = PdfPageMutationService()
+    states = service.read_crop_states(document_path, (0,))
+    plan = build_page_crop_plan(states, margins=PageCropMargins(10.0, 10.0, 10.0, 10.0))
+    command = CropPagesCommand(
+        document_path,
+        plan,
+        service,
+        current_page_index_before=0,
+        selected_page_indexes_before=(0,),
+    )
+
+    with pytest.raises(RuntimeError, match="not been executed"):
+        command.undo()
+    with pytest.raises(RuntimeError, match="not been executed"):
+        command.redo()
 
 
 def test_duplicate_pages_command_executes_undoes_and_redoes(tmp_path: Path) -> None:

@@ -7,7 +7,9 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QFrame, QLabel, QMessageBox, QWidget
 from pytestqt.qtbot import QtBot
 
+from pdf_workbench.domain.page_crop import PageCropMargins
 from pdf_workbench.domain.page_insertion import SourcePageSelection
+from pdf_workbench.ui.widgets.crop_pages_dialog import CropPagesDialog
 from pdf_workbench.ui.widgets.document_toolbar import DocumentToolbar, ToolbarState, button_has_icon
 from pdf_workbench.ui.widgets.empty_state import EmptyState
 from pdf_workbench.ui.widgets.insert_pages_dialog import InsertPagesDialog
@@ -233,6 +235,39 @@ def test_empty_state_shows_recent_files_and_emits_selection(qtbot: QtBot, tmp_pa
         is not None
     )
     assert empty_state.findChild(type(empty_state.open_button), "openPdfButton") is not None
+
+
+def test_crop_pages_dialog_exposes_fields_and_reset_mode(qtbot: QtBot) -> None:
+    dialog = CropPagesDialog(selected_page_count=3)
+    qtbot.addWidget(dialog)
+
+    assert dialog.left_margin_spin.decimals() == 2
+    assert dialog.top_margin_spin.minimum() == 0.0
+    assert dialog.right_margin_spin.suffix() == " pt"
+    assert dialog.explanation_label.text().startswith("トリミングは表示範囲だけを変更します")
+    assert dialog.reset_checkbox.isChecked() is False
+    assert dialog.left_margin_spin.isEnabled() is True
+
+    dialog.reset_checkbox.setChecked(True)
+    assert dialog.left_margin_spin.isEnabled() is False
+    assert dialog.top_margin_spin.isEnabled() is False
+    assert dialog.right_margin_spin.isEnabled() is False
+    assert dialog.bottom_margin_spin.isEnabled() is False
+
+
+def test_crop_pages_dialog_returns_current_margins(qtbot: QtBot) -> None:
+    dialog = CropPagesDialog(selected_page_count=1)
+    qtbot.addWidget(dialog)
+    dialog.left_margin_spin.setValue(12.5)
+    dialog.top_margin_spin.setValue(7.25)
+    dialog.right_margin_spin.setValue(9.0)
+    dialog.bottom_margin_spin.setValue(3.5)
+
+    dialog._accept_with_result()
+
+    assert dialog.dialog_result is not None
+    assert dialog.dialog_result.margins == PageCropMargins(12.5, 7.25, 9.0, 3.5)
+    assert dialog.dialog_result.reset_to_media_box is False
 
 
 def test_insert_pages_dialog_accepts_valid_selection(qtbot: QtBot, tmp_path: Path) -> None:

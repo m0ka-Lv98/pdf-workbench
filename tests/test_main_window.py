@@ -44,6 +44,7 @@ from pdf_workbench.domain.command_history import (
 from pdf_workbench.domain.document_session import DocumentSession, FileFingerprint, SourceStatus
 from pdf_workbench.domain.mutation import PageIndexTransition, WorkingCopyMutationResult
 from pdf_workbench.domain.page_commands import DeletePagesCommand, RotatePagesCommand
+from pdf_workbench.domain.page_crop import PageCropMargins
 from pdf_workbench.domain.page_insertion import SourcePageSelection
 from pdf_workbench.services.page_coordinates import PageMetadata
 from pdf_workbench.services.pdf_page_mutation import (
@@ -76,6 +77,7 @@ from pdf_workbench.services.source_change_monitor import (
 )
 from pdf_workbench.ui.main_window import DocumentTab, MainWindow, RestoreSessionResult
 from pdf_workbench.ui.pdf_view import PdfView, PdfViewMutationSnapshot
+from pdf_workbench.ui.widgets.crop_pages_dialog import CropPagesDialog, CropPagesDialogResult
 from pdf_workbench.ui.widgets.insert_pages_dialog import InsertPagesDialog, InsertPagesDialogResult
 from pdf_workbench.ui.widgets.replace_pages_dialog import (
     ReplacePagesDialogResult,
@@ -2406,6 +2408,16 @@ def working_copy_page_count(path: Path) -> int:
         return len(pdf.pages)
 
 
+def working_copy_crop_boxes(path: Path) -> tuple[tuple[float, float, float, float] | None, ...]:
+    with pikepdf.open(str(path)) as pdf:
+        return tuple(
+            None
+            if page.obj.get("/CropBox", None) is None
+            else tuple(float(component) for component in page.obj["/CropBox"])
+            for page in pdf.pages
+        )
+
+
 def test_main_window_rotate_selected_pages_persists_into_working_copy_and_restores_selection(
     monkeypatch: pytest.MonkeyPatch,
     qtbot: QtBot,
@@ -2441,6 +2453,450 @@ def test_main_window_rotate_selected_pages_persists_into_working_copy_and_restor
     render_service = window._render_service
     window.close()
     qtbot.waitUntil(lambda: not render_service._thread.isRunning())
+
+
+def test_main_window_crop_selected_pages_persists_into_working_copy_and_restores_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    window = create_real_main_window(qtbot, tmp_path)
+    document_path = create_blank_pdf(tmp_path / "crop-selected.pdf", 3)
+    window.open_document(document_path)
+    qtbot.waitUntil(lambda: window._documents[0].view.page_count == 3)
+    document = window._documents[0]
+    document.view._page_organizer.set_selected_page_indexes((0, 2), current_index=2)
+    document.view.set_page(2)
+    qtbot.waitUntil(lambda: document.session.current_page_index == 2)
+    monkeypatch.setattr(
+        window,
+        "_choose_crop_pages_options",
+        lambda *_args, **_kwargs: CropPagesDialogResult(
+            margins=PageCropMargins(10.0, 20.0, 30.0, 40.0),
+            reset_to_media_box=False,
+        ),
+    )
+
+    window._crop_selected_pages()
+
+    qtbot.waitUntil(lambda: document.command_history.can_undo)
+    qtbot.waitUntil(lambda: document.view.page_index == 2)
+    assert document.view.selected_page_indexes == (0, 2)
+    assert document.session.is_modified is True
+    assert working_copy_crop_boxes(document.session.document_path)[0] == (10.0, 40.0, 170.0, 180.0)
+    assert working_copy_crop_boxes(document.session.document_path)[2] == (10.0, 40.0, 170.0, 180.0)
+    assert document.session.operation_history[-1] == "2ページをトリミング"
+
+    window.close()
+    qtbot.waitUntil(lambda: not window._render_service._thread.isRunning())
+
+
+def test_main_window_crop_action_requires_selection_and_is_listed_in_edit_menu(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    window = create_real_main_window(qtbot, tmp_path)
+    document_path = create_blank_pdf(tmp_path / "crop-action-state.pdf", 2)
+    window.open_document(document_path)
+    qtbot.waitUntil(lambda: window._documents[0].view.page_count == 2)
+    document = window._documents[0]
+
+    document.view._page_organizer.set_selected_page_indexes((), current_index=0)
+    window._update_actions()
+    assert window.crop_pages_action.isEnabled() is False
+
+    document.view._page_organizer.set_selected_page_indexes((0,), current_index=0)
+    qtbot.waitUntil(lambda: window.crop_pages_action.isEnabled())
+
+    edit_action = next(action for action in window.menuBar().actions() if action.text() == "編集")
+    edit_menu = edit_action.menu()
+    assert edit_menu is not None
+    assert any(action.text() == "選択ページをトリミング…" for action in edit_menu.actions())
+
+    window.close()
+    qtbot.waitUntil(lambda: not window._render_service._thread.isRunning())
+
+
+def test_main_window_crop_action_is_disabled_while_saving_or_mutating(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    window = create_real_main_window(qtbot, tmp_path)
+    document_path = create_blank_pdf(tmp_path / "crop-action-disable.pdf", 2)
+    window.open_document(document_path)
+    qtbot.waitUntil(lambda: window._documents[0].view.page_count == 2)
+    document = window._documents[0]
+    document.view._page_organizer.set_selected_page_indexes((0,), current_index=0)
+
+    document.session.is_saving = True
+    window._update_actions()
+    assert window.crop_pages_action.isEnabled() is False
+
+    document.session.is_saving = False
+    document.mutation_in_progress = True
+    window._update_actions()
+    assert window.crop_pages_action.isEnabled() is False
+
+    document.mutation_in_progress = False
+    window._update_actions()
+    assert window.crop_pages_action.isEnabled() is True
+
+    window.close()
+    qtbot.waitUntil(lambda: not window._render_service._thread.isRunning())
+
+
+def test_main_window_crop_selected_pages_returns_early_without_document_or_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    window = create_real_main_window(qtbot, tmp_path)
+    window._crop_selected_pages()
+
+    document_path = create_blank_pdf(tmp_path / "crop-no-selection.pdf", 1)
+    window.open_document(document_path)
+    qtbot.waitUntil(lambda: window._documents[0].view.page_count == 1)
+    document = window._documents[0]
+    document.view._page_organizer.set_selected_page_indexes((), current_index=0)
+
+    window._crop_selected_pages()
+
+    assert document.command_history.can_undo is False
+    assert document.session.is_modified is False
+
+    window.close()
+    qtbot.waitUntil(lambda: not window._render_service._thread.isRunning())
+
+
+def test_main_window_crop_selected_pages_returns_when_dialog_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    window = create_real_main_window(qtbot, tmp_path)
+    document_path = create_blank_pdf(tmp_path / "crop-cancelled.pdf", 1)
+    window.open_document(document_path)
+    qtbot.waitUntil(lambda: window._documents[0].view.page_count == 1)
+    document = window._documents[0]
+    document.view._page_organizer.set_selected_page_indexes((0,), current_index=0)
+    monkeypatch.setattr(window, "_choose_crop_pages_options", lambda *_args, **_kwargs: None)
+
+    window._crop_selected_pages()
+
+    assert document.command_history.can_undo is False
+    assert document.session.is_modified is False
+
+    window.close()
+    qtbot.waitUntil(lambda: not window._render_service._thread.isRunning())
+
+
+def test_main_window_choose_crop_pages_options_handles_cancel_and_accept(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    window = create_real_main_window(qtbot, tmp_path)
+    document_path = create_blank_pdf(tmp_path / "crop-dialog-options.pdf", 1)
+    window.open_document(document_path)
+    qtbot.waitUntil(lambda: window._documents[0].view.page_count == 1)
+    document = window._documents[0]
+
+    monkeypatch.setattr(
+        CropPagesDialog,
+        "exec",
+        lambda self: self.DialogCode.Rejected,
+    )
+    assert window._choose_crop_pages_options(document, selected_page_count=1) is None
+
+    def accept_dialog(self: CropPagesDialog) -> int:
+        self._dialog_result = CropPagesDialogResult(
+            margins=PageCropMargins(3.0, 4.0, 5.0, 6.0),
+            reset_to_media_box=False,
+        )
+        return self.DialogCode.Accepted
+
+    monkeypatch.setattr(CropPagesDialog, "exec", accept_dialog)
+
+    accepted = window._choose_crop_pages_options(document, selected_page_count=1)
+
+    assert accepted == CropPagesDialogResult(
+        margins=PageCropMargins(3.0, 4.0, 5.0, 6.0),
+        reset_to_media_box=False,
+    )
+
+    window.close()
+    qtbot.waitUntil(lambda: not window._render_service._thread.isRunning())
+
+
+def test_main_window_page_operation_guards_return_early_for_save_and_empty_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    window = create_real_main_window(qtbot, tmp_path)
+    window._delete_selected_pages()
+    window._replace_selected_pages_from_pdf()
+
+    document_path = create_blank_pdf(tmp_path / "page-op-guards.pdf", 2)
+    window.open_document(document_path)
+    qtbot.waitUntil(lambda: window._documents[0].view.page_count == 2)
+    document = window._documents[0]
+
+    document.session.is_saving = True
+    window._delete_selected_pages()
+    assert document.command_history.can_undo is False
+
+    document.session.is_saving = False
+    document.view._page_organizer.set_selected_page_indexes((), current_index=0)
+    window._replace_selected_pages_from_pdf()
+    assert document.command_history.can_undo is False
+
+    document.session.is_saving = True
+    window._replace_selected_pages_from_pdf()
+    assert document.command_history.can_undo is False
+
+    window.close()
+    qtbot.waitUntil(lambda: not window._render_service._thread.isRunning())
+
+
+def test_main_window_replace_selected_pages_reports_snapshot_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    window = create_real_main_window(qtbot, tmp_path)
+    document_path = create_blank_pdf(tmp_path / "replace-snapshot-error.pdf", 2)
+    window.open_document(document_path)
+    qtbot.waitUntil(lambda: window._documents[0].view.page_count == 2)
+    document = window._documents[0]
+    document.view._page_organizer.set_selected_page_indexes((0,), current_index=0)
+
+    errors: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        window._page_mutation_service,
+        "snapshot_document_structure",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("snapshot failed")),
+    )
+    monkeypatch.setattr(
+        window,
+        "_report_error",
+        lambda title, message: errors.append((title, message)),
+    )
+
+    window._replace_selected_pages_from_pdf()
+
+    assert errors == [("ページ置換に失敗しました", "snapshot failed")]
+    assert document.command_history.can_undo is False
+
+    window.close()
+    qtbot.waitUntil(lambda: not window._render_service._thread.isRunning())
+
+
+def test_main_window_crop_selected_pages_reports_prepare_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    window = create_real_main_window(qtbot, tmp_path)
+    document_path = create_blank_pdf(tmp_path / "crop-prepare-error.pdf", 1)
+    window.open_document(document_path)
+    qtbot.waitUntil(lambda: window._documents[0].view.page_count == 1)
+    document = window._documents[0]
+    document.view._page_organizer.set_selected_page_indexes((0,), current_index=0)
+
+    errors: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        window._page_mutation_service,
+        "read_crop_states",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("broken crop state")),
+    )
+    monkeypatch.setattr(
+        window,
+        "_report_error",
+        lambda title, message: errors.append((title, message)),
+    )
+
+    window._crop_selected_pages()
+
+    assert errors == [("ページのトリミングに失敗しました", "broken crop state")]
+    assert document.command_history.can_undo is False
+    assert document.session.is_modified is False
+
+    window.close()
+    qtbot.waitUntil(lambda: not window._render_service._thread.isRunning())
+
+
+def test_main_window_crop_selected_pages_ignores_stale_context_after_dialog(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    window = create_real_main_window(qtbot, tmp_path)
+    document_path = create_blank_pdf(tmp_path / "crop-stale-context.pdf", 2)
+    window.open_document(document_path)
+    qtbot.waitUntil(lambda: window._documents[0].view.page_count == 2)
+    document = window._documents[0]
+    document.view._page_organizer.set_selected_page_indexes((0,), current_index=0)
+    working_copy_before = file_sha256(document.session.document_path)
+
+    def choose_options(*_args: object, **_kwargs: object) -> CropPagesDialogResult:
+        document.view._page_organizer.set_selected_page_indexes((1,), current_index=1)
+        return CropPagesDialogResult(
+            margins=PageCropMargins(10.0, 10.0, 10.0, 10.0),
+            reset_to_media_box=False,
+        )
+
+    monkeypatch.setattr(window, "_choose_crop_pages_options", choose_options)
+
+    window._crop_selected_pages()
+
+    assert document.command_history.can_undo is False
+    assert document.session.is_modified is False
+    assert file_sha256(document.session.document_path) == working_copy_before
+    assert document.view.selected_page_indexes == (1,)
+
+    window.close()
+    qtbot.waitUntil(lambda: not window._render_service._thread.isRunning())
+
+
+def test_main_window_crop_selected_pages_reports_invalid_plan_without_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    window = create_real_main_window(qtbot, tmp_path)
+    document_path = create_blank_pdf(tmp_path / "crop-invalid-plan.pdf", 1)
+    window.open_document(document_path)
+    qtbot.waitUntil(lambda: window._documents[0].view.page_count == 1)
+    document = window._documents[0]
+    document.view._page_organizer.set_selected_page_indexes((0,), current_index=0)
+
+    errors: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        window,
+        "_choose_crop_pages_options",
+        lambda *_args, **_kwargs: CropPagesDialogResult(
+            margins=PageCropMargins(1000.0, 0.0, 1000.0, 0.0),
+            reset_to_media_box=False,
+        ),
+    )
+    monkeypatch.setattr(
+        window,
+        "_report_error",
+        lambda title, message: errors.append((title, message)),
+    )
+
+    window._crop_selected_pages()
+
+    assert errors
+    assert errors[0][0] == "ページのトリミングに失敗しました"
+    assert document.command_history.can_undo is False
+    assert document.session.is_modified is False
+
+    window.close()
+    qtbot.waitUntil(lambda: not window._render_service._thread.isRunning())
+
+
+def test_main_window_resolve_crop_context_rejects_document_changes(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Discard,
+    )
+    window = create_real_main_window(qtbot, tmp_path)
+    document_path = create_blank_pdf(tmp_path / "crop-resolve-context.pdf", 2)
+    window.open_document(document_path)
+    qtbot.waitUntil(lambda: window._documents[0].view.page_count == 2)
+    document = window._documents[0]
+    document.view._page_organizer.set_selected_page_indexes((0,), current_index=0)
+    context = window._capture_crop_pages_context(document)
+
+    assert window._resolve_crop_pages_document(replace(context, session_id="other")) is None
+    assert (
+        window._resolve_crop_pages_document(
+            replace(context, working_copy_path=tmp_path / "other.pdf")
+        )
+        is None
+    )
+    assert (
+        window._resolve_crop_pages_document(replace(context, source_path=tmp_path / "source.pdf"))
+        is None
+    )
+    assert window._resolve_crop_pages_document(replace(context, page_count=3)) is None
+    assert window._resolve_crop_pages_document(replace(context, selected_page_indexes=(1,))) is None
+    assert window._resolve_crop_pages_document(replace(context, current_page_index=1)) is None
+
+    document.session.is_saving = True
+    assert window._resolve_crop_pages_document(context) is None
+    document.session.is_saving = False
+    document.mutation_in_progress = True
+    assert window._resolve_crop_pages_document(context) is None
+    document.mutation_in_progress = False
+    assert window._resolve_crop_pages_document(context) is document
+
+    window.close()
+    qtbot.waitUntil(lambda: not window._render_service._thread.isRunning())
 
 
 def test_main_window_duplicate_toolbar_button_persists_into_working_copy_and_restores_duplicates(
