@@ -205,7 +205,7 @@ def test_validate_expected_source_revision_rejects_drift(
     [
         ({"resolved_path": Path("relative.pdf")}, "resolved_path must be absolute"),
         (
-            {"resolved_path": Path("/tmp/not-a-pdf.txt")},
+            {"resolved_path": Path("not-a-pdf.txt")},
             "resolved_path must refer to a PDF",
         ),
         ({"page_count": True}, "page_count must be an integer"),
@@ -218,15 +218,18 @@ def test_validate_expected_source_revision_rejects_drift(
     ],
 )
 def test_source_pdf_revision_rejects_invalid_invariants(
+    tmp_path: Path,
     kwargs: dict[str, object],
     message: str,
 ) -> None:
     valid = dict(
-        resolved_path=Path("/tmp/source.pdf"),
+        resolved_path=(tmp_path / "source.pdf").resolve(),
         fingerprint="fingerprint",
         sha256="a" * 64,
         page_count=1,
     )
+    if kwargs.get("resolved_path") == Path("not-a-pdf.txt"):
+        kwargs = {**kwargs, "resolved_path": (tmp_path / "not-a-pdf.txt").resolve()}
     valid.update(kwargs)
 
     with pytest.raises(ValueError, match=message):

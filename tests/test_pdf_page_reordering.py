@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 
 import pikepdf
@@ -212,6 +213,19 @@ def page_count(path: Path) -> int:
 
 def reorder_candidates(path: Path) -> list[Path]:
     return list(path.parent.glob(f".{path.stem}.mutation.*.tmp.pdf"))
+
+
+def add_unused_font_resource(path: Path, page_index: int) -> None:
+    with pikepdf.open(path, allow_overwriting_input=True) as pdf:
+        font_dict = pdf.pages[page_index].obj["/Resources"]["/Font"]
+        font_dict["/F_unused"] = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/Font"),
+                "/Subtype": pikepdf.Name("/Type1"),
+                "/BaseFont": pikepdf.Name("/Courier"),
+            }
+        )
+        pdf.save(path)
 
 
 def outline_summary(
@@ -819,6 +833,24 @@ def test_validate_reordering_redo_precondition_rejects_tampered_original_state(
     assert file_sha256(working_copy) == sha_before_call
 
 
+def test_validate_reordering_redo_precondition_rejects_resources_only_drift(
+    tmp_path: Path,
+) -> None:
+    working_copy = create_simple_text_pdf(
+        tmp_path / "redo-resource-drift.pdf", ["A", "B", "C", "D"]
+    )
+    service = PdfPageMutationService()
+    mutation = service.reorder_pages(working_copy, (1,), 4)
+    service.undo_page_reordering(working_copy, mutation.receipt)
+    add_unused_font_resource(working_copy, 0)
+    sha_before_call = file_sha256(working_copy)
+
+    with pytest.raises(PdfPageMutationError, match="前提状態"):
+        service.validate_reordering_redo_precondition(working_copy, mutation.receipt)
+
+    assert file_sha256(working_copy) == sha_before_call
+
+
 def test_page_reorder_receipt_rejects_tampered_after_snapshot_mapping(tmp_path: Path) -> None:
     working_copy = create_simple_text_pdf(tmp_path / "receipt.pdf", ["A", "B", "C", "D"])
     service = PdfPageMutationService()
@@ -828,4 +860,28 @@ def test_page_reorder_receipt_rejects_tampered_after_snapshot_mapping(tmp_path: 
         clone_reorder_receipt(
             mutation.receipt,
             after_snapshot=mutation.receipt.before_snapshot,
+        )
+
+
+def test_page_reorder_receipt_rejects_resources_only_drift_in_after_snapshot(
+    tmp_path: Path,
+) -> None:
+    working_copy = create_simple_text_pdf(tmp_path / "receipt-resources.pdf", ["A", "B", "C", "D"])
+    service = PdfPageMutationService()
+    mutation = service.reorder_pages(working_copy, (1, 3), 4)
+    tampered_pages = list(mutation.receipt.after_snapshot.pages)
+    moved_page_index = mutation.receipt.moved_page_indexes_after[0]
+    tampered_pages[moved_page_index] = replace(
+        tampered_pages[moved_page_index],
+        resources_fingerprint="f" * 64,
+    )
+    tampered_after = replace(
+        mutation.receipt.after_snapshot,
+        pages=tuple(tampered_pages),
+    )
+
+    with pytest.raises(ValueError, match="expected reordered page order"):
+        clone_reorder_receipt(
+            mutation.receipt,
+            after_snapshot=tampered_after,
         )

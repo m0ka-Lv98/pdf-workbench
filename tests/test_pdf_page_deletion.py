@@ -210,6 +210,19 @@ def delete_candidates(path: Path) -> list[Path]:
     return list(path.parent.glob(f".{path.stem}.mutation.*.tmp.pdf"))
 
 
+def add_unused_font_resource(path: Path, page_index: int) -> None:
+    with pikepdf.open(path, allow_overwriting_input=True) as pdf:
+        font_dict = pdf.pages[page_index].obj["/Resources"]["/Font"]
+        font_dict["/F_unused"] = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/Font"),
+                "/Subtype": pikepdf.Name("/Type1"),
+                "/BaseFont": pikepdf.Name("/Courier"),
+            }
+        )
+        pdf.save(path)
+
+
 def clone_delete_receipt(
     receipt: PageDeletionReceipt,
     **overrides: object,
@@ -659,6 +672,22 @@ def test_page_deletion_receipt_rejects_working_copy_as_snapshot_path(tmp_path: P
 
     with pytest.raises(ValueError, match="must differ"):
         clone_delete_receipt(mutation.receipt, undo_snapshot_path=working_copy.resolve())
+
+
+def test_redo_page_deletion_rejects_resources_only_drift_without_changing_file(
+    tmp_path: Path,
+) -> None:
+    working_copy = create_text_fixture(tmp_path / "redo-resource-drift.pdf", ["A", "B", "C", "D"])
+    service = PdfPageMutationService()
+    mutation = service.delete_pages(working_copy, (1,), current_page_index=2)
+    service.undo_page_deletion(working_copy, mutation.receipt)
+    add_unused_font_resource(working_copy, 2)
+    sha_before_call = file_sha256(working_copy)
+
+    with pytest.raises(PdfPageMutationError, match="前提状態"):
+        service.redo_page_deletion(working_copy, mutation.receipt)
+
+    assert file_sha256(working_copy) == sha_before_call
 
 
 @pytest.mark.parametrize(

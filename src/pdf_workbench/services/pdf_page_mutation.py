@@ -615,9 +615,9 @@ class PageReorderReceipt:
         object.__setattr__(self, "old_to_new", plan.old_to_new)
         object.__setattr__(self, "moved_page_indexes_after", plan.moved_page_indexes_after)
         for new_page_index, original_page_index in enumerate(plan.target_order):
-            if not PdfPageMutationService._page_structure_matches_ignoring_resources(
-                self.after_snapshot.pages[new_page_index],
-                self.before_snapshot.pages[original_page_index],
+            if (
+                self.after_snapshot.pages[new_page_index]
+                != self.before_snapshot.pages[original_page_index]
             ):
                 raise ValueError("after_snapshot does not match the expected reordered page order")
 
@@ -1652,10 +1652,7 @@ class PdfPageMutationService:
     ) -> None:
         resolved_path = path.expanduser().resolve()
         current_snapshot = self._snapshot_document_structure(resolved_path)
-        if not self._document_structure_matches_ignoring_resources(
-            current_snapshot,
-            receipt.before_snapshot,
-        ):
+        if current_snapshot != receipt.before_snapshot:
             raise PdfPageMutationError("並べ替え対象ページの前提状態が変化しました")
         self._reject_unsupported_page_reordering_structures(resolved_path)
 
@@ -1847,10 +1844,7 @@ class PdfPageMutationService:
     ) -> None:
         resolved_path = path.expanduser().resolve()
         current_snapshot = self._snapshot_document_structure(resolved_path)
-        if not self._document_structure_matches_ignoring_resources(
-            current_snapshot,
-            receipt.before_snapshot,
-        ):
+        if current_snapshot != receipt.before_snapshot:
             raise PdfPageMutationError("削除対象ページの前提状態が変化しました")
         self._reject_unsupported_page_deletion_structures(
             resolved_path,
@@ -2475,10 +2469,7 @@ class PdfPageMutationService:
             page_mapping=plan.old_to_new,
         )
         for new_page_index, original_page_index in enumerate(plan.target_order):
-            if not self._page_structure_matches_ignoring_resources(
-                after_snapshot.pages[new_page_index],
-                before_snapshot.pages[original_page_index],
-            ):
+            if after_snapshot.pages[new_page_index] != before_snapshot.pages[original_page_index]:
                 raise PdfPageMutationError("更新後のページ順序または構造の検証に失敗しました")
         self._render_pages(path, self._reorder_execute_render_page_indexes(plan))
         return after_snapshot
@@ -2504,15 +2495,15 @@ class PdfPageMutationService:
             page_mapping=transition.cache_old_to_new,
         )
         for original_page_index, new_page_index in enumerate(plan.target_old_to_new):
-            if not self._page_structure_matches_ignoring_resources(
-                after_snapshot.pages[new_page_index],
-                target_before_snapshot.pages[original_page_index],
+            if (
+                after_snapshot.pages[new_page_index]
+                != target_before_snapshot.pages[original_page_index]
             ):
                 raise PdfPageMutationError("既存ページの構造検証に失敗しました")
         for offset, expected_source_page in enumerate(source_selected_page_snapshots):
             imported_page = after_snapshot.pages[plan.inserted_page_indexes_after[offset]]
             expected_page = self._expected_imported_page_snapshot(expected_source_page)
-            if not self._page_structure_matches_ignoring_resources(imported_page, expected_page):
+            if imported_page != expected_page:
                 raise PdfPageMutationError("挿入ページの構造検証に失敗しました")
         self._render_pages(path, self._page_insertion_render_page_indexes(plan))
         self._validate_inserted_page_render_equivalence(
@@ -2530,10 +2521,7 @@ class PdfPageMutationService:
     ) -> None:
         self._validate_basic_candidate(path, expected_page_count=receipt.original_page_count)
         after_snapshot = self._snapshot_document_structure(path)
-        if not self._document_structure_matches_ignoring_resources(
-            after_snapshot,
-            receipt.before_snapshot,
-        ):
+        if after_snapshot != receipt.before_snapshot:
             raise PdfPageMutationError("複製の取り消し検証に失敗しました")
         self._render_pages(path, tuple(range(receipt.original_page_count)))
 
@@ -2544,10 +2532,7 @@ class PdfPageMutationService:
     ) -> None:
         self._validate_basic_candidate(path, expected_page_count=receipt.original_page_count)
         snapshot = self._snapshot_document_structure(path)
-        if not self._document_structure_matches_ignoring_resources(
-            snapshot,
-            receipt.before_snapshot,
-        ):
+        if snapshot != receipt.before_snapshot:
             raise PdfPageMutationError("ページ並べ替えの取り消し検証に失敗しました")
         self._render_pages(path, self._reorder_undo_render_page_indexes(receipt))
 
@@ -2755,7 +2740,9 @@ class PdfPageMutationService:
                     for item in dereferenced
                 ]
             elif isinstance(dereferenced, pikepdf.Name):
-                normalized = str(dereferenced)
+                normalized = {"__name__": str(dereferenced)}
+            elif isinstance(dereferenced, pikepdf.String):
+                normalized = {"__string__": str(dereferenced)}
             elif isinstance(dereferenced, bytes):
                 normalized = {"__bytes__": sha256(dereferenced).hexdigest()}
             else:
@@ -3890,10 +3877,7 @@ class PdfPageMutationService:
         for original_page_index, current_page_index in enumerate(all_original_indexes_after):
             current_page = after_snapshot.pages[current_page_index]
             original_page = receipt.before_snapshot.pages[original_page_index]
-            if not self._page_structure_matches_ignoring_resources(
-                current_page,
-                original_page,
-            ):
+            if current_page != original_page:
                 raise PdfPageMutationError("ページ順序または構造の検証に失敗しました")
         for source_page_index, duplicate_page_index in zip(
             receipt.source_page_indexes,
@@ -3904,10 +3888,7 @@ class PdfPageMutationService:
             source_page = self._expected_duplicate_page_snapshot(
                 receipt.before_snapshot.pages[source_page_index]
             )
-            if not self._page_structure_matches_ignoring_resources(
-                duplicate_page,
-                source_page,
-            ):
+            if duplicate_page != source_page:
                 raise PdfPageMutationError("複製ページの構造検証に失敗しました")
 
     def _expected_duplicate_page_snapshot(
@@ -3935,42 +3916,6 @@ class PdfPageMutationService:
             ),
             direct_page_keys=page.direct_page_keys,
             extra_page_entries_fingerprint=page.extra_page_entries_fingerprint,
-        )
-
-    @staticmethod
-    def _page_structure_matches_ignoring_resources(
-        current: PdfPageStructureSnapshot,
-        expected: PdfPageStructureSnapshot,
-    ) -> bool:
-        return (
-            current.content_fingerprint == expected.content_fingerprint
-            and current.boxes == expected.boxes
-            and current.direct_resources_present == expected.direct_resources_present
-            and current.direct_rotate_present == expected.direct_rotate_present
-            and current.direct_rotate_value == expected.direct_rotate_value
-            and current.effective_rotation == expected.effective_rotation
-            and current.annotations == expected.annotations
-            and current.direct_page_keys == expected.direct_page_keys
-            and current.extra_page_entries_fingerprint == expected.extra_page_entries_fingerprint
-        )
-
-    @classmethod
-    def _document_structure_matches_ignoring_resources(
-        cls,
-        current: PdfDocumentStructureSnapshot,
-        expected: PdfDocumentStructureSnapshot,
-    ) -> bool:
-        return (
-            current.page_count == expected.page_count
-            and current.metadata_fingerprint == expected.metadata_fingerprint
-            and current.outlines == expected.outlines
-            and current.named_destinations == expected.named_destinations
-            and current.attachments_fingerprint == expected.attachments_fingerprint
-            and len(current.pages) == len(expected.pages)
-            and all(
-                cls._page_structure_matches_ignoring_resources(current_page, expected_page)
-                for current_page, expected_page in zip(current.pages, expected.pages, strict=True)
-            )
         )
 
     def _validate_duplicate_page_independence(
@@ -4278,10 +4223,7 @@ class PdfPageMutationService:
         if len(after_snapshot.pages) != len(survivor_original_indexes):
             raise PdfPageMutationError("更新後のページ順序検証に失敗しました")
         for new_page_index, original_page_index in enumerate(survivor_original_indexes):
-            if not self._page_structure_matches_ignoring_resources(
-                after_snapshot.pages[new_page_index],
-                before_snapshot.pages[original_page_index],
-            ):
+            if after_snapshot.pages[new_page_index] != before_snapshot.pages[original_page_index]:
                 raise PdfPageMutationError("更新後のページ順序または構造の検証に失敗しました")
         self._render_pages(path, tuple(range(expected_page_count)))
         return after_snapshot
@@ -4292,10 +4234,7 @@ class PdfPageMutationService:
         receipt: PageDeletionReceipt,
     ) -> None:
         current_snapshot = self._snapshot_document_structure(path)
-        if not self._document_structure_matches_ignoring_resources(
-            current_snapshot,
-            receipt.after_snapshot,
-        ):
+        if current_snapshot != receipt.after_snapshot:
             raise PdfPageMutationError("削除済みページの状態が変化しているため元に戻せません")
 
     def _validate_delete_undo_snapshot(
@@ -4316,10 +4255,7 @@ class PdfPageMutationService:
             expected_page_count=receipt.original_page_count,
         )
         snapshot = self._snapshot_document_structure(snapshot_path)
-        if not self._document_structure_matches_ignoring_resources(
-            snapshot,
-            receipt.before_snapshot,
-        ):
+        if snapshot != receipt.before_snapshot:
             raise PdfPageMutationError("削除前スナップショットの構造検証に失敗しました")
 
     def _validate_delete_undo_snapshot_ownership(
@@ -4362,10 +4298,7 @@ class PdfPageMutationService:
     ) -> None:
         self._validate_basic_candidate(path, expected_page_count=receipt.original_page_count)
         snapshot = self._snapshot_document_structure(path)
-        if not self._document_structure_matches_ignoring_resources(
-            snapshot,
-            receipt.before_snapshot,
-        ):
+        if snapshot != receipt.before_snapshot:
             raise PdfPageMutationError("ページ削除の取り消し検証に失敗しました")
         self._render_pages(path, tuple(range(receipt.original_page_count)))
 
@@ -4376,10 +4309,7 @@ class PdfPageMutationService:
     ) -> None:
         self._validate_basic_candidate(path, expected_page_count=receipt.after_snapshot.page_count)
         snapshot = self._snapshot_document_structure(path)
-        if not self._document_structure_matches_ignoring_resources(
-            snapshot,
-            receipt.after_snapshot,
-        ):
+        if snapshot != receipt.after_snapshot:
             raise PdfPageMutationError("ページ削除の再適用検証に失敗しました")
         self._render_pages(path, tuple(range(receipt.after_snapshot.page_count)))
 
@@ -4390,10 +4320,7 @@ class PdfPageMutationService:
     ) -> None:
         self._validate_basic_candidate(path, expected_page_count=receipt.original_page_count)
         snapshot = self._snapshot_document_structure(path)
-        if not self._document_structure_matches_ignoring_resources(
-            snapshot,
-            receipt.after_snapshot,
-        ):
+        if snapshot != receipt.after_snapshot:
             raise PdfPageMutationError("ページ並べ替えの再適用検証に失敗しました")
         self._render_pages(
             path,
@@ -4406,10 +4333,7 @@ class PdfPageMutationService:
         receipt: PageInsertionReceipt,
     ) -> None:
         current_snapshot = self._snapshot_document_structure(path)
-        if not self._document_structure_matches_ignoring_resources(
-            current_snapshot,
-            receipt.target_after_snapshot,
-        ):
+        if current_snapshot != receipt.target_after_snapshot:
             raise PdfPageMutationError("挿入済みページの状態が変化しているため元に戻せません")
 
     def _validate_current_replacement_state(
@@ -4673,10 +4597,7 @@ class PdfPageMutationService:
     ) -> None:
         self._validate_basic_candidate(path, expected_page_count=receipt.target_page_count_before)
         snapshot = self._snapshot_document_structure(path)
-        if not self._document_structure_matches_ignoring_resources(
-            snapshot,
-            receipt.target_before_snapshot,
-        ):
+        if snapshot != receipt.target_before_snapshot:
             raise PdfPageMutationError("ページ挿入の取り消し検証に失敗しました")
         self._render_pages(
             path,
@@ -4696,10 +4617,7 @@ class PdfPageMutationService:
             expected_page_count=receipt.target_after_snapshot.page_count,
         )
         snapshot = self._snapshot_document_structure(path)
-        if not self._document_structure_matches_ignoring_resources(
-            snapshot,
-            receipt.target_after_snapshot,
-        ):
+        if snapshot != receipt.target_after_snapshot:
             raise PdfPageMutationError("ページ挿入の再適用検証に失敗しました")
         plan = build_page_insertion_plan(
             receipt.target_page_count_before,
@@ -4818,10 +4736,7 @@ class PdfPageMutationService:
     ) -> None:
         resolved_path = path.expanduser().resolve()
         current_snapshot = self._snapshot_document_structure(resolved_path)
-        if not self._document_structure_matches_ignoring_resources(
-            current_snapshot,
-            receipt.before_snapshot,
-        ):
+        if current_snapshot != receipt.before_snapshot:
             raise PdfPageMutationError("複製対象ページの前提状態が変化しました")
         self._reject_unsupported_forms(resolved_path, receipt.source_page_indexes)
 
@@ -4831,10 +4746,7 @@ class PdfPageMutationService:
         receipt: PageReorderReceipt,
     ) -> None:
         current_snapshot = self._snapshot_document_structure(path)
-        if not self._document_structure_matches_ignoring_resources(
-            current_snapshot,
-            receipt.after_snapshot,
-        ):
+        if current_snapshot != receipt.after_snapshot:
             raise PdfPageMutationError("並べ替え済みページの状態が変化しているため元に戻せません")
 
     def _build_delete_execute_transition(

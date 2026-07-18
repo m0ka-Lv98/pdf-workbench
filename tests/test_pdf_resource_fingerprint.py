@@ -4,7 +4,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pikepdf
-from pikepdf import Name
+from pikepdf import Name, String
 
 from pdf_test_utils import create_blank_pdf
 from pdf_workbench.services.pdf_page_mutation import PdfPageMutationService
@@ -245,6 +245,27 @@ def test_resource_fingerprint_differs_for_changed_resource_dictionary_key(tmp_pa
         pdf.save(changed_path)
 
     assert page_resource_fingerprint(base_path) != page_resource_fingerprint(changed_path)
+
+
+def test_resource_fingerprint_distinguishes_name_and_literal_string_values(
+    tmp_path: Path,
+) -> None:
+    name_path = create_resource_fixture(tmp_path / "name-value.pdf", font_name="Helvetica")
+    string_path = create_resource_fixture(tmp_path / "string-value.pdf", font_name="Helvetica")
+
+    with pikepdf.open(name_path, allow_overwriting_input=True) as pdf:
+        pdf.pages[0].obj["/Resources"]["/Properties"] = pikepdf.Dictionary(
+            {"/Marker": Name("/Value")}
+        )
+        pdf.save(name_path)
+    with pikepdf.open(string_path, allow_overwriting_input=True) as pdf:
+        pdf.pages[0].obj["/Resources"]["/Properties"] = pikepdf.Dictionary(
+            {"/Marker": String("/Value")}
+        )
+        pdf.save(string_path)
+
+    assert build_normalized_resources(name_path) != build_normalized_resources(string_path)
+    assert page_resource_fingerprint(name_path) != page_resource_fingerprint(string_path)
 
 
 def test_reorder_pages_preserves_semantic_shared_resources_after_save_reopen(

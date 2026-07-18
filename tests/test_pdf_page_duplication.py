@@ -217,6 +217,19 @@ def annotation_objects(values: object) -> list[pikepdf.Object]:
     return [item if isinstance(item, pikepdf.Object) else item.get_object() for item in values]
 
 
+def add_unused_font_resource(path: Path, page_index: int) -> None:
+    with pikepdf.open(path, allow_overwriting_input=True) as pdf:
+        font_dict = pdf.pages[page_index].obj["/Resources"]["/Font"]
+        font_dict["/F_unused"] = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/Font"),
+                "/Subtype": pikepdf.Name("/Type1"),
+                "/BaseFont": pikepdf.Name("/Courier"),
+            }
+        )
+        pdf.save(path)
+
+
 def outline_summary(
     items: tuple[PdfOutlineItemSnapshot, ...],
 ) -> tuple[tuple[str, int | None, tuple[object, ...]], ...]:
@@ -475,6 +488,34 @@ def test_duplicate_pages_preserve_metadata_outlines_and_attachments(tmp_path: Pa
 
     service.undo_page_duplication(working_copy_path, mutation.receipt)
     assert service._snapshot_document_structure(working_copy_path) == snapshot_before
+
+
+def test_validate_duplication_redo_precondition_rejects_resources_only_drift(
+    tmp_path: Path,
+) -> None:
+    working_copy_path = create_text_fixture(tmp_path / "redo-resource-drift.pdf", ["A", "B", "C"])
+    service = PdfPageMutationService()
+    mutation = service.duplicate_pages(working_copy_path, (0,))
+    service.undo_page_duplication(working_copy_path, mutation.receipt)
+    add_unused_font_resource(working_copy_path, 0)
+    sha_before_call = file_sha256(working_copy_path)
+
+    with pytest.raises(PdfPageMutationError, match="前提状態"):
+        service.validate_duplication_redo_precondition(working_copy_path, mutation.receipt)
+
+    assert file_sha256(working_copy_path) == sha_before_call
+
+
+def test_duplicate_page_candidate_validation_rejects_resources_only_drift(
+    tmp_path: Path,
+) -> None:
+    working_copy_path = create_text_fixture(tmp_path / "candidate-resource-drift.pdf", ["A", "B"])
+    service = PdfPageMutationService()
+    mutation = service.duplicate_pages(working_copy_path, (0,))
+    add_unused_font_resource(working_copy_path, mutation.receipt.duplicate_page_indexes[0])
+
+    with pytest.raises(PdfPageMutationError, match="複製ページの構造検証"):
+        service._validate_page_duplication_candidate(working_copy_path, mutation.receipt)
 
 
 def test_duplicate_pages_map_later_outline_destinations_and_named_destinations(
