@@ -27,14 +27,14 @@ from pdf_workbench.services.pdf_page_mutation import (
 
 
 def create_text_fixture(path: Path, pages: list[str]) -> Path:
-    objects: list[bytes] = [
-        b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n",
-        f"2 0 obj << /Type /Pages /Count {len(pages)} /Kids [".encode("ascii"),
-    ]
+    objects: dict[int, bytes] = {
+        1: b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n",
+        2: f"2 0 obj << /Type /Pages /Count {len(pages)} /Kids [".encode("ascii"),
+    }
     page_object_numbers = [3 + index * 2 for index in range(len(pages))]
     content_object_numbers = [4 + index * 2 for index in range(len(pages))]
-    objects[1] += b" ".join(f"{number} 0 R".encode("ascii") for number in page_object_numbers)
-    objects[1] += b"] >> endobj\n"
+    objects[2] += b" ".join(f"{number} 0 R".encode("ascii") for number in page_object_numbers)
+    objects[2] += b"] >> endobj\n"
     for page_number, content_number, text in zip(
         page_object_numbers,
         content_object_numbers,
@@ -42,22 +42,28 @@ def create_text_fixture(path: Path, pages: list[str]) -> Path:
         strict=True,
     ):
         content = f"BT /F1 18 Tf 40 100 Td ({text}) Tj ET".encode("latin-1")
-        objects.append(
+        objects[page_number] = (
             f"{page_number} 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] "
             f"/Resources << /Font << /F1 100 0 R >> >> /Contents {content_number} 0 R "
             f">> endobj\n".encode("ascii")
         )
-        objects.append(
+        objects[content_number] = (
             f"{content_number} 0 obj << /Length {len(content)} >> stream\n".encode("ascii")
             + content
             + b"\nendstream\nendobj\n"
         )
-    objects.append(b"100 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n")
+    objects[100] = b"100 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n"
     pdf = bytearray(b"%PDF-1.4\n")
     offsets = [0]
-    for obj in objects:
+    max_object_number = max(objects)
+    for object_number in range(1, max_object_number + 1):
         offsets.append(len(pdf))
-        pdf.extend(obj)
+        pdf.extend(
+            objects.get(
+                object_number,
+                f"{object_number} 0 obj << >> endobj\n".encode("ascii"),
+            )
+        )
     xref_start = len(pdf)
     pdf.extend(f"xref\n0 {len(offsets)}\n".encode("ascii"))
     pdf.extend(b"0000000000 65535 f \n")

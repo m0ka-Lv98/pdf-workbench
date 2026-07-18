@@ -990,6 +990,55 @@ def test_main_window_replace_pages_reports_invalid_plan(
     qtbot.waitUntil(lambda: not window.isVisible())
 
 
+def test_main_window_replace_pages_rejects_stale_source_revision_before_command_execution(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    target_path = create_simple_text_pdf(tmp_path / "replace-stale-target.pdf", ["A", "B"])
+    source_path = create_simple_text_pdf(tmp_path / "replace-stale-source.pdf", ["X"])
+    window.open_document(target_path)
+    qtbot.waitUntil(lambda: window._current_document() is not None)
+    document = window._current_document()
+    assert document is not None
+    configure_fake_view_pages(document.view, 2)
+    document.view._page_organizer.set_selected_page_indexes((0,), current_index=0)
+    reported: list[tuple[str, str]] = []
+    executed_commands: list[DocumentCommand] = []
+
+    monkeypatch.setattr(window, "_choose_insert_source_path", lambda _document: source_path)
+
+    def choose_options(*_args: object, **_kwargs: object) -> ReplacePagesDialogResult:
+        create_simple_text_pdf(source_path, ["Y"])
+        return ReplacePagesDialogResult(page_selection=SourcePageSelection(1, (0,)))
+
+    monkeypatch.setattr(window, "_choose_replace_pages_options", choose_options)
+    monkeypatch.setattr(
+        window,
+        "_report_error",
+        lambda title, message: reported.append((title, message)),
+    )
+    monkeypatch.setattr(
+        window,
+        "execute_document_command",
+        lambda command: executed_commands.append(command) or True,
+    )
+
+    window._replace_selected_pages_from_pdf()
+
+    assert executed_commands == []
+    assert reported == [("ページ置換に失敗しました", "置換元PDFが変更されました")]
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
 class SnapshotRecordingSaveService(PdfSaveService):
     def __init__(self, replacement_pdf: Path | None = None) -> None:
         super().__init__()

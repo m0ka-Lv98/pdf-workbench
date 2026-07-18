@@ -8,6 +8,7 @@ import tempfile
 from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import dataclass
+from decimal import Decimal
 from enum import StrEnum
 from hashlib import sha256
 from numbers import Integral
@@ -60,6 +61,36 @@ _PROHIBITED_IMPORTED_ANNOTATION_KEYS = (
     "/Sound",
     "/Movie",
 )
+_REPLACEMENT_ALLOWED_PAGE_KEYS = frozenset(
+    {
+        "/Type",
+        "/Parent",
+        "/Contents",
+        "/Resources",
+        "/MediaBox",
+        "/CropBox",
+        "/TrimBox",
+        "/BleedBox",
+        "/ArtBox",
+        "/Rotate",
+        "/Annots",
+    }
+)
+_REPLACEMENT_MATERIALIZED_PAGE_KEYS = (
+    "/Contents",
+    "/Resources",
+    "/MediaBox",
+    "/CropBox",
+    "/TrimBox",
+    "/BleedBox",
+    "/ArtBox",
+    "/Rotate",
+    "/Annots",
+)
+_PAGE_ENTRY_FINGERPRINT_EXCLUDED_KEYS = frozenset(
+    _REPLACEMENT_ALLOWED_PAGE_KEYS | {"/Parent", "/Type"}
+)
+_NORMALIZE_OBJECT_UNHANDLED = object()
 
 
 def _require_strict_int(value: object, *, label: str) -> int:
@@ -151,6 +182,30 @@ class PdfPageStructureSnapshot:
     direct_rotate_value: int | None
     effective_rotation: int
     annotations: tuple[PdfAnnotationStructureSnapshot, ...]
+    direct_page_keys: tuple[str, ...]
+    extra_page_entries_fingerprint: str
+
+
+@dataclass(frozen=True, slots=True)
+class SourcePdfRevision:
+    resolved_path: Path
+    fingerprint: FileFingerprint
+    sha256: str
+    page_count: int
+
+    def __post_init__(self) -> None:
+        if not self.resolved_path.is_absolute():
+            raise ValueError("resolved_path must be absolute")
+        if self.resolved_path.suffix.lower() != ".pdf":
+            raise ValueError("resolved_path must refer to a PDF")
+        if isinstance(self.page_count, bool) or not isinstance(self.page_count, Integral):
+            raise ValueError("page_count must be an integer")
+        if self.page_count <= 0:
+            raise ValueError("page_count must be positive")
+        if len(self.sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in self.sha256
+        ):
+            raise ValueError("sha256 must be a lowercase SHA-256 hex digest")
 
 
 @dataclass(frozen=True, slots=True)
@@ -430,6 +485,8 @@ class PageReplacementReceipt:
     source_selected_page_snapshots: tuple[PdfPageStructureSnapshot, ...]
     target_page_indexes: tuple[int, ...]
     source_page_indexes: tuple[int, ...]
+    replacement_pairs: tuple[tuple[int, int], ...]
+    replaced_page_indexes_after: tuple[int, ...]
     execute_transition: PageIndexTransition
     undo_transition: PageIndexTransition
 
@@ -469,6 +526,13 @@ class PageReplacementReceipt:
             character not in "0123456789abcdef" for character in self.target_undo_snapshot_sha256
         ):
             raise ValueError("target_undo_snapshot_sha256 must be a lowercase SHA-256 hex digest")
+        if isinstance(self.source_snapshot_page_count, bool) or not isinstance(
+            self.source_snapshot_page_count,
+            Integral,
+        ):
+            raise ValueError("source_snapshot_page_count must be an integer")
+        if self.source_snapshot_page_count <= 0:
+            raise ValueError("source_snapshot_page_count must be positive")
         plan = build_page_replacement_plan(
             self.target_page_count_before,
             self.source_snapshot_page_count,
@@ -477,6 +541,10 @@ class PageReplacementReceipt:
         )
         if len(self.source_selected_page_snapshots) != len(plan.source_page_indexes):
             raise ValueError("source_selected_page_snapshots length must match source_page_indexes")
+        if tuple(self.replacement_pairs) != plan.replacement_pairs:
+            raise ValueError("replacement_pairs does not match the replacement plan")
+        if tuple(self.replaced_page_indexes_after) != plan.replaced_page_indexes_after:
+            raise ValueError("replaced_page_indexes_after does not match the replacement plan")
         if self.execute_transition.old_page_count != self.target_page_count_before:
             raise ValueError("execute_transition old_page_count is invalid")
         if self.execute_transition.new_page_count != self.target_page_count_before:
@@ -494,8 +562,11 @@ class PageReplacementReceipt:
         if self.undo_transition.current_page_old_to_new != plan.execute_current_page_old_to_new:
             raise ValueError("undo_transition current_page_old_to_new is invalid")
         object.__setattr__(self, "target_page_count_before", int(self.target_page_count_before))
+        object.__setattr__(self, "source_snapshot_page_count", int(self.source_snapshot_page_count))
         object.__setattr__(self, "target_page_indexes", plan.target_page_indexes)
         object.__setattr__(self, "source_page_indexes", plan.source_page_indexes)
+        object.__setattr__(self, "replacement_pairs", plan.replacement_pairs)
+        object.__setattr__(self, "replaced_page_indexes_after", plan.replaced_page_indexes_after)
 
 
 @dataclass(frozen=True, slots=True)
@@ -544,9 +615,9 @@ class PageReorderReceipt:
         object.__setattr__(self, "old_to_new", plan.old_to_new)
         object.__setattr__(self, "moved_page_indexes_after", plan.moved_page_indexes_after)
         for new_page_index, original_page_index in enumerate(plan.target_order):
-            if (
-                self.after_snapshot.pages[new_page_index]
-                != self.before_snapshot.pages[original_page_index]
+            if not PdfPageMutationService._page_structure_matches_ignoring_resources(
+                self.after_snapshot.pages[new_page_index],
+                self.before_snapshot.pages[original_page_index],
             ):
                 raise ValueError("after_snapshot does not match the expected reordered page order")
 
@@ -858,9 +929,10 @@ class PdfPageMutationService:
                 expected_page_count=source_snapshot_page_count,
                 render_page_indexes=plan.source_page_indexes,
             )
-            self._reject_unsupported_page_insertion_source_structures(
+            self._reject_unsupported_import_source_structures(
                 source_snapshot_path,
                 plan.source_page_indexes,
+                operation_label="挿入元",
             )
             source_selected_page_snapshots = self._snapshot_selected_source_pages(
                 source_snapshot_path,
@@ -1136,6 +1208,7 @@ class PdfPageMutationService:
         source_page_indexes: Sequence[object],
         *,
         expected_target_snapshot: PdfDocumentStructureSnapshot | None = None,
+        expected_source_revision: SourcePdfRevision | None = None,
     ) -> PageReplacementMutation:
         resolved_target_path = target_path.expanduser().resolve()
         resolved_source_path = source_path.expanduser().resolve()
@@ -1154,8 +1227,20 @@ class PdfPageMutationService:
                 raise PdfPageMutationError("置換対象PDFの前提状態が変化しました")
             self._reject_unsupported_page_insertion_target_structures(resolved_target_path)
 
-            source_original_fingerprint = self._source_snapshot_fingerprint(resolved_source_path)
-            source_original_sha256 = self._sha256_file(resolved_source_path)
+            if expected_source_revision is not None:
+                self._validate_expected_source_revision(
+                    resolved_source_path,
+                    expected_source_revision,
+                    operation_label="置換元",
+                )
+                source_original_fingerprint = expected_source_revision.fingerprint
+                source_original_sha256 = expected_source_revision.sha256
+            else:
+                source_original_fingerprint = self._source_snapshot_fingerprint(
+                    resolved_source_path,
+                    operation_label="置換元",
+                )
+                source_original_sha256 = self._sha256_file(resolved_source_path)
             source_snapshot_path = self._create_replace_source_snapshot_path(resolved_target_path)
             self._copy_named_snapshot(
                 resolved_source_path,
@@ -1166,7 +1251,10 @@ class PdfPageMutationService:
             source_snapshot_sha256 = self._sha256_file(source_snapshot_path)
             if source_snapshot_sha256 != source_original_sha256:
                 raise PdfPageMutationError("置換元スナップショットPDFの整合性検証に失敗しました")
-            source_current_fingerprint = self._source_snapshot_fingerprint(resolved_source_path)
+            source_current_fingerprint = self._source_snapshot_fingerprint(
+                resolved_source_path,
+                operation_label="置換元",
+            )
             source_current_sha256 = self._sha256_file(resolved_source_path)
             if (
                 source_current_fingerprint != source_original_fingerprint
@@ -1175,6 +1263,13 @@ class PdfPageMutationService:
                 raise PdfPageMutationError("置換元PDFが読み取り中に変更されました")
 
             source_snapshot_page_count = self.read_page_count(source_snapshot_path)
+            if expected_source_revision is not None:
+                if source_snapshot_sha256 != expected_source_revision.sha256:
+                    raise PdfPageMutationError(
+                        "置換元スナップショットPDFの整合性検証に失敗しました"
+                    )
+                if source_snapshot_page_count != expected_source_revision.page_count:
+                    raise PdfPageMutationError("置換元PDFのページ数が変化しました")
             plan = build_page_replacement_plan(
                 target_before_snapshot.page_count,
                 source_snapshot_page_count,
@@ -1192,9 +1287,10 @@ class PdfPageMutationService:
                 expected_page_count=source_snapshot_page_count,
                 render_page_indexes=plan.source_page_indexes,
             )
-            self._reject_unsupported_page_insertion_source_structures(
+            self._reject_unsupported_import_source_structures(
                 source_snapshot_path,
                 plan.source_page_indexes,
+                operation_label="置換元",
             )
             source_selected_page_snapshots = self._snapshot_selected_source_pages(
                 source_snapshot_path,
@@ -1243,6 +1339,8 @@ class PdfPageMutationService:
                 source_selected_page_snapshots=source_selected_page_snapshots,
                 target_page_indexes=plan.target_page_indexes,
                 source_page_indexes=plan.source_page_indexes,
+                replacement_pairs=plan.replacement_pairs,
+                replaced_page_indexes_after=plan.replaced_page_indexes_after,
                 execute_transition=execute_transition,
                 undo_transition=undo_transition,
             )
@@ -1554,7 +1652,10 @@ class PdfPageMutationService:
     ) -> None:
         resolved_path = path.expanduser().resolve()
         current_snapshot = self._snapshot_document_structure(resolved_path)
-        if current_snapshot != receipt.before_snapshot:
+        if not self._document_structure_matches_ignoring_resources(
+            current_snapshot,
+            receipt.before_snapshot,
+        ):
             raise PdfPageMutationError("並べ替え対象ページの前提状態が変化しました")
         self._reject_unsupported_page_reordering_structures(resolved_path)
 
@@ -1746,7 +1847,10 @@ class PdfPageMutationService:
     ) -> None:
         resolved_path = path.expanduser().resolve()
         current_snapshot = self._snapshot_document_structure(resolved_path)
-        if current_snapshot != receipt.before_snapshot:
+        if not self._document_structure_matches_ignoring_resources(
+            current_snapshot,
+            receipt.before_snapshot,
+        ):
             raise PdfPageMutationError("削除対象ページの前提状態が変化しました")
         self._reject_unsupported_page_deletion_structures(
             resolved_path,
@@ -2194,11 +2298,51 @@ class PdfPageMutationService:
         except OSError as exc:
             raise PdfPageMutationError(message) from exc
 
-    def _source_snapshot_fingerprint(self, path: Path) -> FileFingerprint:
+    def _source_snapshot_fingerprint(
+        self,
+        path: Path,
+        *,
+        operation_label: str = "挿入元",
+    ) -> FileFingerprint:
         try:
             return FileFingerprint.from_path(path)
         except OSError as exc:
-            raise PdfPageMutationError("挿入元PDFの状態を確認できませんでした") from exc
+            raise PdfPageMutationError(f"{operation_label}PDFの状態を確認できませんでした") from exc
+
+    def read_source_pdf_revision(self, path: Path) -> SourcePdfRevision:
+        resolved_path = path.expanduser().resolve()
+        fingerprint = self._source_snapshot_fingerprint(resolved_path, operation_label="置換元")
+        sha = self._sha256_file(resolved_path)
+        page_count = self.read_page_count(resolved_path)
+        return SourcePdfRevision(
+            resolved_path=resolved_path,
+            fingerprint=fingerprint,
+            sha256=sha,
+            page_count=page_count,
+        )
+
+    def _validate_expected_source_revision(
+        self,
+        path: Path,
+        expected_revision: SourcePdfRevision,
+        *,
+        operation_label: str,
+    ) -> None:
+        resolved_path = path.expanduser().resolve()
+        if resolved_path != expected_revision.resolved_path:
+            raise PdfPageMutationError(f"{operation_label}PDFのパスが変化しました")
+        current_fingerprint = self._source_snapshot_fingerprint(
+            resolved_path,
+            operation_label=operation_label,
+        )
+        if current_fingerprint != expected_revision.fingerprint:
+            raise PdfPageMutationError(f"{operation_label}PDFが変更されました")
+        current_sha = self._sha256_file(resolved_path)
+        if current_sha != expected_revision.sha256:
+            raise PdfPageMutationError(f"{operation_label}PDFが変更されました")
+        current_page_count = self.read_page_count(resolved_path)
+        if current_page_count != expected_revision.page_count:
+            raise PdfPageMutationError(f"{operation_label}PDFのページ数が変化しました")
 
     def _copy_delete_undo_snapshot(self, source_path: Path, snapshot_path: Path) -> None:
         try:
@@ -2331,7 +2475,10 @@ class PdfPageMutationService:
             page_mapping=plan.old_to_new,
         )
         for new_page_index, original_page_index in enumerate(plan.target_order):
-            if after_snapshot.pages[new_page_index] != before_snapshot.pages[original_page_index]:
+            if not self._page_structure_matches_ignoring_resources(
+                after_snapshot.pages[new_page_index],
+                before_snapshot.pages[original_page_index],
+            ):
                 raise PdfPageMutationError("更新後のページ順序または構造の検証に失敗しました")
         self._render_pages(path, self._reorder_execute_render_page_indexes(plan))
         return after_snapshot
@@ -2357,15 +2504,15 @@ class PdfPageMutationService:
             page_mapping=transition.cache_old_to_new,
         )
         for original_page_index, new_page_index in enumerate(plan.target_old_to_new):
-            if (
-                after_snapshot.pages[new_page_index]
-                != target_before_snapshot.pages[original_page_index]
+            if not self._page_structure_matches_ignoring_resources(
+                after_snapshot.pages[new_page_index],
+                target_before_snapshot.pages[original_page_index],
             ):
                 raise PdfPageMutationError("既存ページの構造検証に失敗しました")
         for offset, expected_source_page in enumerate(source_selected_page_snapshots):
             imported_page = after_snapshot.pages[plan.inserted_page_indexes_after[offset]]
             expected_page = self._expected_imported_page_snapshot(expected_source_page)
-            if imported_page != expected_page:
+            if not self._page_structure_matches_ignoring_resources(imported_page, expected_page):
                 raise PdfPageMutationError("挿入ページの構造検証に失敗しました")
         self._render_pages(path, self._page_insertion_render_page_indexes(plan))
         self._validate_inserted_page_render_equivalence(
@@ -2383,7 +2530,10 @@ class PdfPageMutationService:
     ) -> None:
         self._validate_basic_candidate(path, expected_page_count=receipt.original_page_count)
         after_snapshot = self._snapshot_document_structure(path)
-        if after_snapshot != receipt.before_snapshot:
+        if not self._document_structure_matches_ignoring_resources(
+            after_snapshot,
+            receipt.before_snapshot,
+        ):
             raise PdfPageMutationError("複製の取り消し検証に失敗しました")
         self._render_pages(path, tuple(range(receipt.original_page_count)))
 
@@ -2394,7 +2544,10 @@ class PdfPageMutationService:
     ) -> None:
         self._validate_basic_candidate(path, expected_page_count=receipt.original_page_count)
         snapshot = self._snapshot_document_structure(path)
-        if snapshot != receipt.before_snapshot:
+        if not self._document_structure_matches_ignoring_resources(
+            snapshot,
+            receipt.before_snapshot,
+        ):
             raise PdfPageMutationError("ページ並べ替えの取り消し検証に失敗しました")
         self._render_pages(path, self._reorder_undo_render_page_indexes(receipt))
 
@@ -2459,6 +2612,11 @@ class PdfPageMutationService:
             direct_rotate_value=rotation_state.direct_rotate_value,
             effective_rotation=rotation_state.effective_rotation,
             annotations=annotations,
+            direct_page_keys=tuple(sorted(str(key) for key in page.obj)),
+            extra_page_entries_fingerprint=self._object_fingerprint(
+                page.obj,
+                exclude_keys=_PAGE_ENTRY_FINGERPRINT_EXCLUDED_KEYS,
+            ),
         )
 
     def _annotation_snapshots(
@@ -2528,10 +2686,89 @@ class PdfPageMutationService:
         return self._object_fingerprint(contents)
 
     def _resources_fingerprint(self, page: pikepdf.Page) -> str:
-        resources = page.resources
+        resources: object | None = page.obj.get("/Resources", None)
+        if resources is None:
+            resources = self._resolve_inherited_value(page.obj, "/Resources")
         if resources is None:
             return "none"
-        return self._object_fingerprint(resources)
+        normalized = self._normalize_resource_object(
+            resources,
+            memo={},
+            active=set(),
+        )
+        encoded = json.dumps(
+            normalized,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return sha256(encoded).hexdigest()
+
+    def _normalize_resource_object(
+        self,
+        value: object,
+        *,
+        memo: dict[object, object],
+        active: set[object],
+    ) -> object:
+        dereferenced = self._dereference(value)
+        indirect_identity = self._indirect_normalization_identity(dereferenced)
+        direct_cycle_identity = self._direct_cycle_identity(dereferenced)
+        active_identity = (
+            indirect_identity if indirect_identity is not None else direct_cycle_identity
+        )
+        if active_identity is not None:
+            if active_identity in active:
+                return {"cycle": True}
+            if indirect_identity is not None and indirect_identity in memo:
+                return memo[indirect_identity]
+            active.add(active_identity)
+        try:
+            if isinstance(dereferenced, pikepdf.Stream):
+                payload = {
+                    str(key): self._normalize_resource_object(
+                        item,
+                        memo=memo,
+                        active=active,
+                    )
+                    for key, item in sorted(dereferenced.items(), key=lambda entry: str(entry[0]))
+                    if str(key) not in _VOLATILE_STREAM_KEYS
+                }
+                payload["__stream_data__"] = sha256(dereferenced.read_bytes()).hexdigest()
+                normalized: object = payload
+            elif isinstance(dereferenced, pikepdf.Dictionary):
+                normalized = {
+                    str(key): self._normalize_resource_object(
+                        item,
+                        memo=memo,
+                        active=active,
+                    )
+                    for key, item in sorted(dereferenced.items(), key=lambda entry: str(entry[0]))
+                }
+            elif isinstance(dereferenced, pikepdf.Array):
+                normalized = [
+                    self._normalize_resource_object(
+                        item,
+                        memo=memo,
+                        active=active,
+                    )
+                    for item in dereferenced
+                ]
+            elif isinstance(dereferenced, pikepdf.Name):
+                normalized = str(dereferenced)
+            elif isinstance(dereferenced, bytes):
+                normalized = {"__bytes__": sha256(dereferenced).hexdigest()}
+            else:
+                primitive = self._normalize_primitive_value(dereferenced)
+                normalized = (
+                    primitive if primitive is not _NORMALIZE_OBJECT_UNHANDLED else str(dereferenced)
+                )
+            if indirect_identity is not None:
+                memo[indirect_identity] = normalized
+            return normalized
+        finally:
+            if active_identity is not None:
+                active.discard(active_identity)
 
     def _appearance_fingerprint(self, annot: Any) -> str | None:
         appearance = annot.get("/AP", None)
@@ -2590,21 +2827,27 @@ class PdfPageMutationService:
         value: object,
         *,
         exclude_keys: frozenset[str],
-        seen: dict[tuple[int, int], int],
-        active: set[tuple[int, int]],
+        seen: dict[object, int],
+        active: set[object],
         next_local_id: list[int],
     ) -> object:
         dereferenced = self._dereference(value)
-        objgen = getattr(dereferenced, "objgen", None)
-        if objgen is not None:
-            typed_objgen = cast(tuple[int, int], objgen)
-            if typed_objgen in active:
-                return {"cycle": seen[typed_objgen]}
-            if typed_objgen in seen:
-                return {"ref": seen[typed_objgen]}
-            seen[typed_objgen] = next_local_id[0]
-            next_local_id[0] += 1
-            active.add(typed_objgen)
+        indirect_identity = self._indirect_normalization_identity(dereferenced)
+        direct_cycle_identity = self._direct_cycle_identity(dereferenced)
+        active_identity = (
+            indirect_identity if indirect_identity is not None else direct_cycle_identity
+        )
+        if active_identity is not None:
+            if active_identity in active:
+                if indirect_identity is not None:
+                    return {"cycle": seen[indirect_identity]}
+                return {"cycle": True}
+            if indirect_identity is not None:
+                if indirect_identity in seen:
+                    return {"ref": seen[indirect_identity]}
+                seen[indirect_identity] = next_local_id[0]
+                next_local_id[0] += 1
+            active.add(active_identity)
         try:
             if isinstance(dereferenced, pikepdf.Stream):
                 stream_exclude_keys = exclude_keys | _VOLATILE_STREAM_KEYS
@@ -2628,23 +2871,31 @@ class PdfPageMutationService:
                 payload["__stream_data__"] = sha256(dereferenced.read_bytes()).hexdigest()
                 return payload
             if isinstance(dereferenced, pikepdf.Dictionary):
-                return {
-                    key: self._normalize_object(
+                normalized_dict: dict[str, object] = {}
+                for key, item in sorted(
+                    (
+                        (str(key), item)
+                        for key, item in dereferenced.items()
+                        if str(key) not in exclude_keys
+                    ),
+                    key=lambda entry: entry[0],
+                ):
+                    item_value = self._dereference(item)
+                    if (
+                        getattr(dereferenced, "is_indirect", False) is False
+                        and getattr(item_value, "is_indirect", False) is False
+                        and item_value == dereferenced
+                    ):
+                        normalized_dict[key] = {"cycle": True}
+                        continue
+                    normalized_dict[key] = self._normalize_object(
                         item,
                         exclude_keys=exclude_keys,
                         seen=seen,
                         active=active,
                         next_local_id=next_local_id,
                     )
-                    for key, item in sorted(
-                        (
-                            (str(key), item)
-                            for key, item in dereferenced.items()
-                            if str(key) not in exclude_keys
-                        ),
-                        key=lambda entry: entry[0],
-                    )
-                }
+                return normalized_dict
             if isinstance(dereferenced, pikepdf.Array):
                 return [
                     self._normalize_object(
@@ -2658,12 +2909,51 @@ class PdfPageMutationService:
                 ]
             if isinstance(dereferenced, bytes):
                 return {"__bytes__": sha256(dereferenced).hexdigest()}
-            if dereferenced is None or isinstance(dereferenced, (bool, int, float, str)):
-                return dereferenced
+            primitive = self._normalize_primitive_value(dereferenced)
+            if primitive is not _NORMALIZE_OBJECT_UNHANDLED:
+                return primitive
             return str(dereferenced)
         finally:
-            if objgen is not None:
-                active.discard(cast(tuple[int, int], objgen))
+            if active_identity is not None:
+                active.discard(active_identity)
+
+    def _normalize_primitive_value(self, value: object) -> object:
+        if value is None or isinstance(value, bool):
+            return value
+        if isinstance(value, Integral):
+            return int(value)
+        if isinstance(value, Decimal):
+            return self._normalize_decimal_value(value)
+        if isinstance(value, float):
+            return self._normalize_decimal_value(Decimal(str(value)))
+        if isinstance(value, str):
+            return value
+        return _NORMALIZE_OBJECT_UNHANDLED
+
+    def _normalize_decimal_value(self, value: Decimal) -> object:
+        normalized = value.normalize()
+        if normalized == normalized.to_integral():
+            return int(normalized)
+        rendered = format(normalized, "f")
+        if "." in rendered:
+            rendered = rendered.rstrip("0").rstrip(".")
+        if rendered in {"", "-0"}:
+            rendered = "0"
+        return {"__number__": rendered}
+
+    def _indirect_normalization_identity(self, value: object) -> object | None:
+        if getattr(value, "is_indirect", False) is not True:
+            return None
+        objgen = getattr(value, "objgen", None)
+        if self._has_indirect_objgen(objgen):
+            typed_objgen = cast(tuple[int, int], objgen)
+            return ("indirect", typed_objgen[0], typed_objgen[1])
+        return None
+
+    def _direct_cycle_identity(self, value: object) -> object | None:
+        if isinstance(value, (pikepdf.Stream, pikepdf.Dictionary, pikepdf.Array)):
+            return ("direct", id(value))
+        return None
 
     def _metadata_fingerprint(self, path: Path) -> str:
         try:
@@ -3013,20 +3303,36 @@ class PdfPageMutationService:
         path: Path,
         source_page_indexes: tuple[int, ...],
     ) -> None:
+        self._reject_unsupported_import_source_structures(
+            path,
+            source_page_indexes,
+            operation_label="挿入元",
+        )
+
+    def _reject_unsupported_import_source_structures(
+        self,
+        path: Path,
+        source_page_indexes: tuple[int, ...],
+        *,
+        operation_label: str,
+    ) -> None:
+        operation_name = "ページ置換" if operation_label == "置換元" else "ページ挿入"
         with pikepdf.open(path) as pdf:
             root = pdf.Root
             if len(pdf.pages) <= 0:
                 raise PdfPageMutationError("0ページのPDFは扱えません")
             if "/AcroForm" in root:
-                raise PdfPageMutationError("フォームを含むPDFからのページ挿入は未対応です")
+                raise PdfPageMutationError(f"フォームを含むPDFからの{operation_name}は未対応です")
             if "/StructTreeRoot" in root:
-                raise PdfPageMutationError("タグ付きPDFからのページ挿入は未対応です")
+                raise PdfPageMutationError(f"タグ付きPDFからの{operation_name}は未対応です")
             if "/PageLabels" in root:
-                raise PdfPageMutationError("PageLabelsを含むPDFからのページ挿入は未対応です")
+                raise PdfPageMutationError(f"PageLabelsを含むPDFからの{operation_name}は未対応です")
             if "/Threads" in root:
-                raise PdfPageMutationError("Article Threadsを含むPDFからのページ挿入は未対応です")
+                raise PdfPageMutationError(
+                    f"Article Threadsを含むPDFからの{operation_name}は未対応です"
+                )
             if "/OpenAction" in root:
-                raise PdfPageMutationError("OpenActionを含むPDFからのページ挿入は未対応です")
+                raise PdfPageMutationError(f"OpenActionを含むPDFからの{operation_name}は未対応です")
 
             page_index_by_objgen = {
                 page.obj.objgen: index
@@ -3035,8 +3341,10 @@ class PdfPageMutationService:
             }
             for page_index in source_page_indexes:
                 page = pdf.pages[page_index]
-                if "/B" in page.obj:
-                    raise PdfPageMutationError("Article beadを含むページの挿入は未対応です")
+                self._validate_supported_replacement_source_page_keys(
+                    page.obj,
+                    operation_label=operation_label,
+                )
                 annots_object = page.obj.get("/Annots", None)
                 if annots_object is None:
                     continue
@@ -3048,7 +3356,24 @@ class PdfPageMutationService:
                         annot_ref,
                         source_owning_page=page.obj,
                         source_page_objgens=set(page_index_by_objgen),
+                        operation_label=operation_label,
                     )
+
+    def _validate_supported_replacement_source_page_keys(
+        self,
+        page_object: pikepdf.Dictionary,
+        *,
+        operation_label: str,
+    ) -> None:
+        for key_object in page_object:
+            key = str(key_object)
+            if key in _REPLACEMENT_ALLOWED_PAGE_KEYS:
+                continue
+            if key == "/B" and operation_label == "挿入元":
+                raise PdfPageMutationError("Article beadを含むページの挿入は未対応です")
+            if key == "/AA":
+                raise PdfPageMutationError(f"{operation_label}PDFのページアクションは未対応です")
+            raise PdfPageMutationError(f"{operation_label}PDFのページに未対応の{key}があります")
 
     @staticmethod
     def _annotation_has_internal_goto_action(annot: Any) -> bool:
@@ -3127,6 +3452,7 @@ class PdfPageMutationService:
         *,
         source_page: pikepdf.Page,
         inserted_page: pikepdf.Page,
+        operation_label: str = "挿入元",
     ) -> None:
         source_annots_object = source_page.obj.get("/Annots", None)
         if source_annots_object is None:
@@ -3151,6 +3477,7 @@ class PdfPageMutationService:
                 source_owning_page=source_page.obj,
                 source_page_objgens=page_objgens,
                 inserted_page=inserted_page.obj,
+                operation_label=operation_label,
             )
             copied_annots.append(copied_annot)
         inserted_page.obj[NameObject("/Annots")] = target_pdf.make_indirect(copied_annots)
@@ -3164,11 +3491,13 @@ class PdfPageMutationService:
         source_owning_page: Any,
         source_page_objgens: set[tuple[int, int]],
         inserted_page: Any,
+        operation_label: str,
     ) -> Any:
         source_annot, parent_state = self._validate_importable_source_annotation(
             source_annot_ref,
             source_owning_page=source_owning_page,
             source_page_objgens=source_page_objgens,
+            operation_label=operation_label,
         )
 
         source_handle = source_annot
@@ -3196,43 +3525,101 @@ class PdfPageMutationService:
         source_page: pikepdf.Page,
         source_page_snapshot: PdfPageStructureSnapshot,
     ) -> None:
-        imported_page_object = self._copy_foreign_page_object(
+        target_page_objgen = getattr(target_page.obj, "objgen", None)
+        self._clear_replacement_target_page_dictionary(target_page.obj)
+        copied_contents = self._copy_replacement_page_contents(
             target_pdf,
             source_pdf,
             source_page=source_page,
         )
-        contents = imported_page_object.get("/Contents", None)
-        if contents is None:
-            if "/Contents" in target_page.obj:
-                del target_page.obj["/Contents"]
-        else:
-            target_page.obj[NameObject("/Contents")] = contents
-        self._materialize_imported_page_structure(target_page, source_page_snapshot)
+        copied_resources = self._copy_effective_page_resources(
+            target_pdf,
+            source_pdf,
+            source_page=source_page,
+        )
+        self._materialize_replacement_page_structure(
+            target_page,
+            source_page_snapshot,
+            copied_contents=copied_contents,
+            copied_resources=copied_resources,
+        )
         self._copy_imported_page_annotations(
             target_pdf,
             source_pdf,
             source_page=source_page,
             inserted_page=target_page,
+            operation_label="置換元",
         )
+        if getattr(target_page.obj, "objgen", None) != target_page_objgen:
+            raise PdfPageMutationError("置換対象ページのオブジェクト識別子が変化しました")
 
-    def _copy_foreign_page_object(
+    def _copy_foreign_value(
+        self,
+        target_pdf: pikepdf.Pdf,
+        source_pdf: pikepdf.Pdf,
+        *,
+        value: object,
+        error_message: str,
+    ) -> object:
+        source_handle: object = value
+        if not self._has_indirect_objgen(getattr(source_handle, "objgen", None)):
+            source_handle = source_pdf.make_indirect(cast(pikepdf.Object, source_handle))
+        try:
+            copied_value = target_pdf.copy_foreign(cast(pikepdf.Object, source_handle))
+        except Exception as exc:
+            raise PdfPageMutationError(error_message) from exc
+        return copied_value
+
+    def _copy_replacement_page_contents(
         self,
         target_pdf: pikepdf.Pdf,
         source_pdf: pikepdf.Pdf,
         *,
         source_page: pikepdf.Page,
-    ) -> pikepdf.Dictionary:
-        source_handle = source_page.obj
-        if not self._has_indirect_objgen(getattr(source_handle, "objgen", None)):
-            source_handle = source_pdf.make_indirect(source_handle)
-        try:
-            copied_page = target_pdf.copy_foreign(source_handle)
-        except Exception as exc:
-            raise PdfPageMutationError("置換元ページのコピーに失敗しました") from exc
-        resolved = self._dereference(copied_page)
+    ) -> object | None:
+        contents = source_page.obj.get("/Contents", None)
+        if contents is None:
+            return None
+        copied_contents = self._copy_foreign_value(
+            target_pdf,
+            source_pdf,
+            value=contents,
+            error_message="置換元ページの/Contentsコピーに失敗しました",
+        )
+        resolved = self._dereference(copied_contents)
+        if not isinstance(resolved, (pikepdf.Stream, pikepdf.Array)):
+            raise PdfPageMutationError("置換元ページの/Contents構造が不正です")
+        return copied_contents
+
+    def _copy_effective_page_resources(
+        self,
+        target_pdf: pikepdf.Pdf,
+        source_pdf: pikepdf.Pdf,
+        *,
+        source_page: pikepdf.Page,
+    ) -> object | None:
+        resources: object | None = source_page.obj.get("/Resources", None)
+        if resources is None:
+            resources = self._resolve_inherited_value(source_page.obj, "/Resources")
+        if resources is None:
+            return None
+        copied_resources = self._copy_foreign_value(
+            target_pdf,
+            source_pdf,
+            value=resources,
+            error_message="置換元ページの/Resourcesコピーに失敗しました",
+        )
+        resolved = self._dereference(copied_resources)
         if not isinstance(resolved, pikepdf.Dictionary):
-            raise PdfPageMutationError("置換元ページのコピーに失敗しました")
-        return resolved
+            raise PdfPageMutationError("置換元ページの/Resources構造が不正です")
+        return copied_resources
+
+    def _clear_replacement_target_page_dictionary(self, page_object: pikepdf.Dictionary) -> None:
+        for key_object in list(page_object.keys()):
+            key = str(key_object)
+            if key in {"/Type", "/Parent"}:
+                continue
+            del page_object[key_object]
 
     def _rewrite_imported_annotation_parent(
         self,
@@ -3261,22 +3648,28 @@ class PdfPageMutationService:
         *,
         source_owning_page: Any,
         source_page_objgens: set[tuple[int, int]],
+        operation_label: str = "挿入元",
     ) -> tuple[pikepdf.Dictionary, AnnotationParentState]:
         source_annot = self._dereference(annot_ref)
         if not isinstance(source_annot, pikepdf.Dictionary):
-            raise PdfPageMutationError("挿入元PDFの注釈構造が不正です")
+            raise PdfPageMutationError(f"{operation_label}PDFの注釈構造が不正です")
 
         subtype_object = source_annot.get("/Subtype", None)
         if not isinstance(subtype_object, pikepdf.Name):
-            raise PdfPageMutationError("挿入元PDFの注釈subtypeが不正です")
+            raise PdfPageMutationError(f"{operation_label}PDFの注釈subtypeが不正です")
         subtype = str(subtype_object)
         if subtype not in SUPPORTED_IMPORTED_ANNOTATION_SUBTYPES:
-            raise PdfPageMutationError(f"挿入元PDFの{subtype.removeprefix('/')}注釈は未対応です")
+            raise PdfPageMutationError(
+                f"{operation_label}PDFの{subtype.removeprefix('/')}注釈は未対応です"
+            )
 
         prohibited_key = self._first_prohibited_imported_annotation_key(source_annot)
         if prohibited_key is not None:
             raise PdfPageMutationError(
-                self._unsupported_imported_annotation_key_message(prohibited_key)
+                self._unsupported_imported_annotation_key_message(
+                    prohibited_key,
+                    operation_label=operation_label,
+                )
             )
 
         parent_state = self._annotation_parent_state(
@@ -3297,22 +3690,36 @@ class PdfPageMutationService:
         return None
 
     @staticmethod
-    def _unsupported_imported_annotation_key_message(key: str) -> str:
+    def _unsupported_imported_annotation_key_message(
+        key: str,
+        *,
+        operation_label: str,
+    ) -> str:
         if key in {"/A", "/AA", "/Dest"}:
-            return "挿入元PDFのannotation actionは未対応です"
+            return f"{operation_label}PDFのannotation actionは未対応です"
         if key == "/FS":
-            return "挿入元PDFのFileSpec参照付き注釈は未対応です"
+            return f"{operation_label}PDFのFileSpec参照付き注釈は未対応です"
         if key in {"/RichMediaContent", "/RichMediaSettings"}:
-            return "挿入元PDFのRichMedia注釈は未対応です"
+            return f"{operation_label}PDFのRichMedia注釈は未対応です"
         if key in {"/3DD", "/3DV"}:
-            return "挿入元PDFの3D注釈は未対応です"
+            return f"{operation_label}PDFの3D注釈は未対応です"
         if key == "/Sound":
-            return "挿入元PDFのSound注釈は未対応です"
+            return f"{operation_label}PDFのSound注釈は未対応です"
         if key == "/Movie":
-            return "挿入元PDFのMovie注釈は未対応です"
-        return "挿入元PDFのactive contentを含む注釈は未対応です"
+            return f"{operation_label}PDFのMovie注釈は未対応です"
+        return f"{operation_label}PDFのactive contentを含む注釈は未対応です"
 
     def _materialize_imported_page_structure(
+        self,
+        page: pikepdf.Page,
+        snapshot: PdfPageStructureSnapshot,
+    ) -> None:
+        self._materialize_page_boxes_and_rotation(page, snapshot)
+        resources = page.resources
+        if resources is not None:
+            page.obj[NameObject("/Resources")] = resources
+
+    def _materialize_page_boxes_and_rotation(
         self,
         page: pikepdf.Page,
         snapshot: PdfPageStructureSnapshot,
@@ -3323,9 +3730,6 @@ class PdfPageMutationService:
         self._set_optional_page_box(page.obj, "/TrimBox", snapshot.boxes.trim_box)
         self._set_optional_page_box(page.obj, "/BleedBox", snapshot.boxes.bleed_box)
         self._set_optional_page_box(page.obj, "/ArtBox", snapshot.boxes.art_box)
-        resources = page.resources
-        if resources is not None:
-            page.obj[NameObject("/Resources")] = resources
         if snapshot.direct_rotate_present:
             if snapshot.direct_rotate_value is None:
                 raise PdfPageMutationError("挿入ページの回転情報が不正です")
@@ -3336,6 +3740,20 @@ class PdfPageMutationService:
             rotate_key = NameObject("/Rotate")
             if rotate_key in page.obj:
                 del page.obj[rotate_key]
+
+    def _materialize_replacement_page_structure(
+        self,
+        page: pikepdf.Page,
+        snapshot: PdfPageStructureSnapshot,
+        *,
+        copied_contents: object | None,
+        copied_resources: object | None,
+    ) -> None:
+        if copied_contents is not None:
+            page.obj[NameObject("/Contents")] = copied_contents
+        if copied_resources is not None:
+            page.obj[NameObject("/Resources")] = copied_resources
+        self._materialize_page_boxes_and_rotation(page, snapshot)
 
     def _apply_page_replacement_pairs(
         self,
@@ -3472,7 +3890,10 @@ class PdfPageMutationService:
         for original_page_index, current_page_index in enumerate(all_original_indexes_after):
             current_page = after_snapshot.pages[current_page_index]
             original_page = receipt.before_snapshot.pages[original_page_index]
-            if current_page != original_page:
+            if not self._page_structure_matches_ignoring_resources(
+                current_page,
+                original_page,
+            ):
                 raise PdfPageMutationError("ページ順序または構造の検証に失敗しました")
         for source_page_index, duplicate_page_index in zip(
             receipt.source_page_indexes,
@@ -3483,7 +3904,10 @@ class PdfPageMutationService:
             source_page = self._expected_duplicate_page_snapshot(
                 receipt.before_snapshot.pages[source_page_index]
             )
-            if duplicate_page != source_page:
+            if not self._page_structure_matches_ignoring_resources(
+                duplicate_page,
+                source_page,
+            ):
                 raise PdfPageMutationError("複製ページの構造検証に失敗しました")
 
     def _expected_duplicate_page_snapshot(
@@ -3509,6 +3933,44 @@ class PdfPageMutationService:
                 )
                 for annot in page.annotations
             ),
+            direct_page_keys=page.direct_page_keys,
+            extra_page_entries_fingerprint=page.extra_page_entries_fingerprint,
+        )
+
+    @staticmethod
+    def _page_structure_matches_ignoring_resources(
+        current: PdfPageStructureSnapshot,
+        expected: PdfPageStructureSnapshot,
+    ) -> bool:
+        return (
+            current.content_fingerprint == expected.content_fingerprint
+            and current.boxes == expected.boxes
+            and current.direct_resources_present == expected.direct_resources_present
+            and current.direct_rotate_present == expected.direct_rotate_present
+            and current.direct_rotate_value == expected.direct_rotate_value
+            and current.effective_rotation == expected.effective_rotation
+            and current.annotations == expected.annotations
+            and current.direct_page_keys == expected.direct_page_keys
+            and current.extra_page_entries_fingerprint == expected.extra_page_entries_fingerprint
+        )
+
+    @classmethod
+    def _document_structure_matches_ignoring_resources(
+        cls,
+        current: PdfDocumentStructureSnapshot,
+        expected: PdfDocumentStructureSnapshot,
+    ) -> bool:
+        return (
+            current.page_count == expected.page_count
+            and current.metadata_fingerprint == expected.metadata_fingerprint
+            and current.outlines == expected.outlines
+            and current.named_destinations == expected.named_destinations
+            and current.attachments_fingerprint == expected.attachments_fingerprint
+            and len(current.pages) == len(expected.pages)
+            and all(
+                cls._page_structure_matches_ignoring_resources(current_page, expected_page)
+                for current_page, expected_page in zip(current.pages, expected.pages, strict=True)
+            )
         )
 
     def _validate_duplicate_page_independence(
@@ -3634,6 +4096,21 @@ class PdfPageMutationService:
         self,
         page: PdfPageStructureSnapshot,
     ) -> PdfPageStructureSnapshot:
+        direct_page_keys = ["/Type", "/Parent", "/MediaBox", "/CropBox"]
+        if page.content_fingerprint != "none":
+            direct_page_keys.append("/Contents")
+        if page.resources_fingerprint != "none":
+            direct_page_keys.append("/Resources")
+        if page.boxes.trim_box is not None:
+            direct_page_keys.append("/TrimBox")
+        if page.boxes.bleed_box is not None:
+            direct_page_keys.append("/BleedBox")
+        if page.boxes.art_box is not None:
+            direct_page_keys.append("/ArtBox")
+        if page.direct_rotate_present or page.effective_rotation != 0:
+            direct_page_keys.append("/Rotate")
+        if page.annotations:
+            direct_page_keys.append("/Annots")
         return PdfPageStructureSnapshot(
             content_fingerprint=page.content_fingerprint,
             boxes=PageBoxState(
@@ -3671,7 +4148,12 @@ class PdfPageMutationService:
                 )
                 for annot in page.annotations
             ),
+            direct_page_keys=tuple(sorted(direct_page_keys)),
+            extra_page_entries_fingerprint=self._empty_page_entry_fingerprint(),
         )
+
+    def _empty_page_entry_fingerprint(self) -> str:
+        return self._object_fingerprint(pikepdf.Dictionary(), exclude_keys=frozenset())
 
     def _page_insertion_render_page_indexes(self, plan: PageInsertionPlan) -> tuple[int, ...]:
         indexes = set(plan.inserted_page_indexes_after)
@@ -3796,7 +4278,10 @@ class PdfPageMutationService:
         if len(after_snapshot.pages) != len(survivor_original_indexes):
             raise PdfPageMutationError("更新後のページ順序検証に失敗しました")
         for new_page_index, original_page_index in enumerate(survivor_original_indexes):
-            if after_snapshot.pages[new_page_index] != before_snapshot.pages[original_page_index]:
+            if not self._page_structure_matches_ignoring_resources(
+                after_snapshot.pages[new_page_index],
+                before_snapshot.pages[original_page_index],
+            ):
                 raise PdfPageMutationError("更新後のページ順序または構造の検証に失敗しました")
         self._render_pages(path, tuple(range(expected_page_count)))
         return after_snapshot
@@ -3807,7 +4292,10 @@ class PdfPageMutationService:
         receipt: PageDeletionReceipt,
     ) -> None:
         current_snapshot = self._snapshot_document_structure(path)
-        if current_snapshot != receipt.after_snapshot:
+        if not self._document_structure_matches_ignoring_resources(
+            current_snapshot,
+            receipt.after_snapshot,
+        ):
             raise PdfPageMutationError("削除済みページの状態が変化しているため元に戻せません")
 
     def _validate_delete_undo_snapshot(
@@ -3828,7 +4316,10 @@ class PdfPageMutationService:
             expected_page_count=receipt.original_page_count,
         )
         snapshot = self._snapshot_document_structure(snapshot_path)
-        if snapshot != receipt.before_snapshot:
+        if not self._document_structure_matches_ignoring_resources(
+            snapshot,
+            receipt.before_snapshot,
+        ):
             raise PdfPageMutationError("削除前スナップショットの構造検証に失敗しました")
 
     def _validate_delete_undo_snapshot_ownership(
@@ -3871,7 +4362,10 @@ class PdfPageMutationService:
     ) -> None:
         self._validate_basic_candidate(path, expected_page_count=receipt.original_page_count)
         snapshot = self._snapshot_document_structure(path)
-        if snapshot != receipt.before_snapshot:
+        if not self._document_structure_matches_ignoring_resources(
+            snapshot,
+            receipt.before_snapshot,
+        ):
             raise PdfPageMutationError("ページ削除の取り消し検証に失敗しました")
         self._render_pages(path, tuple(range(receipt.original_page_count)))
 
@@ -3882,7 +4376,10 @@ class PdfPageMutationService:
     ) -> None:
         self._validate_basic_candidate(path, expected_page_count=receipt.after_snapshot.page_count)
         snapshot = self._snapshot_document_structure(path)
-        if snapshot != receipt.after_snapshot:
+        if not self._document_structure_matches_ignoring_resources(
+            snapshot,
+            receipt.after_snapshot,
+        ):
             raise PdfPageMutationError("ページ削除の再適用検証に失敗しました")
         self._render_pages(path, tuple(range(receipt.after_snapshot.page_count)))
 
@@ -3893,7 +4390,10 @@ class PdfPageMutationService:
     ) -> None:
         self._validate_basic_candidate(path, expected_page_count=receipt.original_page_count)
         snapshot = self._snapshot_document_structure(path)
-        if snapshot != receipt.after_snapshot:
+        if not self._document_structure_matches_ignoring_resources(
+            snapshot,
+            receipt.after_snapshot,
+        ):
             raise PdfPageMutationError("ページ並べ替えの再適用検証に失敗しました")
         self._render_pages(
             path,
@@ -3906,7 +4406,10 @@ class PdfPageMutationService:
         receipt: PageInsertionReceipt,
     ) -> None:
         current_snapshot = self._snapshot_document_structure(path)
-        if current_snapshot != receipt.target_after_snapshot:
+        if not self._document_structure_matches_ignoring_resources(
+            current_snapshot,
+            receipt.target_after_snapshot,
+        ):
             raise PdfPageMutationError("挿入済みページの状態が変化しているため元に戻せません")
 
     def _validate_current_replacement_state(
@@ -4170,7 +4673,10 @@ class PdfPageMutationService:
     ) -> None:
         self._validate_basic_candidate(path, expected_page_count=receipt.target_page_count_before)
         snapshot = self._snapshot_document_structure(path)
-        if snapshot != receipt.target_before_snapshot:
+        if not self._document_structure_matches_ignoring_resources(
+            snapshot,
+            receipt.target_before_snapshot,
+        ):
             raise PdfPageMutationError("ページ挿入の取り消し検証に失敗しました")
         self._render_pages(
             path,
@@ -4190,7 +4696,10 @@ class PdfPageMutationService:
             expected_page_count=receipt.target_after_snapshot.page_count,
         )
         snapshot = self._snapshot_document_structure(path)
-        if snapshot != receipt.target_after_snapshot:
+        if not self._document_structure_matches_ignoring_resources(
+            snapshot,
+            receipt.target_after_snapshot,
+        ):
             raise PdfPageMutationError("ページ挿入の再適用検証に失敗しました")
         plan = build_page_insertion_plan(
             receipt.target_page_count_before,
@@ -4309,7 +4818,10 @@ class PdfPageMutationService:
     ) -> None:
         resolved_path = path.expanduser().resolve()
         current_snapshot = self._snapshot_document_structure(resolved_path)
-        if current_snapshot != receipt.before_snapshot:
+        if not self._document_structure_matches_ignoring_resources(
+            current_snapshot,
+            receipt.before_snapshot,
+        ):
             raise PdfPageMutationError("複製対象ページの前提状態が変化しました")
         self._reject_unsupported_forms(resolved_path, receipt.source_page_indexes)
 
@@ -4319,7 +4831,10 @@ class PdfPageMutationService:
         receipt: PageReorderReceipt,
     ) -> None:
         current_snapshot = self._snapshot_document_structure(path)
-        if current_snapshot != receipt.after_snapshot:
+        if not self._document_structure_matches_ignoring_resources(
+            current_snapshot,
+            receipt.after_snapshot,
+        ):
             raise PdfPageMutationError("並べ替え済みページの状態が変化しているため元に戻せません")
 
     def _build_delete_execute_transition(

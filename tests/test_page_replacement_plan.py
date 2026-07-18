@@ -39,6 +39,18 @@ def test_build_page_replacement_plan_builds_expected_mappings() -> None:
             "target and source page selections must be the same length",
         ),
         (
+            {"target_page_indexes": (1, 4), "replacement_pairs": ((1, 0), (4, 3))},
+            "target_page_indexes must stay within the page range",
+        ),
+        (
+            {"replacement_pairs": ((1, 0), (3, 2))},
+            "replacement_pairs does not match the replacement selections",
+        ),
+        (
+            {"replaced_page_indexes_after": (1, 3)},
+            "replaced_page_indexes_after does not match target_page_indexes",
+        ),
+        (
             {"execute_cache_old_to_new": (0, 1, 2, 3)},
             "execute_cache_old_to_new does not match the replacement selection",
         ),

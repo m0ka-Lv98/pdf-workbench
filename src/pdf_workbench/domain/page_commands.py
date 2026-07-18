@@ -23,6 +23,7 @@ from pdf_workbench.services.pdf_page_mutation import (
     PageRotationState,
     PdfDocumentStructureSnapshot,
     PdfPageMutationService,
+    SourcePdfRevision,
 )
 
 
@@ -471,6 +472,7 @@ class ReplacePagesCommand(DocumentCommand):
         current_page_index_before: int,
         selected_page_indexes_before: Sequence[int],
         expected_target_snapshot: PdfDocumentStructureSnapshot | None = None,
+        expected_source_revision: SourcePdfRevision | None = None,
     ) -> None:
         replaced_count = len(plan.target_page_indexes)
         self.description = (
@@ -484,6 +486,7 @@ class ReplacePagesCommand(DocumentCommand):
         self._current_page_index_before = current_page_index_before
         self._selected_page_indexes_before = _normalize_page_indexes(selected_page_indexes_before)
         self._expected_target_snapshot = expected_target_snapshot
+        self._expected_source_revision = expected_source_revision
         self._receipt: PageReplacementReceipt | None = None
         self._disposed = False
         self.last_mutation_result: WorkingCopyMutationResult | None = None
@@ -542,6 +545,7 @@ class ReplacePagesCommand(DocumentCommand):
             self._plan.target_page_indexes,
             self._plan.source_page_indexes,
             expected_target_snapshot=self._expected_target_snapshot,
+            expected_source_revision=self._expected_source_revision,
         )
 
     def _require_receipt(self) -> PageReplacementReceipt:

@@ -76,7 +76,7 @@ from pdf_workbench.domain.page_reorder import (
     build_page_reorder_plan,
 )
 from pdf_workbench.domain.page_replacement import build_page_replacement_plan
-from pdf_workbench.services.pdf_page_mutation import PdfPageMutationService
+from pdf_workbench.services.pdf_page_mutation import PdfPageMutationService, SourcePdfRevision
 from pdf_workbench.services.pdf_renderer import PdfRenderService
 from pdf_workbench.services.pdf_save_service import (
     PdfSaveError,
@@ -745,7 +745,7 @@ class MainWindow(QMainWindow):
         if source_path is None:
             return
         try:
-            source_page_count = self._page_mutation_service.read_page_count(source_path)
+            source_revision = self._page_mutation_service.read_source_pdf_revision(source_path)
         except Exception as exc:
             logger.exception("Failed to inspect source PDF for replacement: %s", source_path)
             self._report_error("ページ置換に失敗しました", str(exc))
@@ -755,7 +755,7 @@ class MainWindow(QMainWindow):
         options = self._choose_replace_pages_options(
             document,
             source_path=source_path,
-            source_page_count=source_page_count,
+            source_page_count=source_revision.page_count,
             target_page_indexes=selected_page_indexes,
         )
         if options is None:
@@ -763,10 +763,12 @@ class MainWindow(QMainWindow):
         target_document = self._resolve_replace_pages_document(context)
         if target_document is None:
             return
+        if not self._confirm_source_revision_still_current(source_revision):
+            return
         try:
             plan = build_page_replacement_plan(
                 target_document.view.page_count,
-                source_page_count,
+                source_revision.page_count,
                 selected_page_indexes,
                 options.page_selection.page_indexes,
             )
@@ -782,6 +784,7 @@ class MainWindow(QMainWindow):
                 current_page_index_before=target_document.view.page_index,
                 selected_page_indexes_before=target_document.view.selected_page_indexes,
                 expected_target_snapshot=expected_target_snapshot,
+                expected_source_revision=source_revision,
             )
         )
 
@@ -908,6 +911,26 @@ class MainWindow(QMainWindow):
         if dialog.exec() != dialog.DialogCode.Accepted:
             return None
         return dialog.dialog_result
+
+    def _confirm_source_revision_still_current(
+        self,
+        expected_revision: SourcePdfRevision,
+    ) -> bool:
+        try:
+            current_revision = self._page_mutation_service.read_source_pdf_revision(
+                expected_revision.resolved_path
+            )
+        except Exception as exc:
+            logger.exception(
+                "Failed to revalidate replacement source PDF: %s",
+                expected_revision.resolved_path,
+            )
+            self._report_error("ページ置換に失敗しました", str(exc))
+            return False
+        if current_revision != expected_revision:
+            self._report_error("ページ置換に失敗しました", "置換元PDFが変更されました")
+            return False
+        return True
 
     def _insertion_targets_for_document(
         self,
