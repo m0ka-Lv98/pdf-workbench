@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pikepdf
 import pytest
 from pypdf import PdfReader
 
-from pdf_test_utils import create_blank_pdf
+from pdf_test_utils import create_blank_pdf, create_simple_text_pdf
+from pdf_workbench.domain.mutation import PageIndexTransition
 from pdf_workbench.services.pdf_page_mutation import (
     PageRotationState,
     PdfPageMutationError,
     PdfPageMutationService,
     PdfPageRotationValidationError,
+    _require_strict_int,
+    _validate_sorted_unique_page_indexes,
 )
 
 
@@ -243,3 +247,294 @@ def test_apply_rotation_states_preserves_working_copy_bytes_when_source_rotation
         )
 
     assert document_path.read_bytes() == original_bytes
+
+
+def test_require_strict_int_rejects_bool_values() -> None:
+    with pytest.raises(ValueError, match="page_indexes must contain only integers"):
+        _require_strict_int(True, label="page_indexes")
+
+
+@pytest.mark.parametrize(
+    ("values", "message"),
+    [
+        ((1, 0), "page_indexes must be sorted"),
+        ((0, 0), "page_indexes must be unique"),
+        ((2,), "page_indexes must stay within the page range"),
+    ],
+)
+def test_validate_sorted_unique_page_indexes_rejects_invalid_values(
+    values: tuple[int, ...],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        _validate_sorted_unique_page_indexes(values, label="page_indexes", page_count=2)
+
+
+def _valid_duplication_receipt(tmp_path: Path) -> object:
+    document_path = create_blank_pdf(tmp_path / "duplication-receipt.pdf", 3)
+    return PdfPageMutationService().duplicate_pages(document_path, (1,)).receipt
+
+
+def _valid_deletion_receipt(tmp_path: Path) -> object:
+    document_path = create_blank_pdf(tmp_path / "deletion-receipt.pdf", 3)
+    return PdfPageMutationService().delete_pages(document_path, (1,), current_page_index=1).receipt
+
+
+def _valid_insertion_receipt(tmp_path: Path) -> object:
+    target_path = create_simple_text_pdf(tmp_path / "insertion-receipt-target.pdf", ["A", "B"])
+    source_path = create_simple_text_pdf(tmp_path / "insertion-receipt-source.pdf", ["X"])
+    return PdfPageMutationService().insert_pages_from_pdf(target_path, source_path, (0,), 1).receipt
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda receipt: replace(receipt, original_page_count=True),
+            "original_page_count must be an integer",
+        ),
+        (
+            lambda receipt: replace(receipt, original_page_count=0),
+            "original_page_count must be positive",
+        ),
+        (
+            lambda receipt: replace(
+                receipt,
+                before_snapshot=replace(
+                    receipt.before_snapshot,
+                    page_count=receipt.original_page_count + 1,
+                ),
+            ),
+            "before_snapshot page count must match original_page_count",
+        ),
+        (
+            lambda receipt: replace(receipt, source_page_indexes=()),
+            "source_page_indexes must not be empty",
+        ),
+        (
+            lambda receipt: replace(receipt, original_page_indexes_after=()),
+            "original_page_indexes_after length must match source_page_indexes",
+        ),
+        (
+            lambda receipt: replace(receipt, duplicate_page_indexes=()),
+            "duplicate_page_indexes length must match source_page_indexes",
+        ),
+        (
+            lambda receipt: replace(receipt, original_page_indexes_after=(0,)),
+            "original_page_indexes_after does not match the expected mapping",
+        ),
+        (
+            lambda receipt: replace(receipt, duplicate_page_indexes=(1,)),
+            "duplicate_page_indexes does not match the expected mapping",
+        ),
+        (
+            lambda receipt: replace(
+                receipt,
+                duplicate_page_indexes=(
+                    receipt.duplicate_page_indexes[0],
+                    receipt.duplicate_page_indexes[0],
+                ),
+            ),
+            "duplicate_page_indexes length must match source_page_indexes",
+        ),
+    ],
+)
+def test_page_duplication_receipt_rejects_invalid_invariants(
+    tmp_path: Path,
+    mutate: object,
+    message: str,
+) -> None:
+    receipt = _valid_duplication_receipt(tmp_path)
+
+    with pytest.raises(ValueError, match=message):
+        mutate(receipt)  # type: ignore[misc,operator]
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda receipt: replace(receipt, working_copy_path=Path("relative.pdf")),
+            "working_copy_path must be absolute",
+        ),
+        (
+            lambda receipt: replace(
+                receipt,
+                working_copy_path=receipt.working_copy_path.with_suffix(".txt"),
+            ),
+            "working_copy_path must point to a PDF",
+        ),
+        (
+            lambda receipt: replace(receipt, original_page_count=True),
+            "original_page_count must be an integer",
+        ),
+        (
+            lambda receipt: replace(receipt, original_current_page_index=True),
+            "original_current_page_index must be an integer",
+        ),
+        (
+            lambda receipt: replace(
+                receipt,
+                original_current_page_index=receipt.original_page_count,
+            ),
+            "original_current_page_index must stay within the page range",
+        ),
+        (
+            lambda receipt: replace(receipt, deleted_page_indexes=(0, 1, 2)),
+            "at least one page must remain after deletion",
+        ),
+        (
+            lambda receipt: replace(receipt, survivor_original_indexes=(0,)),
+            "survivor_original_indexes does not match the deleted pages",
+        ),
+        (
+            lambda receipt: replace(
+                receipt,
+                after_snapshot=replace(
+                    receipt.after_snapshot,
+                    page_count=receipt.after_snapshot.page_count + 1,
+                ),
+            ),
+            "after_snapshot page count does not match the deletion result",
+        ),
+        (
+            lambda receipt: replace(
+                receipt,
+                undo_snapshot_path=receipt.working_copy_path,
+            ),
+            "undo_snapshot_path must differ from working_copy_path",
+        ),
+        (
+            lambda receipt: replace(receipt, undo_snapshot_path=Path("relative.pdf")),
+            "undo_snapshot_path must be absolute",
+        ),
+        (
+            lambda receipt: replace(receipt, undo_snapshot_sha256="bad"),
+            "undo_snapshot_sha256 must be a lowercase SHA-256 hex digest",
+        ),
+    ],
+)
+def test_page_deletion_receipt_rejects_invalid_invariants(
+    tmp_path: Path,
+    mutate: object,
+    message: str,
+) -> None:
+    receipt = _valid_deletion_receipt(tmp_path)
+
+    with pytest.raises(ValueError, match=message):
+        mutate(receipt)  # type: ignore[misc,operator]
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda receipt: replace(receipt, working_copy_path=Path("relative.pdf")),
+            "working_copy_path must be absolute",
+        ),
+        (
+            lambda receipt: replace(
+                receipt,
+                working_copy_path=receipt.working_copy_path.with_suffix(".txt"),
+            ),
+            "working_copy_path must point to a PDF",
+        ),
+        (
+            lambda receipt: replace(receipt, target_page_count_before=True),
+            "target_page_count_before must be an integer",
+        ),
+        (
+            lambda receipt: replace(receipt, source_snapshot_path=Path("relative.pdf")),
+            "source_snapshot_path must be absolute",
+        ),
+        (
+            lambda receipt: replace(receipt, target_undo_snapshot_path=Path("relative.pdf")),
+            "target_undo_snapshot_path must be absolute",
+        ),
+        (
+            lambda receipt: replace(receipt, source_snapshot_path=receipt.working_copy_path),
+            "source_snapshot_path must differ from working_copy_path",
+        ),
+        (
+            lambda receipt: replace(receipt, target_undo_snapshot_path=receipt.working_copy_path),
+            "target_undo_snapshot_path must differ from working_copy_path",
+        ),
+        (
+            lambda receipt: replace(
+                receipt,
+                target_undo_snapshot_path=receipt.source_snapshot_path,
+            ),
+            "snapshot paths must differ",
+        ),
+        (
+            lambda receipt: replace(receipt, source_snapshot_sha256="bad"),
+            "source_snapshot_sha256 must be a lowercase SHA-256 hex digest",
+        ),
+        (
+            lambda receipt: replace(receipt, target_undo_snapshot_sha256="bad"),
+            "target_undo_snapshot_sha256 must be a lowercase SHA-256 hex digest",
+        ),
+        (
+            lambda receipt: replace(
+                receipt,
+                source_selected_page_snapshots=(),
+            ),
+            "source_selected_page_snapshots length must match source_page_indexes",
+        ),
+        (
+            lambda receipt: replace(
+                receipt,
+                target_after_snapshot=replace(
+                    receipt.target_after_snapshot,
+                    page_count=receipt.target_after_snapshot.page_count + 1,
+                ),
+            ),
+            "target_after_snapshot page count does not match the insertion result",
+        ),
+        (
+            lambda receipt: replace(
+                receipt,
+                execute_transition=PageIndexTransition(
+                    old_page_count=receipt.execute_transition.old_page_count,
+                    new_page_count=receipt.target_after_snapshot.page_count + 1,
+                    cache_old_to_new=receipt.execute_transition.cache_old_to_new,
+                    current_page_old_to_new=receipt.execute_transition.current_page_old_to_new,
+                ),
+            ),
+            "execute_transition new_page_count is invalid",
+        ),
+        (
+            lambda receipt: replace(
+                receipt,
+                execute_transition=PageIndexTransition(
+                    old_page_count=receipt.execute_transition.old_page_count,
+                    new_page_count=receipt.execute_transition.new_page_count,
+                    cache_old_to_new=receipt.execute_transition.cache_old_to_new,
+                    current_page_old_to_new=(0, 1),
+                ),
+            ),
+            "execute_transition current_page_old_to_new is invalid",
+        ),
+        (
+            lambda receipt: replace(
+                receipt,
+                undo_transition=PageIndexTransition(
+                    old_page_count=receipt.target_after_snapshot.page_count,
+                    new_page_count=receipt.target_page_count_before,
+                    cache_old_to_new=(0, 1, None),
+                    current_page_old_to_new=(0, 1, None),
+                ),
+            ),
+            "undo_transition cache_old_to_new is invalid",
+        ),
+    ],
+)
+def test_page_insertion_receipt_rejects_invalid_invariants(
+    tmp_path: Path,
+    mutate: object,
+    message: str,
+) -> None:
+    receipt = _valid_insertion_receipt(tmp_path)
+
+    with pytest.raises(ValueError, match=message):
+        mutate(receipt)  # type: ignore[misc,operator]

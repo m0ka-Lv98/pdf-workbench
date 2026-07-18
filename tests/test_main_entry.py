@@ -63,7 +63,10 @@ def test_build_parser_supports_skip_recovery_prompt() -> None:
     assert args.skip_recovery_prompt is True
 
 
-def test_initial_open_performs_recovery_before_cli_pdf(monkeypatch) -> None:
+def test_initial_open_performs_recovery_before_cli_pdf(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
     call_order: list[str] = []
     window = FakeWindow()
 
@@ -71,7 +74,7 @@ def test_initial_open_performs_recovery_before_cli_pdf(monkeypatch) -> None:
         call_order.append("recovery")
 
     monkeypatch.setattr("pdf_workbench.__main__._handle_startup_recovery", record_recovery)
-    cli_pdf = Path("/tmp/example.pdf")
+    cli_pdf = (tmp_path / "example.pdf").resolve()
 
     _perform_initial_document_open(
         window,  # type: ignore[arg-type]
@@ -84,7 +87,10 @@ def test_initial_open_performs_recovery_before_cli_pdf(monkeypatch) -> None:
     assert window.opened == [cli_pdf]
 
 
-def test_initial_open_skips_recovery_when_requested(monkeypatch) -> None:
+def test_initial_open_skips_recovery_when_requested(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
     call_order: list[str] = []
     window = FakeWindow()
 
@@ -92,7 +98,7 @@ def test_initial_open_skips_recovery_when_requested(monkeypatch) -> None:
         call_order.append("recovery")
 
     monkeypatch.setattr("pdf_workbench.__main__._handle_startup_recovery", record_recovery)
-    cli_pdf = Path("/tmp/example.pdf")
+    cli_pdf = (tmp_path / "example.pdf").resolve()
 
     _perform_initial_document_open(
         window,  # type: ignore[arg-type]
@@ -136,8 +142,11 @@ def test_handle_startup_recovery_recovers_selected_and_releases_others(monkeypat
     assert released == [second]
 
 
-def test_handle_startup_recovery_keeps_second_duplicate_candidate(monkeypatch) -> None:
-    source_path = Path("/tmp/shared.pdf")
+def test_handle_startup_recovery_keeps_second_duplicate_candidate(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    source_path = (tmp_path / "shared.pdf").resolve()
     first = FakeCandidate("first", source_path=source_path)
     second = FakeCandidate("second", source_path=source_path)
     released: list[FakeCandidate] = []

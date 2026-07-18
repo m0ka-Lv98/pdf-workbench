@@ -77,6 +77,9 @@ from pdf_workbench.services.source_change_monitor import (
 from pdf_workbench.ui.main_window import DocumentTab, MainWindow, RestoreSessionResult
 from pdf_workbench.ui.pdf_view import PdfView, PdfViewMutationSnapshot
 from pdf_workbench.ui.widgets.insert_pages_dialog import InsertPagesDialog, InsertPagesDialogResult
+from pdf_workbench.ui.widgets.replace_pages_dialog import (
+    ReplacePagesDialogResult,
+)
 from pdf_workbench.ui.widgets.search_bar import SearchBar, SearchInputSurface
 
 
@@ -91,6 +94,17 @@ def patch_pdf_open(monkeypatch: pytest.MonkeyPatch) -> None:
         self.state_changed.emit()
 
     monkeypatch.setattr(PdfView, "open_document", fake_open_document)
+
+
+def configure_fake_view_pages(view: PdfView, page_count: int) -> None:
+    assert view._metadata is not None
+    metadata = tuple(PageMetadata.from_size(144.0, 144.0) for _ in range(page_count))
+    view._metadata = DocumentMetadata(
+        revision=view._metadata.revision,
+        pages=metadata,
+    )
+    view._page_organizer.set_document(metadata)
+    view._page_organizer.set_current_page(0)
 
 
 def create_settings(tmp_path: Path) -> QSettings:
@@ -290,6 +304,34 @@ def test_main_window_insert_pages_action_exists_and_is_enabled_with_document(
 
     assert window.insert_pages_action.text() == "別のPDFからページを挿入…"
     assert window.insert_pages_action.isEnabled() is True
+    assert window.replace_pages_action.text() == "選択ページを別のPDFで置換…"
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
+def test_main_window_replace_pages_action_requires_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    window = MainWindow(create_settings(tmp_path))
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    target_path = create_simple_text_pdf(tmp_path / "replace-action-target.pdf", ["A", "B"])
+    window.open_document(target_path)
+    qtbot.waitUntil(lambda: window._current_document() is not None)
+    document = window._current_document()
+    assert document is not None
+    configure_fake_view_pages(document.view, 2)
+
+    document.view._page_organizer.set_selected_page_indexes((), current_index=0)
+    window._update_actions()
+    assert window.replace_pages_action.isEnabled() is False
+
+    document.view._page_organizer.set_selected_page_indexes((1,), current_index=1)
+    window._update_actions()
+    assert window.replace_pages_action.isEnabled() is True
     window.close()
     qtbot.waitUntil(lambda: not window.isVisible())
 
@@ -815,6 +857,184 @@ def test_main_window_insert_pages_reports_invalid_plan(
         ("ページ挿入に失敗しました", "insertion_slot must stay within 0..target_page_count")
     ]
     assert executed == []
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
+def test_main_window_replace_pages_builds_replace_command_from_ui_flow(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    target_path = create_simple_text_pdf(tmp_path / "replace-exec-target.pdf", ["A", "B", "C"])
+    source_path = create_simple_text_pdf(tmp_path / "replace-exec-source.pdf", ["X", "Y"])
+    window.open_document(target_path)
+    qtbot.waitUntil(lambda: window._current_document() is not None)
+    document = window._current_document()
+    assert document is not None
+    configure_fake_view_pages(document.view, 3)
+    document.view._page_organizer.set_selected_page_indexes((0, 2), current_index=2)
+    executed_commands: list[DocumentCommand] = []
+
+    monkeypatch.setattr(window, "_choose_insert_source_path", lambda _document: source_path)
+    monkeypatch.setattr(
+        window,
+        "_choose_replace_pages_options",
+        lambda _document, **_kwargs: ReplacePagesDialogResult(
+            page_selection=SourcePageSelection(2, (0, 1)),
+        ),
+    )
+    monkeypatch.setattr(
+        window,
+        "execute_document_command",
+        lambda command: executed_commands.append(command) or True,
+    )
+
+    window._replace_selected_pages_from_pdf()
+
+    assert len(executed_commands) == 1
+    command = executed_commands[0]
+    assert command.description == "2ページを置換"
+    assert command.requires_document_reload is True
+    assert command.mutates_working_copy is True
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
+def test_main_window_resolve_replace_pages_document_rejects_stale_context(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    target_path = create_simple_text_pdf(tmp_path / "replace-context-target.pdf", ["A", "B"])
+    window.open_document(target_path)
+    qtbot.waitUntil(lambda: window._current_document() is not None)
+    document = window._current_document()
+    assert document is not None
+    configure_fake_view_pages(document.view, 2)
+    document.view._page_organizer.set_selected_page_indexes((1,), current_index=1)
+    document.view.set_page(1)
+
+    context = window._capture_replace_pages_context(document)
+
+    assert window._resolve_replace_pages_document(context) is document
+    assert (
+        window._resolve_replace_pages_document(replace(context, selected_page_indexes=(0,))) is None
+    )
+    assert window._resolve_replace_pages_document(replace(context, current_page_index=0)) is None
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
+def test_main_window_replace_pages_reports_invalid_plan(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    window = MainWindow(create_settings(tmp_path))
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    target_path = create_simple_text_pdf(tmp_path / "replace-invalid-plan-target.pdf", ["A", "B"])
+    source_path = create_simple_text_pdf(tmp_path / "replace-invalid-plan-source.pdf", ["X"])
+    window.open_document(target_path)
+    qtbot.waitUntil(lambda: window._current_document() is not None)
+    document = window._current_document()
+    assert document is not None
+    configure_fake_view_pages(document.view, 2)
+    document.view._page_organizer.set_selected_page_indexes((0, 1), current_index=0)
+    reported: list[tuple[str, str]] = []
+    executed: list[DocumentCommand] = []
+
+    monkeypatch.setattr(window, "_choose_insert_source_path", lambda _document: source_path)
+    monkeypatch.setattr(window._page_mutation_service, "read_page_count", lambda _path: 1)
+    monkeypatch.setattr(
+        window,
+        "_choose_replace_pages_options",
+        lambda *args, **kwargs: ReplacePagesDialogResult(
+            page_selection=SourcePageSelection(1, (0,))
+        ),
+    )
+    monkeypatch.setattr(
+        window,
+        "_report_error",
+        lambda title, message: reported.append((title, message)),
+    )
+    monkeypatch.setattr(
+        window,
+        "execute_document_command",
+        lambda command: executed.append(command) or True,
+    )
+
+    window._replace_selected_pages_from_pdf()
+
+    assert reported == [
+        ("ページ置換に失敗しました", "target and source page selections must be the same length")
+    ]
+    assert executed == []
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
+def test_main_window_replace_pages_rejects_stale_source_revision_before_command_execution(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    target_path = create_simple_text_pdf(tmp_path / "replace-stale-target.pdf", ["A", "B"])
+    source_path = create_simple_text_pdf(tmp_path / "replace-stale-source.pdf", ["X"])
+    window.open_document(target_path)
+    qtbot.waitUntil(lambda: window._current_document() is not None)
+    document = window._current_document()
+    assert document is not None
+    configure_fake_view_pages(document.view, 2)
+    document.view._page_organizer.set_selected_page_indexes((0,), current_index=0)
+    reported: list[tuple[str, str]] = []
+    executed_commands: list[DocumentCommand] = []
+
+    monkeypatch.setattr(window, "_choose_insert_source_path", lambda _document: source_path)
+
+    def choose_options(*_args: object, **_kwargs: object) -> ReplacePagesDialogResult:
+        create_simple_text_pdf(source_path, ["Y"])
+        return ReplacePagesDialogResult(page_selection=SourcePageSelection(1, (0,)))
+
+    monkeypatch.setattr(window, "_choose_replace_pages_options", choose_options)
+    monkeypatch.setattr(
+        window,
+        "_report_error",
+        lambda title, message: reported.append((title, message)),
+    )
+    monkeypatch.setattr(
+        window,
+        "execute_document_command",
+        lambda command: executed_commands.append(command) or True,
+    )
+
+    window._replace_selected_pages_from_pdf()
+
+    assert executed_commands == []
+    assert reported == [("ページ置換に失敗しました", "置換元PDFが変更されました")]
     window.close()
     qtbot.waitUntil(lambda: not window.isVisible())
 

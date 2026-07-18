@@ -19,15 +19,18 @@ from pdf_workbench.domain.page_commands import (
     DuplicatePagesCommand,
     InsertPagesCommand,
     ReorderPagesCommand,
+    ReplacePagesCommand,
     RotatePagesCommand,
 )
 from pdf_workbench.domain.page_insertion import build_page_insertion_plan
 from pdf_workbench.domain.page_reorder import build_page_reorder_plan
+from pdf_workbench.domain.page_replacement import build_page_replacement_plan
 from pdf_workbench.services.pdf_page_mutation import (
     PdfPageMutationError,
     PdfPageMutationService,
 )
 from pdf_workbench.services.pdf_renderer import DocumentRevision
+from test_pdf_page_replacement import create_replacement_text_pdf
 
 
 def create_command_fixture(path: Path) -> Path:
@@ -303,6 +306,129 @@ def test_insert_pages_command_rejects_use_after_dispose(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="disposed"):
         command.undo()
+
+
+def test_replace_pages_command_executes_undoes_and_redoes(tmp_path: Path) -> None:
+    target_path = create_replacement_text_pdf(tmp_path / "replace-target.pdf", ["A", "B", "C"])
+    source_path = create_replacement_text_pdf(tmp_path / "replace-source.pdf", ["X", "Y"])
+    service = PdfPageMutationService()
+    command = ReplacePagesCommand(
+        target_path,
+        source_path,
+        build_page_replacement_plan(3, 2, (0, 2), (0, 1)),
+        service,
+        current_page_index_before=1,
+        selected_page_indexes_before=(0, 2),
+    )
+
+    execute_change = command.execute()
+    assert execute_change.requires_reload is True
+    assert execute_change.selected_page_indexes_after == (0, 2)
+    assert execute_change.current_page_index_after == 1
+    assert extract_pdfium_text(target_path) == "X B Y"
+
+    undo_change = command.undo()
+    assert undo_change.selected_page_indexes_after == (0, 2)
+    assert undo_change.current_page_index_after == 1
+    assert extract_pdfium_text(target_path) == "A B C"
+
+    source_path.write_bytes(b"%PDF-1.4\nbroken")
+    redo_change = command.redo()
+    assert redo_change.selected_page_indexes_after == (0, 2)
+    assert redo_change.current_page_index_after == 1
+    assert extract_pdfium_text(target_path) == "X B Y"
+
+    command.dispose()
+    assert command._receipt is None
+
+
+def test_replace_pages_command_rejects_use_after_dispose(tmp_path: Path) -> None:
+    target_path = create_blank_pdf(tmp_path / "replace-dispose-target.pdf", 2)
+    source_path = create_blank_pdf(tmp_path / "replace-dispose-source.pdf", 1)
+    command = ReplacePagesCommand(
+        target_path,
+        source_path,
+        build_page_replacement_plan(2, 1, (1,), (0,)),
+        PdfPageMutationService(),
+        current_page_index_before=1,
+        selected_page_indexes_before=(1,),
+    )
+
+    command.execute()
+    command.dispose()
+
+    with pytest.raises(RuntimeError, match="disposed"):
+        command.undo()
+
+
+def test_insert_pages_command_rejects_undo_and_redo_before_execute(tmp_path: Path) -> None:
+    target_path = create_blank_pdf(tmp_path / "insert-before-execute-target.pdf", 2)
+    source_path = create_blank_pdf(tmp_path / "insert-before-execute-source.pdf", 1)
+    command = InsertPagesCommand(
+        target_path,
+        source_path,
+        build_page_insertion_plan(2, 1, (0,), 1),
+        PdfPageMutationService(),
+        current_page_index_before=0,
+        selected_page_indexes_before=(0,),
+    )
+
+    with pytest.raises(RuntimeError, match="not been executed"):
+        command.undo()
+    with pytest.raises(RuntimeError, match="not been executed"):
+        command.redo()
+
+
+def test_insert_pages_command_dispose_is_idempotent(tmp_path: Path) -> None:
+    target_path = create_blank_pdf(tmp_path / "insert-dispose-idempotent-target.pdf", 2)
+    source_path = create_blank_pdf(tmp_path / "insert-dispose-idempotent-source.pdf", 1)
+    command = InsertPagesCommand(
+        target_path,
+        source_path,
+        build_page_insertion_plan(2, 1, (0,), 1),
+        PdfPageMutationService(),
+        current_page_index_before=0,
+        selected_page_indexes_before=(0,),
+    )
+
+    command.execute()
+    command.dispose()
+    command.dispose()
+
+
+def test_replace_pages_command_rejects_undo_and_redo_before_execute(tmp_path: Path) -> None:
+    target_path = create_blank_pdf(tmp_path / "replace-before-execute-target.pdf", 2)
+    source_path = create_blank_pdf(tmp_path / "replace-before-execute-source.pdf", 1)
+    command = ReplacePagesCommand(
+        target_path,
+        source_path,
+        build_page_replacement_plan(2, 1, (1,), (0,)),
+        PdfPageMutationService(),
+        current_page_index_before=1,
+        selected_page_indexes_before=(1,),
+    )
+
+    with pytest.raises(RuntimeError, match="not been executed"):
+        command.undo()
+    with pytest.raises(RuntimeError, match="not been executed"):
+        command.redo()
+
+
+def test_replace_pages_command_dispose_is_idempotent(tmp_path: Path) -> None:
+    target_path = create_blank_pdf(tmp_path / "replace-dispose-idempotent-target.pdf", 2)
+    source_path = create_blank_pdf(tmp_path / "replace-dispose-idempotent-source.pdf", 1)
+    command = ReplacePagesCommand(
+        target_path,
+        source_path,
+        build_page_replacement_plan(2, 1, (1,), (0,)),
+        PdfPageMutationService(),
+        current_page_index_before=1,
+        selected_page_indexes_before=(1,),
+    )
+
+    command.execute()
+    command.dispose()
+    command.dispose()
 
 
 def test_duplicate_pages_command_redo_preflight_failure_preserves_working_copy(

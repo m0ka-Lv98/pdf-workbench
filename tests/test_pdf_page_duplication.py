@@ -27,14 +27,14 @@ from pdf_workbench.services.pdf_page_mutation import (
 
 
 def create_text_fixture(path: Path, pages: list[str]) -> Path:
-    objects: list[bytes] = [
-        b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n",
-        f"2 0 obj << /Type /Pages /Count {len(pages)} /Kids [".encode("ascii"),
-    ]
+    objects: dict[int, bytes] = {
+        1: b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n",
+        2: f"2 0 obj << /Type /Pages /Count {len(pages)} /Kids [".encode("ascii"),
+    }
     page_object_numbers = [3 + index * 2 for index in range(len(pages))]
     content_object_numbers = [4 + index * 2 for index in range(len(pages))]
-    objects[1] += b" ".join(f"{number} 0 R".encode("ascii") for number in page_object_numbers)
-    objects[1] += b"] >> endobj\n"
+    objects[2] += b" ".join(f"{number} 0 R".encode("ascii") for number in page_object_numbers)
+    objects[2] += b"] >> endobj\n"
     for page_number, content_number, text in zip(
         page_object_numbers,
         content_object_numbers,
@@ -42,22 +42,28 @@ def create_text_fixture(path: Path, pages: list[str]) -> Path:
         strict=True,
     ):
         content = f"BT /F1 18 Tf 40 100 Td ({text}) Tj ET".encode("latin-1")
-        objects.append(
+        objects[page_number] = (
             f"{page_number} 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] "
             f"/Resources << /Font << /F1 100 0 R >> >> /Contents {content_number} 0 R "
             f">> endobj\n".encode("ascii")
         )
-        objects.append(
+        objects[content_number] = (
             f"{content_number} 0 obj << /Length {len(content)} >> stream\n".encode("ascii")
             + content
             + b"\nendstream\nendobj\n"
         )
-    objects.append(b"100 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n")
+    objects[100] = b"100 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n"
     pdf = bytearray(b"%PDF-1.4\n")
     offsets = [0]
-    for obj in objects:
+    max_object_number = max(objects)
+    for object_number in range(1, max_object_number + 1):
         offsets.append(len(pdf))
-        pdf.extend(obj)
+        pdf.extend(
+            objects.get(
+                object_number,
+                f"{object_number} 0 obj << >> endobj\n".encode("ascii"),
+            )
+        )
     xref_start = len(pdf)
     pdf.extend(f"xref\n0 {len(offsets)}\n".encode("ascii"))
     pdf.extend(b"0000000000 65535 f \n")
@@ -209,6 +215,19 @@ def annotation_objects(values: object) -> list[pikepdf.Object]:
     if not isinstance(values, pikepdf.Array):
         raise AssertionError("annotation array was not preserved")
     return [item if isinstance(item, pikepdf.Object) else item.get_object() for item in values]
+
+
+def add_unused_font_resource(path: Path, page_index: int) -> None:
+    with pikepdf.open(path, allow_overwriting_input=True) as pdf:
+        font_dict = pdf.pages[page_index].obj["/Resources"]["/Font"]
+        font_dict["/F_unused"] = pikepdf.Dictionary(
+            {
+                "/Type": pikepdf.Name("/Font"),
+                "/Subtype": pikepdf.Name("/Type1"),
+                "/BaseFont": pikepdf.Name("/Courier"),
+            }
+        )
+        pdf.save(path)
 
 
 def outline_summary(
@@ -469,6 +488,34 @@ def test_duplicate_pages_preserve_metadata_outlines_and_attachments(tmp_path: Pa
 
     service.undo_page_duplication(working_copy_path, mutation.receipt)
     assert service._snapshot_document_structure(working_copy_path) == snapshot_before
+
+
+def test_validate_duplication_redo_precondition_rejects_resources_only_drift(
+    tmp_path: Path,
+) -> None:
+    working_copy_path = create_text_fixture(tmp_path / "redo-resource-drift.pdf", ["A", "B", "C"])
+    service = PdfPageMutationService()
+    mutation = service.duplicate_pages(working_copy_path, (0,))
+    service.undo_page_duplication(working_copy_path, mutation.receipt)
+    add_unused_font_resource(working_copy_path, 0)
+    sha_before_call = file_sha256(working_copy_path)
+
+    with pytest.raises(PdfPageMutationError, match="前提状態"):
+        service.validate_duplication_redo_precondition(working_copy_path, mutation.receipt)
+
+    assert file_sha256(working_copy_path) == sha_before_call
+
+
+def test_duplicate_page_candidate_validation_rejects_resources_only_drift(
+    tmp_path: Path,
+) -> None:
+    working_copy_path = create_text_fixture(tmp_path / "candidate-resource-drift.pdf", ["A", "B"])
+    service = PdfPageMutationService()
+    mutation = service.duplicate_pages(working_copy_path, (0,))
+    add_unused_font_resource(working_copy_path, mutation.receipt.duplicate_page_indexes[0])
+
+    with pytest.raises(PdfPageMutationError, match="複製ページの構造検証"):
+        service._validate_page_duplication_candidate(working_copy_path, mutation.receipt)
 
 
 def test_duplicate_pages_map_later_outline_destinations_and_named_destinations(

@@ -66,6 +66,7 @@ from pdf_workbench.domain.page_commands import (
     DuplicatePagesCommand,
     InsertPagesCommand,
     ReorderPagesCommand,
+    ReplacePagesCommand,
     RotatePagesCommand,
 )
 from pdf_workbench.domain.page_insertion import build_page_insertion_plan
@@ -74,7 +75,8 @@ from pdf_workbench.domain.page_reorder import (
     PageReorderPlan,
     build_page_reorder_plan,
 )
-from pdf_workbench.services.pdf_page_mutation import PdfPageMutationService
+from pdf_workbench.domain.page_replacement import build_page_replacement_plan
+from pdf_workbench.services.pdf_page_mutation import PdfPageMutationService, SourcePdfRevision
 from pdf_workbench.services.pdf_renderer import PdfRenderService
 from pdf_workbench.services.pdf_save_service import (
     PdfSaveError,
@@ -98,6 +100,10 @@ from pdf_workbench.ui.widgets.empty_state import EmptyState
 from pdf_workbench.ui.widgets.insert_pages_dialog import (
     InsertPagesDialog,
     InsertPagesDialogResult,
+)
+from pdf_workbench.ui.widgets.replace_pages_dialog import (
+    ReplacePagesDialog,
+    ReplacePagesDialogResult,
 )
 from pdf_workbench.ui.widgets.search_bar import SearchBar, SearchBarState
 from pdf_workbench.ui.widgets.source_change_banner import (
@@ -134,6 +140,16 @@ class InsertPagesDocumentContext:
     working_copy_path: Path
     source_path: Path
     page_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class ReplacePagesDocumentContext:
+    session_id: str
+    working_copy_path: Path
+    source_path: Path
+    page_count: int
+    selected_page_indexes: tuple[int, ...]
+    current_page_index: int
 
 
 class MainWindow(QMainWindow):
@@ -359,6 +375,9 @@ class MainWindow(QMainWindow):
         self.insert_pages_action = QAction("別のPDFからページを挿入…", self)
         self.insert_pages_action.triggered.connect(self._insert_pages_from_pdf)
 
+        self.replace_pages_action = QAction("選択ページを別のPDFで置換…", self)
+        self.replace_pages_action.triggered.connect(self._replace_selected_pages_from_pdf)
+
         self.copy_action = QAction("コピー", self)
         self.copy_action.setShortcut(QKeySequence.StandardKey.Copy)
         self.copy_action.triggered.connect(self._copy_selection)
@@ -370,6 +389,7 @@ class MainWindow(QMainWindow):
             self.delete_pages_action,
             self.duplicate_pages_action,
             self.insert_pages_action,
+            self.replace_pages_action,
             self.save_action,
             self.save_as_action,
             self.close_action,
@@ -410,6 +430,7 @@ class MainWindow(QMainWindow):
         edit_menu.addAction(self.delete_pages_action)
         edit_menu.addAction(self.duplicate_pages_action)
         edit_menu.addAction(self.insert_pages_action)
+        edit_menu.addAction(self.replace_pages_action)
         edit_menu.addSeparator()
         edit_menu.addAction(self.find_action)
         edit_menu.addAction(self.find_next_action)
@@ -704,6 +725,69 @@ class MainWindow(QMainWindow):
             )
         )
 
+    def _replace_selected_pages_from_pdf(self) -> None:
+        document = self._current_document()
+        if document is None or document.session.is_saving or document.mutation_in_progress:
+            return
+        selected_page_indexes = tuple(sorted(set(document.view.selected_page_indexes)))
+        if not selected_page_indexes:
+            return
+        context = self._capture_replace_pages_context(document)
+        try:
+            expected_target_snapshot = self._page_mutation_service.snapshot_document_structure(
+                document.session.document_path,
+            )
+        except Exception as exc:
+            logger.exception("Failed to snapshot target PDF before replacement")
+            self._report_error("ページ置換に失敗しました", str(exc))
+            return
+        source_path = self._choose_insert_source_path(document)
+        if source_path is None:
+            return
+        try:
+            source_revision = self._page_mutation_service.read_source_pdf_revision(source_path)
+        except Exception as exc:
+            logger.exception("Failed to inspect source PDF for replacement: %s", source_path)
+            self._report_error("ページ置換に失敗しました", str(exc))
+            return
+        if self._resolve_replace_pages_document(context) is None:
+            return
+        options = self._choose_replace_pages_options(
+            document,
+            source_path=source_path,
+            source_page_count=source_revision.page_count,
+            target_page_indexes=selected_page_indexes,
+        )
+        if options is None:
+            return
+        target_document = self._resolve_replace_pages_document(context)
+        if target_document is None:
+            return
+        if not self._confirm_source_revision_still_current(source_revision):
+            return
+        try:
+            plan = build_page_replacement_plan(
+                target_document.view.page_count,
+                source_revision.page_count,
+                selected_page_indexes,
+                options.page_selection.page_indexes,
+            )
+        except (TypeError, ValueError) as exc:
+            self._report_error("ページ置換に失敗しました", str(exc))
+            return
+        self.execute_document_command(
+            ReplacePagesCommand(
+                target_document.session.document_path,
+                source_path,
+                plan,
+                self._page_mutation_service,
+                current_page_index_before=target_document.view.page_index,
+                selected_page_indexes_before=target_document.view.selected_page_indexes,
+                expected_target_snapshot=expected_target_snapshot,
+                expected_source_revision=source_revision,
+            )
+        )
+
     def _reorder_selected_pages(
         self,
         plan: object,
@@ -731,6 +815,16 @@ class MainWindow(QMainWindow):
             page_count=document.view.page_count,
         )
 
+    def _capture_replace_pages_context(self, document: DocumentTab) -> ReplacePagesDocumentContext:
+        return ReplacePagesDocumentContext(
+            session_id=document.session.session_id,
+            working_copy_path=document.session.document_path,
+            source_path=document.session.source_path,
+            page_count=document.view.page_count,
+            selected_page_indexes=tuple(sorted(set(document.view.selected_page_indexes))),
+            current_page_index=document.view.page_index,
+        )
+
     def _resolve_insert_pages_document(
         self,
         context: InsertPagesDocumentContext,
@@ -747,6 +841,26 @@ class MainWindow(QMainWindow):
         if document.view.page_count != context.page_count:
             return None
         if document.session.is_saving or document.mutation_in_progress:
+            return None
+        return document
+
+    def _resolve_replace_pages_document(
+        self,
+        context: ReplacePagesDocumentContext,
+    ) -> DocumentTab | None:
+        document = self._resolve_insert_pages_document(
+            InsertPagesDocumentContext(
+                session_id=context.session_id,
+                working_copy_path=context.working_copy_path,
+                source_path=context.source_path,
+                page_count=context.page_count,
+            )
+        )
+        if document is None:
+            return None
+        if tuple(sorted(set(document.view.selected_page_indexes))) != context.selected_page_indexes:
+            return None
+        if document.view.page_index != context.current_page_index:
             return None
         return document
 
@@ -779,6 +893,44 @@ class MainWindow(QMainWindow):
         if dialog.exec() != dialog.DialogCode.Accepted:
             return None
         return dialog.dialog_result
+
+    def _choose_replace_pages_options(
+        self,
+        document: DocumentTab,
+        *,
+        source_path: Path,
+        source_page_count: int,
+        target_page_indexes: tuple[int, ...],
+    ) -> ReplacePagesDialogResult | None:
+        dialog = ReplacePagesDialog(
+            source_path,
+            source_page_count,
+            tuple(page_index + 1 for page_index in target_page_indexes),
+            parent=self,
+        )
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return None
+        return dialog.dialog_result
+
+    def _confirm_source_revision_still_current(
+        self,
+        expected_revision: SourcePdfRevision,
+    ) -> bool:
+        try:
+            current_revision = self._page_mutation_service.read_source_pdf_revision(
+                expected_revision.resolved_path
+            )
+        except Exception as exc:
+            logger.exception(
+                "Failed to revalidate replacement source PDF: %s",
+                expected_revision.resolved_path,
+            )
+            self._report_error("ページ置換に失敗しました", str(exc))
+            return False
+        if current_revision != expected_revision:
+            self._report_error("ページ置換に失敗しました", "置換元PDFが変更されました")
+            return False
+        return True
 
     def _insertion_targets_for_document(
         self,
@@ -1279,6 +1431,14 @@ class MainWindow(QMainWindow):
         self.insert_pages_action.setEnabled(
             bool(document and not document.session.is_saving and not document.mutation_in_progress)
         )
+        self.replace_pages_action.setEnabled(
+            bool(
+                document
+                and document.view.selected_page_indexes
+                and not document.session.is_saving
+                and not document.mutation_in_progress
+            )
+        )
         self.previous_action.setEnabled(has_document)
         self.next_action.setEnabled(has_document)
         self.zoom_in_action.setEnabled(has_document)
@@ -1415,6 +1575,7 @@ class MainWindow(QMainWindow):
             return
         menu = QMenu(self)
         menu.addAction(self.insert_pages_action)
+        menu.addAction(self.replace_pages_action)
         menu.addSeparator()
         menu.addAction(self.duplicate_pages_action)
         menu.addAction(self.delete_pages_action)
