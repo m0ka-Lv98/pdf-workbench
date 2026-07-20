@@ -62,6 +62,7 @@ from pdf_workbench.domain.command_history import (
 )
 from pdf_workbench.domain.document_session import DocumentSession, SourceStatus
 from pdf_workbench.domain.page_commands import (
+    CropPagesCommand,
     DeletePagesCommand,
     DuplicatePagesCommand,
     InsertPagesCommand,
@@ -69,6 +70,7 @@ from pdf_workbench.domain.page_commands import (
     ReplacePagesCommand,
     RotatePagesCommand,
 )
+from pdf_workbench.domain.page_crop import build_page_crop_plan
 from pdf_workbench.domain.page_insertion import build_page_insertion_plan
 from pdf_workbench.domain.page_reorder import (
     PageReorderNoOpError,
@@ -95,6 +97,10 @@ from pdf_workbench.services.session_workspace import (
 from pdf_workbench.services.source_change_monitor import SourceChangeMonitor, SourceCheckResult
 from pdf_workbench.ui.icon_provider import IconName, IconProvider, IconTone
 from pdf_workbench.ui.pdf_view import PdfView, PdfViewMutationSnapshot
+from pdf_workbench.ui.widgets.crop_pages_dialog import (
+    CropPagesDialog,
+    CropPagesDialogResult,
+)
 from pdf_workbench.ui.widgets.document_toolbar import DocumentToolbar, ToolbarState
 from pdf_workbench.ui.widgets.empty_state import EmptyState
 from pdf_workbench.ui.widgets.insert_pages_dialog import (
@@ -144,6 +150,16 @@ class InsertPagesDocumentContext:
 
 @dataclass(frozen=True, slots=True)
 class ReplacePagesDocumentContext:
+    session_id: str
+    working_copy_path: Path
+    source_path: Path
+    page_count: int
+    selected_page_indexes: tuple[int, ...]
+    current_page_index: int
+
+
+@dataclass(frozen=True, slots=True)
+class CropPagesDocumentContext:
     session_id: str
     working_copy_path: Path
     source_path: Path
@@ -372,6 +388,9 @@ class MainWindow(QMainWindow):
         self.duplicate_pages_action = QAction("選択したページを複製", self)
         self.duplicate_pages_action.triggered.connect(self._duplicate_selected_pages)
 
+        self.crop_pages_action = QAction("選択ページをトリミング…", self)
+        self.crop_pages_action.triggered.connect(self._crop_selected_pages)
+
         self.insert_pages_action = QAction("別のPDFからページを挿入…", self)
         self.insert_pages_action.triggered.connect(self._insert_pages_from_pdf)
 
@@ -386,6 +405,7 @@ class MainWindow(QMainWindow):
             self.open_action,
             self.undo_action,
             self.redo_action,
+            self.crop_pages_action,
             self.delete_pages_action,
             self.duplicate_pages_action,
             self.insert_pages_action,
@@ -427,6 +447,7 @@ class MainWindow(QMainWindow):
         edit_menu.addAction(self.undo_action)
         edit_menu.addAction(self.redo_action)
         edit_menu.addSeparator()
+        edit_menu.addAction(self.crop_pages_action)
         edit_menu.addAction(self.delete_pages_action)
         edit_menu.addAction(self.duplicate_pages_action)
         edit_menu.addAction(self.insert_pages_action)
@@ -653,6 +674,55 @@ class MainWindow(QMainWindow):
             )
         )
 
+    def _crop_selected_pages(self) -> None:
+        document = self._current_document()
+        if document is None or document.session.is_saving or document.mutation_in_progress:
+            return
+        selected_page_indexes = tuple(sorted(set(document.view.selected_page_indexes)))
+        if not selected_page_indexes:
+            return
+        context = self._capture_crop_pages_context(document)
+        try:
+            expected_target_snapshot = self._page_mutation_service.snapshot_document_structure(
+                document.session.document_path,
+            )
+            crop_states = self._page_mutation_service.read_crop_states(
+                document.session.document_path,
+                selected_page_indexes,
+            )
+        except Exception as exc:
+            logger.exception("Failed to prepare CropBox edit")
+            self._report_error("ページのトリミングに失敗しました", str(exc))
+            return
+        result = self._choose_crop_pages_options(
+            document,
+            selected_page_count=len(selected_page_indexes),
+        )
+        if result is None:
+            return
+        target_document = self._resolve_crop_pages_document(context)
+        if target_document is None:
+            return
+        try:
+            plan = build_page_crop_plan(
+                crop_states,
+                margins=result.margins,
+                reset_to_media_box=result.reset_to_media_box,
+            )
+        except (TypeError, ValueError) as exc:
+            self._report_error("ページのトリミングに失敗しました", str(exc))
+            return
+        self.execute_document_command(
+            CropPagesCommand(
+                target_document.session.document_path,
+                plan,
+                self._page_mutation_service,
+                current_page_index_before=target_document.view.page_index,
+                selected_page_indexes_before=target_document.view.selected_page_indexes,
+                expected_target_snapshot=expected_target_snapshot,
+            )
+        )
+
     def _delete_selected_pages(self) -> None:
         document = self._current_document()
         if document is None or document.session.is_saving or document.mutation_in_progress:
@@ -825,6 +895,16 @@ class MainWindow(QMainWindow):
             current_page_index=document.view.page_index,
         )
 
+    def _capture_crop_pages_context(self, document: DocumentTab) -> CropPagesDocumentContext:
+        return CropPagesDocumentContext(
+            session_id=document.session.session_id,
+            working_copy_path=document.session.document_path,
+            source_path=document.session.source_path,
+            page_count=document.view.page_count,
+            selected_page_indexes=tuple(sorted(set(document.view.selected_page_indexes))),
+            current_page_index=document.view.page_index,
+        )
+
     def _resolve_insert_pages_document(
         self,
         context: InsertPagesDocumentContext,
@@ -857,6 +937,29 @@ class MainWindow(QMainWindow):
             )
         )
         if document is None:
+            return None
+        if tuple(sorted(set(document.view.selected_page_indexes))) != context.selected_page_indexes:
+            return None
+        if document.view.page_index != context.current_page_index:
+            return None
+        return document
+
+    def _resolve_crop_pages_document(
+        self,
+        context: CropPagesDocumentContext,
+    ) -> DocumentTab | None:
+        document = self._current_document()
+        if document is None:
+            return None
+        if document.session.session_id != context.session_id:
+            return None
+        if document.session.document_path != context.working_copy_path:
+            return None
+        if document.session.source_path != context.source_path:
+            return None
+        if document.view.page_count != context.page_count:
+            return None
+        if document.session.is_saving or document.mutation_in_progress:
             return None
         if tuple(sorted(set(document.view.selected_page_indexes))) != context.selected_page_indexes:
             return None
@@ -907,6 +1010,20 @@ class MainWindow(QMainWindow):
             source_page_count,
             tuple(page_index + 1 for page_index in target_page_indexes),
             parent=self,
+        )
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return None
+        return dialog.dialog_result
+
+    def _choose_crop_pages_options(
+        self,
+        document: DocumentTab,
+        *,
+        selected_page_count: int,
+    ) -> CropPagesDialogResult | None:
+        dialog = CropPagesDialog(
+            selected_page_count=selected_page_count,
+            parent=document.view,
         )
         if dialog.exec() != dialog.DialogCode.Accepted:
             return None
@@ -1411,6 +1528,14 @@ class MainWindow(QMainWindow):
         self.save_as_action.setEnabled(
             bool(document and not document.session.is_saving and not document.mutation_in_progress)
         )
+        self.crop_pages_action.setEnabled(
+            bool(
+                document
+                and document.view.selected_page_indexes
+                and not document.session.is_saving
+                and not document.mutation_in_progress
+            )
+        )
         self.delete_pages_action.setEnabled(
             bool(
                 document
@@ -1574,6 +1699,8 @@ class MainWindow(QMainWindow):
         if current_document is None or current_document.view is not view:
             return
         menu = QMenu(self)
+        menu.addAction(self.crop_pages_action)
+        menu.addSeparator()
         menu.addAction(self.insert_pages_action)
         menu.addAction(self.replace_pages_action)
         menu.addSeparator()

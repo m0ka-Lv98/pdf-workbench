@@ -471,6 +471,7 @@ def test_scan_excludes_active_workspace_locked_by_subprocess(tmp_path: Path) -> 
     manager.release_session_lock(session.session_id)
 
     workspace_directory = session.workspace_directory
+    ready_path = tmp_path / "workspace-lock-ready.txt"
     source_root = Path(__file__).resolve().parents[1] / "src"
     command = [
         sys.executable,
@@ -481,17 +482,26 @@ def test_scan_excludes_active_workspace_locked_by_subprocess(tmp_path: Path) -> 
             "sys.path.insert(0, sys.argv[1]); "
             "from pdf_workbench.services.session_workspace import SessionWorkspaceManager; "
             "workspace = Path(sys.argv[2]); "
+            "ready = Path(sys.argv[3]); "
             "manager = SessionWorkspaceManager(workspace.parent); "
             "lease = manager.acquire_workspace_lock(workspace.name, workspace); "
+            "ready.write_text('ready\\n', encoding='utf-8'); "
             "time.sleep(3); "
             "lease.release()"
         ),
         str(source_root),
         str(workspace_directory),
+        str(ready_path),
     ]
     process = subprocess.Popen(command)
     try:
-        time.sleep(0.5)
+        for _ in range(50):
+            if ready_path.exists():
+                break
+            if process.poll() is not None:
+                break
+            time.sleep(0.1)
+        assert ready_path.exists()
         concurrent_recovery = SessionRecoveryService(
             SessionWorkspaceManager(tmp_path / "sessions"),
             validator=PdfDocumentValidator(),
@@ -499,6 +509,7 @@ def test_scan_excludes_active_workspace_locked_by_subprocess(tmp_path: Path) -> 
         assert concurrent_recovery.scan_candidates().candidates == []
     finally:
         process.wait(timeout=10)
+        ready_path.unlink(missing_ok=True)
 
     rescanned = recovery.scan_candidates()
     assert len(rescanned.candidates) == 1

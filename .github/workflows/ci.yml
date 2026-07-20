@@ -32,4 +32,8 @@ jobs:
       - run: ruff check .
       - run: ruff format --check .
       - run: mypy src/pdf_workbench
-      - run: pytest --cov=pdf_workbench
+      - name: Run test suite
+        timeout-minutes: 10
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: python -m pytest -o faulthandler_timeout=120 --cov=pdf_workbench
