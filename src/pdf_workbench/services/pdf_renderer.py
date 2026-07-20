@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 import uuid
 from collections import OrderedDict
 from contextlib import suppress
@@ -599,6 +600,8 @@ class PdfRenderWorker(QObject):
         self._sequence = 0
         self._processing = False
         self._shutting_down = False
+        self._active_operation: str | None = None
+        self._last_operation: str | None = None
 
     @Slot(str, Path, int, object)
     def open_document(
@@ -695,7 +698,7 @@ class PdfRenderWorker(QObject):
         context = self._documents.get(document_id)
         if context is None:
             return
-        if revision != context.revision:
+        if generation != context.generation or revision != context.revision:
             return
         key = (document_id, generation, page_index, revision)
         if key in self._pending_text_keys:
@@ -803,6 +806,7 @@ class PdfRenderWorker(QObject):
             return
 
         self._drop_pending_render_for_document(document_id)
+        self._drop_pending_text_for_document(document_id)
         context.generation = generation
 
     @Slot(object, object, object, object)
@@ -871,13 +875,24 @@ class PdfRenderWorker(QObject):
             if next_text_request is None:
                 self._processing = False
                 return
-            document_id, _generation, page_index, requested_revision = next_text_request
+            document_id, requested_generation, page_index, requested_revision = next_text_request
             context = self._documents.get(document_id)
-            if context is None or context.revision != requested_revision or self._shutting_down:
+            if (
+                context is None
+                or context.generation != requested_generation
+                or context.revision != requested_revision
+                or self._shutting_down
+            ):
                 self._processing = False
                 self._schedule_processing()
                 return
             try:
+                self._mark_operation(
+                    "extract_text_page",
+                    document_id,
+                    requested_generation,
+                    page_index,
+                )
                 text_index = context.backend.extract_text_page(page_index, requested_revision)
             except Exception as exc:
                 self._failed_text_pages.setdefault(
@@ -887,6 +902,7 @@ class PdfRenderWorker(QObject):
                 current_context = self._documents.get(document_id)
                 if (
                     current_context is None
+                    or current_context.generation != requested_generation
                     or current_context.revision != requested_revision
                     or self._shutting_down
                 ):
@@ -907,13 +923,17 @@ class PdfRenderWorker(QObject):
                 current_context = self._documents.get(document_id)
                 if (
                     current_context is not None
+                    and current_context.generation == requested_generation
                     and current_context.revision == requested_revision
                     and not self._shutting_down
                 ):
                     self.text_page_indexed.emit(document_id, requested_revision, text_index)
+            finally:
+                self._clear_active_operation()
             current_context = self._documents.get(document_id)
             if (
                 current_context is None
+                or current_context.generation != requested_generation
                 or current_context.revision != requested_revision
                 or self._shutting_down
             ):
@@ -950,6 +970,12 @@ class PdfRenderWorker(QObject):
             return
 
         try:
+            self._mark_operation(
+                "render_page",
+                next_request.document_id,
+                next_request.generation,
+                next_request.page_index,
+            )
             image = context.backend.render_page(
                 next_request.page_index,
                 next_request.logical_zoom,
@@ -979,6 +1005,8 @@ class PdfRenderWorker(QObject):
                         cache_key=next_request.cache_key,
                     )
                 )
+        finally:
+            self._clear_active_operation()
 
         self._processing = False
         if (self._pending_requests or self._pending_text_requests) and not self._shutting_down:
@@ -997,8 +1025,8 @@ class PdfRenderWorker(QObject):
         while self._pending_text_requests:
             request = self._pending_text_requests.pop(0)
             self._pending_text_keys.discard(request)
-            document_id, _generation, _page_index, revision = request
-            if self._is_text_request_current(document_id, revision):
+            document_id, generation, _page_index, revision = request
+            if self._is_text_request_current(document_id, generation, revision):
                 return request
         return None
 
@@ -1010,13 +1038,18 @@ class PdfRenderWorker(QObject):
             return False
         return request.generation == context.generation and request.revision == context.revision
 
-    def _is_text_request_current(self, document_id: str, revision: DocumentRevision) -> bool:
+    def _is_text_request_current(
+        self,
+        document_id: str,
+        generation: int,
+        revision: DocumentRevision,
+    ) -> bool:
         if self._shutting_down:
             return False
         context = self._documents.get(document_id)
         if context is None:
             return False
-        return context.revision == revision
+        return context.generation == generation and context.revision == revision
 
     def _drop_pending_render_for_document(self, document_id: str) -> None:
         kept_requests: list[QueuedRenderRequest] = []
@@ -1044,8 +1077,33 @@ class PdfRenderWorker(QObject):
         context = self._documents.get(document_id)
         if context is None:
             return
-        context.backend.close()
+        self._mark_operation(
+            "close_document",
+            document_id,
+            context.generation,
+            None,
+        )
+        try:
+            context.backend.close()
+        finally:
+            self._clear_active_operation()
         self._documents.pop(document_id, None)
+
+    def _mark_operation(
+        self,
+        operation: str,
+        document_id: str,
+        generation: int,
+        page_index: int | None,
+    ) -> None:
+        suffix = "" if page_index is None else f" page_index={page_index}"
+        self._active_operation = (
+            f"{operation} document_id={document_id} generation={generation}{suffix}"
+        )
+        self._last_operation = self._active_operation
+
+    def _clear_active_operation(self) -> None:
+        self._active_operation = None
 
     @staticmethod
     def _request_key(
@@ -1093,6 +1151,7 @@ class PdfRenderService(QObject):
     _update_generation_requested = Signal(str, int, object)
     _transition_cache_requested = Signal(object, object, object, object)
     _shutdown_requested = Signal()
+    _document_released = Signal(object)
 
     def __init__(
         self,
@@ -1116,6 +1175,10 @@ class PdfRenderService(QObject):
         self._worker.text_index_progress.connect(self.text_index_progress)
         self._worker.text_index_completed.connect(self.text_index_completed)
         self._worker.text_index_failed.connect(self.text_index_failed)
+        self._worker.document_released.connect(
+            self._forward_document_released,
+            Qt.ConnectionType.QueuedConnection,
+        )
         self._worker.shutdown_completed.connect(
             self._thread.quit,
             Qt.ConnectionType.DirectConnection,
@@ -1192,22 +1255,45 @@ class PdfRenderService(QObject):
             ):
                 return
             result = release_result
-            timeout.stop()
             event_loop.quit()
 
         def handle_timeout() -> None:
             event_loop.quit()
 
-        self._worker.document_released.connect(handle_released)
         timeout.timeout.connect(handle_timeout)
+        started_at = time.monotonic()
+        self._document_released.connect(handle_released)
         timeout.start(timeout_ms)
         self._release_requested.emit(request)
-        event_loop.exec()
-        with suppress(RuntimeError, TypeError):
-            self._worker.document_released.disconnect(handle_released)
-        with suppress(RuntimeError, TypeError):
-            timeout.timeout.disconnect(handle_timeout)
+        try:
+            event_loop.exec()
+        finally:
+            with suppress(RuntimeError, TypeError):
+                self._document_released.disconnect(handle_released)
+            with suppress(RuntimeError, TypeError):
+                timeout.timeout.disconnect(handle_timeout)
         if result is None:
+            context = self._worker._documents.get(request.document_id)
+            context_generation = context.generation if context is not None else None
+            context_revision = context.revision if context is not None else None
+            logger.warning(
+                "Timed out releasing PDF renderer document: document_id=%s "
+                "request_id=%s requested_generation=%s elapsed_ms=%d "
+                "context_generation=%s context_revision=%s pending_render_count=%d "
+                "pending_text_count=%d worker_processing=%s active_operation=%s "
+                "last_operation=%s",
+                request.document_id,
+                request.request_id,
+                request.generation,
+                int((time.monotonic() - started_at) * 1000),
+                context_generation,
+                context_revision,
+                len(self._worker._pending_requests),
+                len(self._worker._pending_text_requests),
+                self._worker._processing,
+                self._worker._active_operation,
+                self._worker._last_operation,
+            )
             return DocumentReleaseResult(
                 request_id=request.request_id,
                 document_id=request.document_id,
@@ -1244,6 +1330,10 @@ class PdfRenderService(QObject):
             affected_pages,
             page_index_transition,
         )
+
+    @Slot(object)
+    def _forward_document_released(self, release_result: object) -> None:
+        self._document_released.emit(release_result)
 
     def shutdown(self, timeout_ms: int = 3000) -> bool:
         if not self._thread.isRunning():
