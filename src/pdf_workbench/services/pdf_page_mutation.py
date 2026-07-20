@@ -254,11 +254,31 @@ class PageBoxState:
     media_box: tuple[float, float, float, float]
     crop_box: tuple[float, float, float, float]
     crop_box_direct_present: bool
+    crop_box_direct_value: tuple[float, float, float, float] | None
     crop_box_inherited: bool
     crop_box_falls_back_to_media_box: bool
     trim_box: tuple[float, float, float, float] | None
     bleed_box: tuple[float, float, float, float] | None
     art_box: tuple[float, float, float, float] | None
+
+    def __post_init__(self) -> None:
+        if self.crop_box_direct_present:
+            if self.crop_box_direct_value is None:
+                raise ValueError(
+                    "crop_box_direct_value is required when crop_box_direct_present is true"
+                )
+            object.__setattr__(
+                self,
+                "crop_box_direct_value",
+                _require_snapshot_raw_box(
+                    self.crop_box_direct_value,
+                    label="crop_box_direct_value",
+                ),
+            )
+        elif self.crop_box_direct_value is not None:
+            raise ValueError(
+                "crop_box_direct_value must be None when crop_box_direct_present is false"
+            )
 
 
 class AnnotationParentState(StrEnum):
@@ -386,6 +406,27 @@ def _validate_crop_target_inside_media_box(
         raise ValueError("target CropBox height must be at least 1 point")
 
 
+def _require_snapshot_raw_box(
+    value: object,
+    *,
+    label: str,
+) -> tuple[float, float, float, float]:
+    raw_value: object = tuple(value) if isinstance(value, pikepdf.Array) else value
+    if not isinstance(raw_value, (tuple, list)):
+        raise ValueError(f"{label} is invalid")
+    if len(raw_value) != 4:
+        raise ValueError(f"{label} is invalid")
+    normalized: list[float] = []
+    for component in raw_value:
+        if isinstance(component, bool) or not isinstance(component, (Integral, float, Decimal)):
+            raise ValueError(f"{label} is invalid")
+        numeric_value = float(component)
+        if numeric_value != numeric_value or numeric_value in {float("inf"), float("-inf")}:
+            raise ValueError(f"{label} is invalid")
+        normalized.append(numeric_value)
+    return tuple(normalized)  # type: ignore[return-value]
+
+
 def _validate_crop_snapshot_transition(
     before_snapshot: PdfDocumentStructureSnapshot,
     after_snapshot: PdfDocumentStructureSnapshot,
@@ -420,6 +461,8 @@ def _validate_crop_snapshot_transition(
             raise ValueError("original crop state CropBox must match before snapshot")
         if original_state.direct_crop_box_present != before_page.boxes.crop_box_direct_present:
             raise ValueError("original crop state direct CropBox flag must match before snapshot")
+        if original_state.direct_crop_box_value != before_page.boxes.crop_box_direct_value:
+            raise ValueError("original crop state raw direct CropBox must match before snapshot")
         if original_state.crop_box_inherited != before_page.boxes.crop_box_inherited:
             raise ValueError(
                 "original crop state inherited CropBox flag must match before snapshot"
@@ -462,6 +505,8 @@ def _validate_crop_snapshot_transition(
             raise ValueError("extra page entries must stay unchanged across crop transitions")
         if after_page.boxes.crop_box_direct_present is not True:
             raise ValueError("changed pages must materialize a direct CropBox in after snapshot")
+        if after_page.boxes.crop_box_direct_value != target_state.crop_box:
+            raise ValueError("changed pages must materialize the target raw CropBox")
         if after_page.boxes.crop_box_inherited is not False:
             raise ValueError("changed pages must not keep inherited CropBox in after snapshot")
         if after_page.boxes.crop_box_falls_back_to_media_box is not False:
@@ -1037,13 +1082,12 @@ class PdfPageMutationService:
                 root_pages = cast(Any, writer.root_object["/Pages"]).get_object()
                 page_objects = self._collect_page_objects(root_pages)
                 candidate_path = self._create_candidate_path(resolved_path)
-                targeted_page_indexes = set(plan.page_indexes)
-                for page_index, page_object in enumerate(page_objects):
-                    if page_index in targeted_page_indexes:
-                        continue
-                    if before_snapshot.pages[page_index].boxes.crop_box_direct_present:
-                        continue
-                    page_object.pop(NameObject("/CropBox"), None)
+                targeted_page_indexes = frozenset(plan.page_indexes)
+                self._restore_inherited_crop_boxes_for_untouched_pages(
+                    page_objects,
+                    reference_snapshot=before_snapshot,
+                    changed_page_indexes=targeted_page_indexes,
+                )
                 for target in plan.targets:
                     page_object = cast(dict[object, object], page_objects[target.page_index])
                     page_object[NameObject("/CropBox")] = self._crop_box_array_object(
@@ -1115,6 +1159,12 @@ class PdfPageMutationService:
                 root_pages = cast(Any, writer.root_object["/Pages"]).get_object()
                 page_objects = self._collect_page_objects(root_pages)
                 candidate_path = self._create_candidate_path(resolved_path)
+                changed_page_indexes = frozenset(receipt.changed_page_indexes)
+                self._restore_inherited_crop_boxes_for_untouched_pages(
+                    page_objects,
+                    reference_snapshot=receipt.before_snapshot,
+                    changed_page_indexes=changed_page_indexes,
+                )
                 for state in receipt.original_crop_states:
                     page_object = cast(dict[object, object], page_objects[state.page_index])
                     if state.direct_crop_box_present:
@@ -1169,6 +1219,12 @@ class PdfPageMutationService:
                 root_pages = cast(Any, writer.root_object["/Pages"]).get_object()
                 page_objects = self._collect_page_objects(root_pages)
                 candidate_path = self._create_candidate_path(resolved_path)
+                changed_page_indexes = frozenset(receipt.changed_page_indexes)
+                self._restore_inherited_crop_boxes_for_untouched_pages(
+                    page_objects,
+                    reference_snapshot=receipt.after_snapshot,
+                    changed_page_indexes=changed_page_indexes,
+                )
                 for target in receipt.target_crop_states:
                     page_object = cast(dict[object, object], page_objects[target.page_index])
                     page_object[NameObject("/CropBox")] = self._crop_box_array_object(
@@ -2688,20 +2744,29 @@ class PdfPageMutationService:
         exact_page_object: Any,
     ) -> PageBoxState:
         direct_media_box = page.obj.get("/MediaBox", None)
+        direct_crop_box = exact_page_object.get("/CropBox", None)
         inherited_crop_box = (
             None
-            if exact_page_object.get("/CropBox", None) is not None
+            if direct_crop_box is not None
             else self._resolve_inherited_value(exact_page_object, "/CropBox")
         )
         effective_crop_box = page.obj.get("/CropBox", None) or inherited_crop_box or page.cropbox
         return PageBoxState(
             media_box_direct_present=direct_media_box is not None,
             media_box=self._normalize_box(page.mediabox),
-            crop_box=self._normalize_box(effective_crop_box),
-            crop_box_direct_present=exact_page_object.get("/CropBox", None) is not None,
+            crop_box=self._normalize_effective_snapshot_box(effective_crop_box),
+            crop_box_direct_present=direct_crop_box is not None,
+            crop_box_direct_value=(
+                None
+                if direct_crop_box is None
+                else _require_snapshot_raw_box(
+                    direct_crop_box,
+                    label="crop_box_direct_value",
+                )
+            ),
             crop_box_inherited=inherited_crop_box is not None,
             crop_box_falls_back_to_media_box=(
-                exact_page_object.get("/CropBox", None) is None and inherited_crop_box is None
+                direct_crop_box is None and inherited_crop_box is None
             ),
             trim_box=self._optional_box(page.obj.get("/TrimBox", None)),
             bleed_box=self._optional_box(page.obj.get("/BleedBox", None)),
@@ -2714,6 +2779,15 @@ class PdfPageMutationService:
         if len(values) != 4:
             raise PdfPageMutationError("ページボックスが不正です")
         return values
+
+    @staticmethod
+    def _normalize_effective_snapshot_box(box: object) -> tuple[float, float, float, float]:
+        try:
+            return PdfRect.normalized(
+                _require_snapshot_raw_box(box, label="crop_box"),
+            ).as_tuple()
+        except ValueError as exc:
+            raise PdfPageMutationError("ページボックスが不正です") from exc
 
     def _optional_box(self, value: object) -> tuple[float, float, float, float] | None:
         if value is None:
@@ -3115,6 +3189,7 @@ class PdfPageMutationService:
                 media_box=page.boxes.media_box,
                 crop_box=target_box,
                 crop_box_direct_present=True,
+                crop_box_direct_value=target_box,
                 crop_box_inherited=False,
                 crop_box_falls_back_to_media_box=False,
                 trim_box=page.boxes.trim_box,
@@ -3135,6 +3210,20 @@ class PdfPageMutationService:
         key_set = set(keys)
         key_set.add("/CropBox")
         return tuple(sorted(key_set))
+
+    def _restore_inherited_crop_boxes_for_untouched_pages(
+        self,
+        page_objects: Sequence[dict[object, object]],
+        *,
+        reference_snapshot: PdfDocumentStructureSnapshot,
+        changed_page_indexes: frozenset[int],
+    ) -> None:
+        for page_index, page_object in enumerate(page_objects):
+            if page_index in changed_page_indexes:
+                continue
+            if reference_snapshot.pages[page_index].boxes.crop_box_direct_present:
+                continue
+            page_object.pop(NameObject("/CropBox"), None)
 
     def _validate_current_crop_state(
         self,
@@ -4916,6 +5005,9 @@ class PdfPageMutationService:
                 media_box=page.boxes.media_box,
                 crop_box=page.boxes.crop_box,
                 crop_box_direct_present=True,
+                crop_box_direct_value=page.boxes.crop_box_direct_value
+                if page.boxes.crop_box_direct_value is not None
+                else page.boxes.crop_box,
                 crop_box_inherited=False,
                 crop_box_falls_back_to_media_box=False,
                 trim_box=page.boxes.trim_box,

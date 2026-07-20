@@ -498,6 +498,8 @@ def test_scan_excludes_active_workspace_locked_by_subprocess(tmp_path: Path) -> 
         for _ in range(50):
             if ready_path.exists():
                 break
+            if process.poll() is not None:
+                break
             time.sleep(0.1)
         assert ready_path.exists()
         concurrent_recovery = SessionRecoveryService(
@@ -507,6 +509,7 @@ def test_scan_excludes_active_workspace_locked_by_subprocess(tmp_path: Path) -> 
         assert concurrent_recovery.scan_candidates().candidates == []
     finally:
         process.wait(timeout=10)
+        ready_path.unlink(missing_ok=True)
 
     rescanned = recovery.scan_candidates()
     assert len(rescanned.candidates) == 1
