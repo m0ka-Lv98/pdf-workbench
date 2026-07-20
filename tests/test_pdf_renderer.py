@@ -4,6 +4,7 @@ import threading
 from pathlib import Path
 
 import pytest
+from PySide6.QtCore import qInstallMessageHandler
 from PySide6.QtGui import QImage
 from pytestqt.qtbot import QtBot
 
@@ -156,6 +157,29 @@ class BlockingBackend(FakeBackend):
         if not self.allow_render_to_finish.wait(timeout=5):
             raise RuntimeError("test render was not released")
         return super().render_page(page_index, logical_zoom, rotation, device_pixel_ratio)
+
+    def close(self) -> None:
+        self.close_call_count += 1
+        super().close()
+
+
+class BlockingTextBackend(FakeBackend):
+    def __init__(self, label: str) -> None:
+        super().__init__(label)
+        self.text_started = threading.Event()
+        self.allow_text_to_finish = threading.Event()
+        self.extract_calls: list[int] = []
+        self.close_call_count = 0
+
+    def page_count(self) -> int:
+        return 3
+
+    def extract_text_page(self, page_index: int, revision: DocumentRevision) -> PageTextIndex:
+        self.text_started.set()
+        self.extract_calls.append(page_index)
+        if not self.allow_text_to_finish.wait(timeout=5):
+            raise RuntimeError("test text extraction was not released")
+        return super().extract_text_page(page_index, revision)
 
     def close(self) -> None:
         self.close_call_count += 1
@@ -656,6 +680,76 @@ def test_render_service_release_document_waits_for_worker_close(
     qtbot.waitUntil(lambda: backend.closed is True)
     assert "doc-1" not in service._worker._documents
     assert service.shutdown() is True
+
+
+def test_render_service_release_document_uses_owner_thread_for_timeout_timer(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    messages: list[str] = []
+    previous_handler = qInstallMessageHandler(
+        lambda _mode, _context, message: messages.append(message)
+    )
+    backend = FakeBackend("sample")
+    service = PdfRenderService(backend_factory=lambda _path: backend)
+    try:
+        qtbot.waitUntil(service._thread.isRunning)
+        revision = make_revision(tmp_path)
+        service.open_document("doc-1", tmp_path / "sample.pdf", 1, revision)
+        qtbot.waitUntil(lambda: "doc-1" in service._worker._documents)
+
+        result = service.release_document("doc-1", 1, timeout_ms=3000)
+
+        assert result.success is True
+        assert backend.closed is True
+    finally:
+        assert service.shutdown() is True
+        qInstallMessageHandler(previous_handler)
+
+    assert not any(
+        "Timers cannot be stopped from another thread" in message for message in messages
+    )
+
+
+def test_render_service_release_document_timeout_ignores_late_release_result(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    backend = BlockingBackend("blocking")
+    service = PdfRenderService(backend_factory=lambda _path: backend)
+    try:
+        qtbot.waitUntil(service._thread.isRunning)
+        revision = make_revision(tmp_path)
+        service.open_document("doc-1", tmp_path / "blocking.pdf", 1, revision)
+        qtbot.waitUntil(lambda: "doc-1" in service._worker._documents)
+        service.request_render(
+            RenderRequest(
+                document_id="doc-1",
+                generation=1,
+                page_index=0,
+                logical_zoom=1.0,
+                rotation=0,
+                device_pixel_ratio=1.0,
+                priority=0,
+                revision=revision,
+            )
+        )
+        assert backend.render_started.wait(timeout=5) is True
+
+        timed_out = service.release_document("doc-1", 1, timeout_ms=50)
+        assert timed_out.success is False
+        assert timed_out.message == "timeout"
+
+        backend.allow_render_to_finish.set()
+        qtbot.waitUntil(lambda: backend.close_call_count == 1)
+
+        second_result = service.release_document("doc-1", 1, timeout_ms=3000)
+        assert second_result.success is True
+        assert second_result.request_id != timed_out.request_id
+        assert second_result.closed_generation is None
+    finally:
+        backend.allow_render_to_finish.set()
+        assert service.shutdown() is True
 
 
 def test_render_service_release_document_returns_failure_when_thread_is_not_running(
@@ -1181,6 +1275,72 @@ def test_worker_updates_generation_without_reopening_backend(tmp_path: Path) -> 
     assert backend.render_calls == [0]
     assert factory_calls == 1
     assert worker._pending_requests == []
+
+
+def test_worker_generation_update_drops_pending_text_requests(tmp_path: Path) -> None:
+    cache = RenderImageCache(max_bytes=1024 * 1024)
+    backend = FakeBackend("sample")
+    worker = PdfRenderWorker(lambda _path: backend, cache)
+    revision = make_revision(tmp_path)
+
+    worker.open_document("doc-1", tmp_path / "sample.pdf", 1, revision)
+    assert len(worker._pending_text_requests) == 2
+
+    worker.update_document_generation("doc-1", 2, revision)
+
+    assert worker._documents["doc-1"].generation == 2
+    assert worker._pending_text_requests == []
+    assert worker._pending_text_keys == set()
+    worker._process_next()
+    assert backend.render_calls == []
+
+
+def test_worker_skips_stale_text_request_with_old_generation(tmp_path: Path) -> None:
+    cache = RenderImageCache(max_bytes=1024 * 1024)
+    backend = FakeBackend("sample")
+    worker = PdfRenderWorker(lambda _path: backend, cache)
+    revision = make_revision(tmp_path)
+    indexed_pages: list[PageTextIndex] = []
+    worker.text_page_indexed.connect(
+        lambda _document_id, _revision, page_text: indexed_pages.append(page_text)
+    )
+
+    worker.open_document("doc-1", tmp_path / "sample.pdf", 1, revision)
+    worker._documents["doc-1"].generation = 2
+
+    worker._process_next()
+
+    assert indexed_pages == []
+    assert worker._pending_text_requests == []
+    assert worker._pending_text_keys == set()
+
+
+def test_render_service_release_document_waits_for_in_flight_text_then_closes(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    backend = BlockingTextBackend("blocking-text")
+    service = PdfRenderService(backend_factory=lambda _path: backend)
+    try:
+        qtbot.waitUntil(service._thread.isRunning)
+        revision = make_revision(tmp_path)
+        service.open_document("doc-1", tmp_path / "text.pdf", 1, revision)
+        qtbot.waitUntil(lambda: "doc-1" in service._worker._documents)
+        assert backend.text_started.wait(timeout=5) is True
+
+        service.update_document_generation("doc-1", 2, revision)
+        backend.allow_text_to_finish.set()
+
+        result = service.release_document("doc-1", 2, timeout_ms=3000)
+
+        assert result.success is True
+        assert result.closed_generation == 2
+        assert backend.close_call_count == 1
+        assert backend.extract_calls == [0]
+        assert service._worker._pending_text_requests == []
+    finally:
+        backend.allow_text_to_finish.set()
+        assert service.shutdown() is True
 
 
 def test_generation_update_does_not_affect_other_document(tmp_path: Path) -> None:
