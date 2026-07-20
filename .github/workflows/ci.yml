@@ -32,4 +32,48 @@ jobs:
       - run: ruff check .
       - run: ruff format --check .
       - run: mypy src/pdf_workbench
-      - run: pytest --cov=pdf_workbench
+      - name: Run test suite
+        if: runner.os != 'macOS' || matrix.python-version != '3.13'
+        run: pytest --cov=pdf_workbench
+      - name: Record macOS Python 3.13 environment
+        if: runner.os == 'macOS' && matrix.python-version == '3.13'
+        run: |
+          python --version
+          python -m pip --version
+          python -m pip show pytest pytest-cov coverage pytest-qt PySide6 pypdfium2 pikepdf pypdf
+          python -m pip freeze
+      - name: Diagnose tests without coverage on macOS Python 3.13
+        if: runner.os == 'macOS' && matrix.python-version == '3.13'
+        timeout-minutes: 5
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          set -o pipefail
+          python -m pytest \
+            -vv \
+            --durations=50 \
+            -o faulthandler_timeout=120 \
+            2>&1 | tee pytest-macos-py313-no-coverage.log
+      - name: Diagnose tests with coverage on macOS Python 3.13
+        if: runner.os == 'macOS' && matrix.python-version == '3.13'
+        timeout-minutes: 10
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          set -o pipefail
+          python -m coverage erase
+          python -m pytest \
+            -vv \
+            --durations=50 \
+            -o faulthandler_timeout=120 \
+            --cov=pdf_workbench \
+            2>&1 | tee pytest-macos-py313-coverage.log
+      - name: Upload macOS Python 3.13 pytest diagnostics
+        if: always() && runner.os == 'macOS' && matrix.python-version == '3.13'
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-py313-pytest-diagnostics-${{ github.run_attempt }}
+          path: |
+            pytest-macos-py313-no-coverage.log
+            pytest-macos-py313-coverage.log
+          if-no-files-found: warn
