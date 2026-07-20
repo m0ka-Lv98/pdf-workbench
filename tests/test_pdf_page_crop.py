@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import fields, replace
 from pathlib import Path
 
 import pikepdf
@@ -7,8 +8,20 @@ import pytest
 from pypdf import PdfReader, PdfWriter
 from pypdf.generic import ArrayObject, DictionaryObject, NameObject, NumberObject, TextStringObject
 
-from pdf_workbench.domain.page_crop import PageCropMargins, build_page_crop_plan
-from pdf_workbench.services.pdf_page_mutation import PdfPageMutationError, PdfPageMutationService
+from pdf_workbench.domain.mutation import PageIndexTransition
+from pdf_workbench.domain.page_crop import (
+    PageCropMargins,
+    PageCropState,
+    build_page_crop_plan,
+)
+from pdf_workbench.services.pdf_page_mutation import (
+    AnnotationParentState,
+    PdfAnnotationStructureSnapshot,
+    PdfNamedDestinationSnapshot,
+    PdfOutlineItemSnapshot,
+    PdfPageMutationError,
+    PdfPageMutationService,
+)
 
 
 def create_crop_source_pdf(path: Path) -> Path:
@@ -87,6 +100,22 @@ def annotation_rects(path: Path, page_index: int) -> tuple[tuple[float, float, f
         tuple(float(component) for component in annot.get_object()["/Rect"])  # type: ignore[misc]
         for annot in annots
     )
+
+
+def mutation_candidate_paths(path: Path) -> set[Path]:
+    return set(path.parent.glob(f".{path.stem}.mutation.*.tmp.pdf"))
+
+
+def unsafe_page_crop_state(
+    state: PageCropState,
+    **changes: object,
+) -> PageCropState:
+    values = {field.name: getattr(state, field.name) for field in fields(PageCropState)}
+    values.update(changes)
+    invalid_state = object.__new__(PageCropState)
+    for name, value in values.items():
+        object.__setattr__(invalid_state, name, value)
+    return invalid_state
 
 
 def test_read_crop_states_reports_inherited_and_direct_crop_boxes(tmp_path: Path) -> None:
@@ -178,3 +207,262 @@ def test_crop_pages_rejects_redo_when_current_snapshot_drifted(tmp_path: Path) -
 
     with pytest.raises(PdfPageMutationError, match="前提状態が変化"):
         service.redo_page_crop(document_path, mutation.receipt)
+
+
+def test_crop_receipt_rejects_invalid_direct_raw_crop_values(tmp_path: Path) -> None:
+    document_path = create_crop_source_pdf(tmp_path / "crop-receipt-raw.pdf")
+    service = PdfPageMutationService()
+    states = service.read_crop_states(document_path, (1,))
+    plan = build_page_crop_plan(states, margins=PageCropMargins(10, 20, 30, 40))
+    mutation = service.crop_pages(document_path, plan)
+    receipt = mutation.receipt
+
+    invalid_values: tuple[object, ...] = (
+        (1.0, 2.0, 3.0),
+        (1.0, 2.0, 3.0, 4.0, 5.0),
+        (True, 2.0, 3.0, 4.0),
+        (1.0, 2.0, float("nan"), 4.0),
+        (1.0, 2.0, float("inf"), 4.0),
+    )
+    for invalid_value in invalid_values:
+        invalid_state = unsafe_page_crop_state(
+            receipt.original_crop_states[0],
+            direct_crop_box_present=True,
+            direct_crop_box_value=invalid_value,  # type: ignore[arg-type]
+        )
+        with pytest.raises(ValueError, match="direct_crop_box_value is invalid"):
+            replace(receipt, original_crop_states=(invalid_state,))
+
+    with pytest.raises(ValueError, match="direct_crop_box_value must be None"):
+        replace(
+            receipt,
+            original_crop_states=(
+                replace(
+                    receipt.original_crop_states[0],
+                    direct_crop_box_present=False,
+                    direct_crop_box_value=(1.0, 2.0, 3.0, 4.0),
+                ),
+            ),
+        )
+
+
+def test_crop_receipt_rejects_invalid_changed_indexes_and_path(tmp_path: Path) -> None:
+    document_path = create_crop_source_pdf(tmp_path / "crop-receipt-indexes.pdf")
+    service = PdfPageMutationService()
+    states = service.read_crop_states(document_path, (0,))
+    plan = build_page_crop_plan(states, margins=PageCropMargins(10, 20, 30, 40))
+    receipt = service.crop_pages(document_path, plan).receipt
+
+    with pytest.raises(ValueError, match="changed_page_indexes must not be empty"):
+        replace(receipt, changed_page_indexes=())
+    with pytest.raises(ValueError, match="changed_page_indexes must be unique"):
+        replace(receipt, changed_page_indexes=(0, 0))
+    with pytest.raises(ValueError, match="changed_page_indexes must stay within the page range"):
+        replace(receipt, changed_page_indexes=(99,))
+    with pytest.raises(ValueError, match="working_copy_path must point to a PDF"):
+        replace(receipt, working_copy_path=document_path.with_suffix(".txt"))
+
+
+def test_crop_receipt_rejects_semantic_snapshot_and_state_tampering(tmp_path: Path) -> None:
+    document_path = create_crop_source_pdf(tmp_path / "crop-receipt-semantic.pdf")
+    service = PdfPageMutationService()
+    states = service.read_crop_states(document_path, (0,))
+    plan = build_page_crop_plan(states, margins=PageCropMargins(10, 20, 30, 40))
+    receipt = service.crop_pages(document_path, plan).receipt
+    after_page = receipt.after_snapshot.pages[0]
+
+    with pytest.raises(ValueError, match="original crop state page index"):
+        replace(
+            receipt,
+            original_crop_states=(replace(receipt.original_crop_states[0], page_index=1),),
+        )
+    with pytest.raises(ValueError, match="target crop state page index"):
+        replace(
+            receipt,
+            target_crop_states=(replace(receipt.target_crop_states[0], page_index=1),),
+        )
+    with pytest.raises(ValueError, match="target CropBox must match after snapshot"):
+        replace(
+            receipt,
+            target_crop_states=(
+                replace(
+                    receipt.target_crop_states[0],
+                    crop_box=(41.0, 80.0, 560.0, 780.0),
+                ),
+            ),
+        )
+    with pytest.raises(ValueError, match="MediaBox must stay unchanged"):
+        replace(
+            receipt,
+            after_snapshot=replace(
+                receipt.after_snapshot,
+                pages=(
+                    replace(
+                        after_page,
+                        boxes=replace(after_page.boxes, media_box=(11.0, 20.0, 610.0, 820.0)),
+                    ),
+                    *receipt.after_snapshot.pages[1:],
+                ),
+            ),
+        )
+    with pytest.raises(ValueError, match="page Resources must stay unchanged"):
+        replace(
+            receipt,
+            after_snapshot=replace(
+                receipt.after_snapshot,
+                pages=(
+                    replace(after_page, resources_fingerprint="tampered"),
+                    *receipt.after_snapshot.pages[1:],
+                ),
+            ),
+        )
+    with pytest.raises(ValueError, match="page Contents must stay unchanged"):
+        replace(
+            receipt,
+            after_snapshot=replace(
+                receipt.after_snapshot,
+                pages=(
+                    replace(after_page, content_fingerprint="tampered"),
+                    *receipt.after_snapshot.pages[1:],
+                ),
+            ),
+        )
+    with pytest.raises(ValueError, match="page rotation must stay unchanged"):
+        replace(
+            receipt,
+            after_snapshot=replace(
+                receipt.after_snapshot,
+                pages=(
+                    replace(after_page, effective_rotation=90),
+                    *receipt.after_snapshot.pages[1:],
+                ),
+            ),
+        )
+    with pytest.raises(ValueError, match="page annotations must stay unchanged"):
+        replace(
+            receipt,
+            after_snapshot=replace(
+                receipt.after_snapshot,
+                pages=(
+                    replace(
+                        after_page,
+                        annotations=(
+                            PdfAnnotationStructureSnapshot(
+                                subtype="/Text",
+                                rect=(10.0, 20.0, 30.0, 40.0),
+                                has_appearance=False,
+                                appearance_fingerprint=None,
+                                parent_state=AnnotationParentState.ABSENT,
+                                fingerprint="tampered-annotation",
+                            ),
+                        ),
+                    ),
+                    *receipt.after_snapshot.pages[1:],
+                ),
+            ),
+        )
+    with pytest.raises(ValueError, match="metadata must stay unchanged"):
+        replace(
+            receipt,
+            after_snapshot=replace(
+                receipt.after_snapshot,
+                metadata_fingerprint="tampered",
+            ),
+        )
+    with pytest.raises(ValueError, match="untouched pages must remain identical"):
+        replace(
+            receipt,
+            after_snapshot=replace(
+                receipt.after_snapshot,
+                pages=(
+                    receipt.after_snapshot.pages[0],
+                    replace(receipt.after_snapshot.pages[1], content_fingerprint="tampered"),
+                ),
+            ),
+        )
+
+
+def test_crop_receipt_rejects_invalid_transition_mapping(tmp_path: Path) -> None:
+    document_path = create_crop_source_pdf(tmp_path / "crop-receipt-transition.pdf")
+    service = PdfPageMutationService()
+    states = service.read_crop_states(document_path, (0,))
+    plan = build_page_crop_plan(states, margins=PageCropMargins(10, 20, 30, 40))
+    receipt = service.crop_pages(document_path, plan).receipt
+
+    invalid_transition = PageIndexTransition(
+        old_page_count=receipt.before_snapshot.page_count,
+        new_page_count=receipt.before_snapshot.page_count,
+        cache_old_to_new=(0, 1),
+        current_page_old_to_new=(0, 1),
+    )
+    with pytest.raises(ValueError, match="execute_transition cache_old_to_new is invalid"):
+        replace(receipt, execute_transition=invalid_transition)
+
+
+def test_crop_receipt_undo_redo_reject_working_copy_ownership_mismatch(tmp_path: Path) -> None:
+    service = PdfPageMutationService()
+    path_a = create_crop_source_pdf(tmp_path / "crop-owner-a.pdf")
+    path_b = create_crop_source_pdf(tmp_path / "crop-owner-b.pdf")
+    states = service.read_crop_states(path_a, (0,))
+    plan = build_page_crop_plan(states, margins=PageCropMargins(10, 20, 30, 40))
+    mutation = service.crop_pages(path_a, plan)
+    before_sha_b = path_b.read_bytes()
+    before_candidates = mutation_candidate_paths(path_b)
+
+    with pytest.raises(PdfPageMutationError, match="別の作業コピー用"):
+        service.undo_page_crop(path_b, mutation.receipt)
+    assert path_b.read_bytes() == before_sha_b
+    assert mutation_candidate_paths(path_b) == before_candidates
+
+    service.undo_page_crop(path_a, mutation.receipt)
+    with pytest.raises(PdfPageMutationError, match="別の作業コピー用"):
+        service.redo_page_crop(path_b, mutation.receipt)
+    assert path_b.read_bytes() == before_sha_b
+    assert mutation_candidate_paths(path_b) == before_candidates
+
+
+def test_crop_receipt_reset_to_mediabox_keeps_direct_crop_materialized(tmp_path: Path) -> None:
+    document_path = create_crop_source_pdf(tmp_path / "crop-receipt-reset-direct.pdf")
+    service = PdfPageMutationService()
+    states = service.read_crop_states(document_path, (1,))
+    plan = build_page_crop_plan(
+        states,
+        margins=PageCropMargins(0, 0, 0, 0),
+        reset_to_media_box=True,
+    )
+
+    mutation = service.crop_pages(document_path, plan)
+
+    assert mutation.receipt.after_snapshot.pages[1].boxes.crop_box_direct_present is True
+    assert mutation.receipt.after_snapshot.pages[1].boxes.crop_box_inherited is False
+    assert mutation.receipt.after_snapshot.pages[1].boxes.crop_box_falls_back_to_media_box is False
+
+
+def test_crop_receipt_rejects_document_level_structure_drift(tmp_path: Path) -> None:
+    document_path = create_crop_source_pdf(tmp_path / "crop-receipt-doc-drift.pdf")
+    service = PdfPageMutationService()
+    states = service.read_crop_states(document_path, (0,))
+    plan = build_page_crop_plan(states, margins=PageCropMargins(10, 20, 30, 40))
+    receipt = service.crop_pages(document_path, plan).receipt
+
+    with pytest.raises(ValueError, match="outlines must stay unchanged"):
+        replace(
+            receipt,
+            after_snapshot=replace(
+                receipt.after_snapshot,
+                outlines=(PdfOutlineItemSnapshot("x", None, None, ()),),
+            ),
+        )
+    with pytest.raises(ValueError, match="named destinations must stay unchanged"):
+        replace(
+            receipt,
+            after_snapshot=replace(
+                receipt.after_snapshot,
+                named_destinations=(PdfNamedDestinationSnapshot("dest", 0),),
+            ),
+        )
+    with pytest.raises(ValueError, match="attachments must stay unchanged"):
+        replace(
+            receipt,
+            after_snapshot=replace(receipt.after_snapshot, attachments_fingerprint="tampered"),
+        )

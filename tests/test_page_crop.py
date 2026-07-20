@@ -9,6 +9,7 @@ from pdf_workbench.domain.page_crop import (
     PageCropPlan,
     PageCropState,
     PageCropTarget,
+    _require_raw_box,
     _rotation_dimensions,
     _validate_target_for_state,
     build_page_crop_plan,
@@ -180,6 +181,18 @@ def test_page_crop_state_rejects_invalid_direct_crop_source_flags() -> None:
             effective_media_box=(10.0, 20.0, 610.0, 820.0),
             effective_rotation=0,
         )
+    with pytest.raises(
+        ValueError,
+        match="direct_crop_box_value must be None when direct_crop_box_present is false",
+    ):
+        PageCropState(
+            page_index=0,
+            direct_crop_box_present=False,
+            direct_crop_box_value=(30.0, 40.0, 590.0, 800.0),
+            effective_crop_box=(30.0, 40.0, 590.0, 800.0),
+            effective_media_box=(10.0, 20.0, 610.0, 820.0),
+            effective_rotation=0,
+        )
 
 
 def test_page_crop_state_rejects_invalid_rotation_and_crop_outside_media_box() -> None:
@@ -226,6 +239,10 @@ def test_page_crop_target_and_plan_reject_invalid_indexes_and_mismatched_targets
         PageCropTarget(page_index=-1, crop_box=(10.0, 20.0, 30.0, 40.0))
     with pytest.raises(ValueError, match="crop_box is invalid"):
         PageCropTarget(page_index=0, crop_box=(10.0, 20.0, 30.0))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="crop_box width must be at least 1 point"):
+        PageCropTarget(page_index=0, crop_box=(10.0, 20.0, 10.5, 80.0))
+    with pytest.raises(ValueError, match="crop_box height must be at least 1 point"):
+        PageCropTarget(page_index=0, crop_box=(10.0, 20.0, 80.0, 20.5))
     with pytest.raises(ValueError, match="page_indexes must not be empty"):
         PageCropPlan(page_indexes=(), targets=(), reset_to_media_box=False)
     with pytest.raises(ValueError, match="page_indexes must be unique"):
@@ -319,6 +336,34 @@ def test_crop_box_from_display_margins_rejects_unsupported_rotation() -> None:
             forged_state,
             PageCropMargins(1.0, 1.0, 1.0, 1.0),
         )
+
+
+def test_require_raw_box_rejects_invalid_shapes_and_values() -> None:
+    invalid_values: tuple[object, ...] = (
+        (0.0, 0.0, 100.0),
+        (0.0, 0.0, 100.0, 100.0, 200.0),
+        (False, 0.0, 100.0, 100.0),
+        (0.0, 0.0, math.nan, 100.0),
+        (0.0, 0.0, math.inf, 100.0),
+        "0,0,100,100",
+    )
+
+    for value in invalid_values:
+        with pytest.raises(ValueError, match="raw is invalid"):
+            _require_raw_box(value, label="raw")
+
+
+def test_page_crop_state_preserves_reverse_order_raw_direct_crop_box() -> None:
+    state = PageCropState(
+        page_index=0,
+        direct_crop_box_present=True,
+        direct_crop_box_value=(590.0, 800.0, 30.0, 40.0),
+        effective_crop_box=(30.0, 40.0, 590.0, 800.0),
+        effective_media_box=(10.0, 20.0, 610.0, 820.0),
+        effective_rotation=0,
+    )
+
+    assert state.direct_crop_box_value == (590.0, 800.0, 30.0, 40.0)
 
 
 @pytest.mark.parametrize(

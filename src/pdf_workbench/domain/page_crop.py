@@ -32,13 +32,33 @@ def _require_page_index(value: object, *, label: str) -> int:
     return page_index
 
 
+def _require_raw_box(
+    value: object,
+    *,
+    label: str,
+) -> tuple[float, float, float, float]:
+    if not isinstance(value, (tuple, list)):
+        raise ValueError(f"{label} is invalid")
+    if len(value) != 4:
+        raise ValueError(f"{label} is invalid")
+    normalized: list[float] = []
+    for component in value:
+        if isinstance(component, bool) or not isinstance(component, Real):
+            raise ValueError(f"{label} is invalid")
+        numeric_value = float(component)
+        if not math.isfinite(numeric_value):
+            raise ValueError(f"{label} is invalid")
+        normalized.append(numeric_value)
+    return tuple(normalized)  # type: ignore[return-value]
+
+
 def _canonical_box(
-    values: tuple[float, float, float, float],
+    values: object,
     *,
     label: str,
 ) -> tuple[float, float, float, float]:
     try:
-        rect = PdfRect.normalized(values)
+        rect = PdfRect.normalized(_require_raw_box(values, label=label))
     except ValueError as exc:
         raise ValueError(f"{label} is invalid") from exc
     return _stable_box(rect.as_tuple())
@@ -129,7 +149,11 @@ class PageCropState:
             object.__setattr__(
                 self,
                 "direct_crop_box_value",
-                tuple(float(value) for value in self.direct_crop_box_value),
+                _require_raw_box(self.direct_crop_box_value, label="direct_crop_box_value"),
+            )
+        elif self.direct_crop_box_value is not None:
+            raise ValueError(
+                "direct_crop_box_value must be None when direct_crop_box_present is false"
             )
         media = PdfRect.from_tuple(self.effective_media_box)
         crop = PdfRect.from_tuple(self.effective_crop_box)
@@ -159,6 +183,11 @@ class PageCropTarget:
             _require_page_index(self.page_index, label="page_index"),
         )
         object.__setattr__(self, "crop_box", _canonical_box(self.crop_box, label="crop_box"))
+        crop_rect = PdfRect.from_tuple(self.crop_box)
+        if crop_rect.width < _MINIMUM_EXTENT - _EPSILON:
+            raise ValueError("crop_box width must be at least 1 point")
+        if crop_rect.height < _MINIMUM_EXTENT - _EPSILON:
+            raise ValueError("crop_box height must be at least 1 point")
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,10 +267,6 @@ def build_page_crop_plan(
     normalized_states = tuple(sorted(states, key=lambda state: state.page_index))
     if len({state.page_index for state in normalized_states}) != len(normalized_states):
         raise ValueError("selected pages must be unique")
-    if tuple(state.page_index for state in normalized_states) != tuple(
-        sorted(state.page_index for state in normalized_states)
-    ):
-        raise ValueError("selected pages must be sorted")
 
     invalid_page_numbers: list[int] = []
     targets: list[PageCropTarget] = []
