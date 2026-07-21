@@ -8,11 +8,13 @@ import os
 import stat
 import tempfile
 import warnings
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from typing import cast
 
 import pikepdf
 from PIL import Image, ImageCms, ImageFile, ImageOps, ImageSequence, UnidentifiedImageError
@@ -140,8 +142,14 @@ class ExpectedImagePage:
 
 
 class ImageToPdfService:
-    def __init__(self, *, validator: PdfDocumentValidator | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        validator: PdfDocumentValidator | None = None,
+        resource_tracker: Callable[[str, int], None] | None = None,
+    ) -> None:
         self._validator = validator if validator is not None else PdfDocumentValidator()
+        self._resource_tracker = resource_tracker
 
     def inspect_image_input(self, path: Path) -> InspectedImageInput:
         resolved_path = path.expanduser().resolve()
@@ -251,7 +259,10 @@ class ImageToPdfService:
                         image_input.path,
                         source_revisions[image_input.path],
                     )
-                    with self._open_image(image_input.path) as image:
+                    with (
+                        self._tracked_resource("source_file"),
+                        self._open_image(image_input.path) as image,
+                    ):
                         self._validate_runtime_image_identity(image, image_input)
                         for frame_index in range(image_input.frame_count):
                             self._check_cancelled(should_cancel)
@@ -264,8 +275,9 @@ class ImageToPdfService:
                                 mapping,
                                 completed_pages=completed_pages,
                             )
-                            frame = ImageSequence.Iterator(image)[frame_index]
-                            encoded_frame = self._prepare_frame(frame, plan=plan)
+                            with self._tracked_resource("decoded_frame"):
+                                frame = ImageSequence.Iterator(image)[frame_index]
+                                encoded_frame = self._prepare_frame(frame, plan=plan)
                             self._emit_progress(
                                 progress_callback,
                                 plan,
@@ -365,6 +377,7 @@ class ImageToPdfService:
             raise ImageToPdfError("画像ファイルを読み取れません")
 
     def _open_image(self, path: Path) -> Image.Image:
+        previous_load_truncated = ImageFile.LOAD_TRUNCATED_IMAGES
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("error", Image.DecompressionBombWarning)
@@ -374,10 +387,12 @@ class ImageToPdfService:
             image = Image.open(path)
             image.load()
             return image
-        except Image.DecompressionBombWarning as exc:
+        except (Image.DecompressionBombWarning, Image.DecompressionBombError) as exc:
             raise ImageToPdfError("画像が大きすぎるため安全に処理できません") from exc
         except (UnidentifiedImageError, OSError, ValueError) as exc:
             raise ImageToPdfError("画像ファイルを開けません") from exc
+        finally:
+            ImageFile.LOAD_TRUNCATED_IMAGES = previous_load_truncated
 
     def _validate_detected_format(self, image: Image.Image, detected_format: str) -> None:
         if detected_format == "GIF":
@@ -509,30 +524,37 @@ class ImageToPdfService:
             except ValueError as exc:
                 raise ImageToPdfError(str(exc)) from exc
             if geometry.source_crop_box is not None:
-                normalized = normalized.crop(geometry.source_crop_box)
+                cropped = normalized.crop(geometry.source_crop_box)
+                normalized.close()
+                normalized = cropped
             color_image, alpha_image = self._normalize_color_and_alpha(normalized, plan)
             try:
-                if (
-                    alpha_image is not None
-                    and plan.transparency_policy is TransparencyPolicy.PRESERVE_ALPHA
-                ):
-                    alpha_bytes = alpha_image.convert("L").tobytes()
-                else:
-                    alpha_bytes = None
-                if color_image.mode == "L":
-                    color_space = pikepdf.Name("/DeviceGray")
-                else:
-                    color_image = color_image.convert("RGB")
-                    color_space = pikepdf.Name("/DeviceRGB")
-                return EncodedFrame(
-                    width=color_image.width,
-                    height=color_image.height,
-                    color_bytes=color_image.tobytes(),
-                    color_space=color_space,
-                    bits_per_component=8,
-                    alpha_bytes=alpha_bytes,
-                    geometry=geometry,
-                )
+                with self._tracked_resource("color_image"):
+                    if (
+                        alpha_image is not None
+                        and plan.transparency_policy is TransparencyPolicy.PRESERVE_ALPHA
+                    ):
+                        with self._tracked_resource("alpha_image"):
+                            alpha_bytes = alpha_image.convert("L").tobytes()
+                    else:
+                        alpha_bytes = None
+                    if color_image.mode == "L":
+                        color_space = pikepdf.Name("/DeviceGray")
+                    else:
+                        converted_color = color_image.convert("RGB")
+                        if converted_color is not color_image:
+                            color_image.close()
+                            color_image = converted_color
+                        color_space = pikepdf.Name("/DeviceRGB")
+                    return EncodedFrame(
+                        width=color_image.width,
+                        height=color_image.height,
+                        color_bytes=color_image.tobytes(),
+                        color_space=color_space,
+                        bits_per_component=8,
+                        alpha_bytes=alpha_bytes,
+                        geometry=geometry,
+                    )
             finally:
                 color_image.close()
                 if alpha_image is not None:
@@ -557,40 +579,76 @@ class ImageToPdfService:
     ) -> tuple[Image.Image, Image.Image | None]:
         working = self._convert_indexed_or_transparent(image)
         try:
-            if working.mode == "CMYK":
-                working = self._convert_cmyk_to_srgb(working)
-            elif working.info.get("icc_profile") and working.mode in {"RGB", "RGBA", "L", "LA"}:
-                working = self._convert_with_icc_to_srgb(working)
             if working.mode in {"I;16", "I;16B", "I;16L", "I", "F"}:
-                if working.mode == "F":
-                    extrema = working.getextrema()
-                    if not all(
-                        isinstance(value, int | float) and math.isfinite(value) for value in extrema
-                    ):
-                        raise ImageToPdfError("floating image data is invalid")
-                working = working.convert("L")
-            if self._has_alpha(working):
-                alpha = (
-                    working.getchannel("A")
-                    if "A" in working.getbands()
-                    else working.getchannel("a")
-                )
+                normalized_depth = self._normalize_high_bit_depth_image(working)
+                working.close()
+                working = normalized_depth
+
+            alpha = self._extract_alpha(working)
+            color_source = self._image_without_alpha(working)
+            try:
+                if color_source.mode == "CMYK":
+                    converted_color = self._convert_cmyk_to_srgb(color_source)
+                elif color_source.info.get("icc_profile") and color_source.mode in {"RGB", "L"}:
+                    converted_color = self._convert_with_icc_to_srgb(color_source)
+                else:
+                    converted_color = color_source.copy()
+            finally:
+                color_source.close()
+
+            if alpha is not None and alpha.size != converted_color.size:
+                alpha.close()
+                converted_color.close()
+                raise ImageToPdfError("透明度情報のサイズが画像と一致しません")
+
+            if alpha is not None:
                 if plan.transparency_policy is TransparencyPolicy.PRESERVE_ALPHA:
-                    return (working.convert("RGB"), alpha)
+                    return (converted_color, alpha)
                 background_color = (
                     (255, 255, 255)
                     if plan.transparency_policy is TransparencyPolicy.WHITE_BACKGROUND
                     else (0, 0, 0)
                 )
-                background = Image.new("RGB", working.size, background_color)
-                background.paste(working.convert("RGBA"), mask=alpha)
-                alpha.close()
+                background = Image.new("RGB", converted_color.size, background_color)
+                rgba = converted_color.convert("RGBA")
+                try:
+                    background.paste(rgba, mask=alpha)
+                finally:
+                    rgba.close()
+                    converted_color.close()
+                    alpha.close()
                 return (background, None)
-            if working.mode == "L":
-                return (working.copy(), None)
-            return (working.convert("RGB"), None)
+            if converted_color.mode == "L":
+                return (converted_color, None)
+            if converted_color.mode != "RGB":
+                converted_rgb = converted_color.convert("RGB")
+                converted_color.close()
+                return (converted_rgb, None)
+            return (converted_color, None)
         finally:
             working.close()
+
+    @staticmethod
+    def _extract_alpha(image: Image.Image) -> Image.Image | None:
+        bands = image.getbands()
+        if "A" in bands:
+            return image.getchannel("A")
+        if "a" in bands:
+            return image.getchannel("a")
+        return None
+
+    @staticmethod
+    def _image_without_alpha(image: Image.Image) -> Image.Image:
+        icc_profile = image.info.get("icc_profile")
+        if image.mode == "RGBA":
+            result = image.convert("RGB")
+        elif image.mode == "LA":
+            result = image.getchannel("L")
+        else:
+            result = image.copy()
+        if isinstance(icc_profile, bytes) and icc_profile:
+            result.info["icc_profile"] = icc_profile
+        return result
 
     @staticmethod
     def _convert_indexed_or_transparent(image: Image.Image) -> Image.Image:
@@ -602,14 +660,17 @@ class ImageToPdfService:
         profile_bytes = image.info.get("icc_profile")
         if not isinstance(profile_bytes, bytes) or not profile_bytes:
             return image.copy()
+        if image.mode not in {"RGB", "L", "CMYK"}:
+            raise ImageToPdfError("ICC profile付き画像の色空間が未対応です")
         try:
             source_profile = ImageCms.ImageCmsProfile(io.BytesIO(profile_bytes))
             target_profile = ImageCms.createProfile("sRGB")
+            output_mode = "RGB" if image.mode in {"RGB", "CMYK"} else "L"
             converted = ImageCms.profileToProfile(
                 image,
                 source_profile,
                 target_profile,
-                outputMode="RGB" if image.mode in {"RGB", "RGBA"} else "L",
+                outputMode=output_mode,
             )
         except Exception as exc:
             raise ImageToPdfError("ICC profileを安全に変換できません") from exc
@@ -621,6 +682,70 @@ class ImageToPdfService:
         if not image.info.get("icc_profile"):
             raise ImageToPdfError("ICC profileなしのCMYK画像は未対応です")
         return self._convert_with_icc_to_srgb(image)
+
+    def _normalize_high_bit_depth_image(self, image: Image.Image) -> Image.Image:
+        range_source = image
+        if image.mode in {"I;16", "I;16B", "I;16L"}:
+            range_source = image.convert("I")
+        try:
+            if range_source.mode == "F":
+                self._ensure_finite_float_pixels(range_source)
+            extrema = range_source.getextrema()
+            if not isinstance(extrema, tuple) or len(extrema) != 2:
+                raise ImageToPdfError("高ビット深度画像の範囲を検査できません")
+            minimum, maximum = extrema
+            if not isinstance(minimum, int | float) or not isinstance(maximum, int | float):
+                raise ImageToPdfError("高ビット深度画像の範囲が不正です")
+            minimum_float = float(minimum)
+            maximum_float = float(maximum)
+            if not math.isfinite(minimum_float) or not math.isfinite(maximum_float):
+                raise ImageToPdfError("高ビット深度画像に不正な値が含まれています")
+            if maximum_float < minimum_float:
+                raise ImageToPdfError("高ビット深度画像の範囲が不正です")
+            if maximum_float == minimum_float:
+                value = 0 if maximum_float <= 0 else 255
+                return Image.new("L", image.size, value)
+            scale = 255.0 / (maximum_float - minimum_float)
+            converted_values = bytearray()
+            float_image = range_source.convert("F")
+            try:
+                for pixel in self._iter_pixels(float_image):
+                    if not isinstance(pixel, int | float) or not math.isfinite(float(pixel)):
+                        raise ImageToPdfError("高ビット深度画像に不正な値が含まれています")
+                    converted_values.append(
+                        max(0, min(255, round((float(pixel) - minimum_float) * scale)))
+                    )
+            finally:
+                float_image.close()
+            normalized = Image.new("L", image.size)
+            normalized.frombytes(bytes(converted_values))
+            return normalized
+        finally:
+            if range_source is not image:
+                range_source.close()
+
+    @staticmethod
+    def _ensure_finite_float_pixels(image: Image.Image) -> None:
+        for value in ImageToPdfService._iter_pixels(image):
+            if not isinstance(value, int | float) or not math.isfinite(float(value)):
+                raise ImageToPdfError("floating image data is invalid")
+
+    @staticmethod
+    def _iter_pixels(image: Image.Image) -> Iterable[object]:
+        flattened_data = getattr(image, "get_flattened_data", None)
+        if callable(flattened_data):
+            return cast(Iterable[object], flattened_data())
+        return ImageToPdfService._iter_pixels_with_getdata(image)
+
+    @staticmethod
+    def _iter_pixels_with_getdata(image: Image.Image) -> Iterator[object]:
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"Image\.Image\.getdata is deprecated",
+                category=DeprecationWarning,
+            )
+            yield from cast(Iterable[object], image.getdata())
 
     def _append_page(
         self,
@@ -712,30 +837,60 @@ class ImageToPdfService:
             raise ImageToPdfError("画像PDF候補の構造検証に失敗しました") from exc
 
     def _validate_candidate_page(self, expected: ExpectedImagePage, page: pikepdf.Page) -> None:
+        if page.obj.get("/Type", None) != pikepdf.Name("/Page"):
+            raise ImageToPdfError("画像PDF候補のPage Typeが不正です")
         media_box = tuple(float(value) for value in page.obj["/MediaBox"])
         self._assert_close_tuple(media_box, expected.media_box, "MediaBox")
+        for unexpected_key in ("/CropBox", "/Rotate", "/AA", "/Metadata"):
+            if unexpected_key in page.obj:
+                raise ImageToPdfError(f"画像PDF候補ページに未対応の{unexpected_key}が残っています")
         if "/Annots" in page.obj:
             raise ImageToPdfError("画像PDF候補にannotationが残っています")
         resources = page.obj.get("/Resources", None)
         if not isinstance(resources, pikepdf.Dictionary):
             raise ImageToPdfError("画像PDF候補のResourcesが不正です")
         xobjects = resources.get("/XObject", None)
-        if not isinstance(xobjects, pikepdf.Dictionary) or "/Im0" not in xobjects:
+        if not isinstance(xobjects, pikepdf.Dictionary) or set(xobjects.keys()) != {"/Im0"}:
             raise ImageToPdfError("画像PDF候補のXObjectが不正です")
         image = xobjects["/Im0"]
         if not isinstance(image, pikepdf.Stream):
             raise ImageToPdfError("画像PDF候補のImage XObjectが不正です")
+        if image.get("/Type", None) != pikepdf.Name("/XObject"):
+            raise ImageToPdfError("画像PDF候補のImage Typeが不正です")
+        if image.get("/Subtype", None) != pikepdf.Name("/Image"):
+            raise ImageToPdfError("画像PDF候補のImage Subtypeが不正です")
         if int(image["/Width"]) != expected.image_pixel_width:
             raise ImageToPdfError("画像PDF候補のimage widthが一致しません")
         if int(image["/Height"]) != expected.image_pixel_height:
             raise ImageToPdfError("画像PDF候補のimage heightが一致しません")
         if str(image["/ColorSpace"]) != expected.color_space:
             raise ImageToPdfError("画像PDF候補のColorSpaceが一致しません")
+        if int(image["/BitsPerComponent"]) != 8:
+            raise ImageToPdfError("画像PDF候補のBitsPerComponentが不正です")
         has_soft_mask = "/SMask" in image
         if has_soft_mask != expected.has_soft_mask:
             raise ImageToPdfError("画像PDF候補の透明度設定が一致しません")
+        if has_soft_mask:
+            soft_mask = image["/SMask"]
+            if not isinstance(soft_mask, pikepdf.Stream):
+                raise ImageToPdfError("画像PDF候補のSMaskが不正です")
+            if soft_mask.get("/Subtype", None) != pikepdf.Name("/Image"):
+                raise ImageToPdfError("画像PDF候補のSMask Subtypeが不正です")
+            if int(soft_mask["/Width"]) != expected.image_pixel_width:
+                raise ImageToPdfError("画像PDF候補のSMask widthが一致しません")
+            if int(soft_mask["/Height"]) != expected.image_pixel_height:
+                raise ImageToPdfError("画像PDF候補のSMask heightが一致しません")
+            if soft_mask.get("/ColorSpace", None) != pikepdf.Name("/DeviceGray"):
+                raise ImageToPdfError("画像PDF候補のSMask ColorSpaceが不正です")
+            if int(soft_mask["/BitsPerComponent"]) != 8:
+                raise ImageToPdfError("画像PDF候補のSMask BitsPerComponentが不正です")
         content = bytes(page.obj["/Contents"].read_bytes()).decode("ascii")
-        numbers = tuple(float(value) for value in content.splitlines()[1].split()[:6])
+        tokens = content.split()
+        if len(tokens) != 11 or tokens[0] != "q" or tokens[7] != "cm":
+            raise ImageToPdfError("画像PDF候補のcontent streamが不正です")
+        if tokens[8] != "/Im0" or tokens[9] != "Do" or tokens[10] != "Q":
+            raise ImageToPdfError("画像PDF候補のcontent streamが不正です")
+        numbers = tuple(float(value) for value in tokens[1:7])
         self._assert_close_tuple(numbers, expected.image_matrix, "image matrix")
 
     @staticmethod
@@ -780,6 +935,16 @@ class ImageToPdfService:
             or ("A" in image.getbands())
             or ("transparency" in image.info)
         )
+
+    @contextmanager
+    def _tracked_resource(self, name: str) -> Iterator[None]:
+        if self._resource_tracker is not None:
+            self._resource_tracker(name, 1)
+        try:
+            yield
+        finally:
+            if self._resource_tracker is not None:
+                self._resource_tracker(name, -1)
 
     @staticmethod
     def _check_cancelled(should_cancel: Callable[[], bool] | None) -> None:

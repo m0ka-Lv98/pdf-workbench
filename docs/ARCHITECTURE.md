@@ -181,10 +181,13 @@ working copy を直接 mutate する専用サービス。Issue #7では、select
 - merge worker はGUI threadをブロックせず、progress/cancel/result summaryをQt signalで返す。Split workerとは同時実行しない。window close時はcancel tokenをsetし、GUI threadから`QThread.quit()`を明示してbounded waitし、終了できない場合はcloseを拒否する
 - `ImageToPdfPlan` は Qt 非依存のdomain objectで、resolved unique image inputs、frame mapping、output `.pdf` invariant、page size mode、orientation、margins、scaling、transparency policy を検証する
 - Image-to-PDF は JPEG / PNG / TIFF / BMP / WebP を Pillow の実formatで判定し、multi-page TIFF は各frameをページ化する。animated GIF / animated WebP / APNG / static GIF、未対応format、拡張子と実formatの不整合は fail-closed にする
-- Image-to-PDF geometry は EXIF orientation 後のpixel sizeとDPIから作り、Image Fit / A4 / Letter / Custom、auto orientation、fit / fill / actual size、mm marginを point 単位の page box と draw matrix へ変換する
-- transparency は白/黒flattenまたは soft mask で保持する。ICC付きCMYKはsRGBへ変換し、ICCなしCMYKやNaN / infinite pixelを含むfloating imageは拒否する
+- Image-to-PDF geometry は EXIF orientation 後のpixel sizeとDPIから作り、Image Fit / A4 / Letter / Custom、auto orientation、fit / fill / actual size、mm marginを point 単位の page box と draw matrix へ変換する。FILL はcenter cropで、colorとalphaへ同じcropを適用する
+- transparency は白/黒flattenまたは soft mask で保持する。ICC付きRGBA / LAはalphaを色変換前に分離し、PRESERVE_ALPHAでは `/SMask` として保持する。ICC付きCMYKは必ずsRGB RGBへ変換し、ICCなしCMYKやICC変換失敗、NaN / infinite pixelを含むfloating imageは拒否する
+- 16-bit unsigned、integer、floating point image は8-bitへ決定的に正規化する。floating point imageはextremaだけでなく全pixelを検査し、NaN / positive infinity / negative infinity をfail-closedにする
 - Image-to-PDF service はsource revisionをdialog時点で固定し、candidate作成前後とreplace直前に再確認する。targetは `TargetSnapshot` をpreflightとreplace直前に確認し、managed workspace配下出力を拒否する
-- Image-to-PDF candidate はtarget directoryに作成し、pikepdf reopen、root構造検証、全ページPDFium render validation、source revision再確認、target snapshot再確認を通過した場合だけ `os.replace()` でatomicに置換する
+- Image-to-PDF candidate はtarget directoryに作成し、pikepdf reopen、root構造検証、全ページPDFium render validation、source revision再確認、target snapshot再確認を通過した場合だけ `os.replace()` でatomicに置換する。page validationでは `/Type /Page`、MediaBox、unexpected CropBox / Rotate / page actionなし、単一 `/Im0` XObject、image / SMask dimensions、8-bit component、color space、content stream の限定operator列を検証する
+- Image-to-PDF はPillowの実formatを主判定としつつ、入力suffixは既知画像suffixに限定する。truncated image と decompression bomb warning/errorは拒否し、Pillow global stateは復元する
+- multi-page TIFF はframeごとのdimensions、mode、DPI、alphaを使用して逐次処理する。file-level dialog summaryは先頭frame情報ベースで、可変frame TIFFの完全なframe一覧表示は将来scopeとする
 - Image-to-PDF worker はGUI threadをブロックせず、progress/cancel/result summaryをQt signalで返す。Split / Merge / Image-to-PDF は同時実行しない。window close時はcancel tokenをsetし、GUI threadから`QThread.quit()`を明示してbounded waitし、終了できない場合はcloseを拒否する
 - Image-to-PDF は現在開いている document、working copy、selection、current page、dirty state、command history を変更しない。OCR、既存PDFへの画像挿入、metadata/bookmark/attachment生成、Undo / Redo command化は別scopeとする
 
