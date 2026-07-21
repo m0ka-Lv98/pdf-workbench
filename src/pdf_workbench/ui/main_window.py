@@ -71,6 +71,10 @@ from pdf_workbench.domain.page_commands import (
     RotatePagesCommand,
 )
 from pdf_workbench.domain.page_crop import build_page_crop_plan
+from pdf_workbench.domain.page_extraction import (
+    PageExtractionPlan,
+    build_selected_page_extraction_plan,
+)
 from pdf_workbench.domain.page_insertion import build_page_insertion_plan
 from pdf_workbench.domain.page_reorder import (
     PageReorderNoOpError,
@@ -78,6 +82,10 @@ from pdf_workbench.domain.page_reorder import (
     build_page_reorder_plan,
 )
 from pdf_workbench.domain.page_replacement import build_page_replacement_plan
+from pdf_workbench.services.pdf_page_export import (
+    PdfPageExportError,
+    PdfPageExportService,
+)
 from pdf_workbench.services.pdf_page_mutation import PdfPageMutationService, SourcePdfRevision
 from pdf_workbench.services.pdf_renderer import PdfRenderService
 from pdf_workbench.services.pdf_save_service import (
@@ -103,6 +111,10 @@ from pdf_workbench.ui.widgets.crop_pages_dialog import (
 )
 from pdf_workbench.ui.widgets.document_toolbar import DocumentToolbar, ToolbarState
 from pdf_workbench.ui.widgets.empty_state import EmptyState
+from pdf_workbench.ui.widgets.extract_pages_dialog import (
+    ExtractPagesDialog,
+    ExtractPagesDialogResult,
+)
 from pdf_workbench.ui.widgets.insert_pages_dialog import (
     InsertPagesDialog,
     InsertPagesDialogResult,
@@ -168,6 +180,17 @@ class CropPagesDocumentContext:
     current_page_index: int
 
 
+@dataclass(frozen=True, slots=True)
+class ExtractPagesDocumentContext:
+    session_id: str
+    working_copy_path: Path
+    source_path: Path
+    page_count: int
+    selected_page_indexes: tuple[int, ...]
+    current_page_index: int
+    source_revision: SourcePdfRevision
+
+
 class MainWindow(QMainWindow):
     _RECENT_FILES_KEY = "main_window/recent_files"
     _GEOMETRY_KEY = "main_window/geometry"
@@ -182,6 +205,7 @@ class MainWindow(QMainWindow):
         render_service: PdfRenderService | None = None,
         workspace_manager: SessionWorkspaceManager | None = None,
         save_service: PdfSaveService | None = None,
+        page_export_service: PdfPageExportService | None = None,
         recovery_service: SessionRecoveryService | None = None,
         source_change_monitor: SourceChangeMonitor | None = None,
     ) -> None:
@@ -195,6 +219,9 @@ class MainWindow(QMainWindow):
         )
         self._save_service = save_service if save_service is not None else PdfSaveService()
         self._page_mutation_service = PdfPageMutationService()
+        self._page_export_service = (
+            page_export_service if page_export_service is not None else PdfPageExportService()
+        )
         self._recovery_service = (
             recovery_service
             if recovery_service is not None
@@ -391,6 +418,12 @@ class MainWindow(QMainWindow):
         self.crop_pages_action = QAction("選択ページをトリミング…", self)
         self.crop_pages_action.triggered.connect(self._crop_selected_pages)
 
+        self.extract_selected_pages_action = QAction("選択ページを抽出…", self)
+        self.extract_selected_pages_action.triggered.connect(self._extract_selected_pages)
+
+        self.extract_page_range_action = QAction("ページ範囲を抽出…", self)
+        self.extract_page_range_action.triggered.connect(self._extract_page_range)
+
         self.insert_pages_action = QAction("別のPDFからページを挿入…", self)
         self.insert_pages_action.triggered.connect(self._insert_pages_from_pdf)
 
@@ -408,6 +441,8 @@ class MainWindow(QMainWindow):
             self.crop_pages_action,
             self.delete_pages_action,
             self.duplicate_pages_action,
+            self.extract_selected_pages_action,
+            self.extract_page_range_action,
             self.insert_pages_action,
             self.replace_pages_action,
             self.save_action,
@@ -450,6 +485,10 @@ class MainWindow(QMainWindow):
         edit_menu.addAction(self.crop_pages_action)
         edit_menu.addAction(self.delete_pages_action)
         edit_menu.addAction(self.duplicate_pages_action)
+        edit_menu.addSeparator()
+        edit_menu.addAction(self.extract_selected_pages_action)
+        edit_menu.addAction(self.extract_page_range_action)
+        edit_menu.addSeparator()
         edit_menu.addAction(self.insert_pages_action)
         edit_menu.addAction(self.replace_pages_action)
         edit_menu.addSeparator()
@@ -723,6 +762,100 @@ class MainWindow(QMainWindow):
             )
         )
 
+    def _extract_selected_pages(self) -> None:
+        document = self._current_document()
+        if document is None or document.session.is_saving or document.mutation_in_progress:
+            return
+        if not document.view.selected_page_indexes:
+            return
+        context = self._capture_extract_pages_context(document)
+        if context is None:
+            return
+        result = ExtractPagesDialogResult(
+            plan=self._selected_extraction_plan(context),
+            mode="selection",
+        )
+        self._run_page_extraction(context, result)
+
+    def _extract_page_range(self) -> None:
+        document = self._current_document()
+        if document is None or document.session.is_saving or document.mutation_in_progress:
+            return
+        context = self._capture_extract_pages_context(document)
+        if context is None:
+            return
+        result = self._choose_extract_pages_options(document, default_mode="range")
+        if result is None:
+            return
+        self._run_page_extraction(context, result)
+
+    def _run_page_extraction(
+        self,
+        context: ExtractPagesDocumentContext,
+        result: ExtractPagesDialogResult,
+    ) -> None:
+        target_document = self._resolve_extract_pages_document(
+            context,
+            require_selection_match=result.mode == "selection",
+        )
+        if target_document is None:
+            return
+        target_path = self._choose_extract_target_path(target_document, result.plan)
+        if target_path is None:
+            return
+        if target_path == context.source_path:
+            self._report_error(
+                "ページ抽出に失敗しました",
+                "抽出元PDFと同じ場所には出力できません。別の保存先を選択してください。",
+            )
+            return
+        if self._workspace_manager.contains_managed_path(target_path):
+            self._report_error(
+                "ページ抽出に失敗しました",
+                "アプリの一時作業フォルダ内には出力できません。別の保存先を選択してください。",
+            )
+            return
+        target_document = self._resolve_extract_pages_document(
+            context,
+            require_selection_match=result.mode == "selection",
+        )
+        if target_document is None:
+            return
+        try:
+            target_snapshot = TargetSnapshot.capture(target_path)
+        except OSError as exc:
+            self._report_error("ページ抽出に失敗しました", str(exc))
+            return
+        session = target_document.session
+        session.is_saving = True
+        self._update_actions()
+        self._set_status_message("ページを抽出しています…")
+        try:
+            export_result = self._page_export_service.extract_pages(
+                session.document_path,
+                target_path,
+                result.plan,
+                working_copy_path=session.document_path,
+                expected_source_revision=context.source_revision,
+                expected_target_snapshot=target_snapshot,
+            )
+        except (PdfPageExportError, TargetChangedError) as exc:
+            logger.exception("Failed to extract pages")
+            self._report_error(
+                "ページ抽出に失敗しました",
+                f"{exc}\n\n元のPDFと現在の作業コピーは変更されていません。",
+            )
+            return
+        finally:
+            session.is_saving = False
+            self._update_actions()
+            self._update_status()
+        self._set_status_message(
+            f"{export_result.exported_page_count}ページを抽出しました: "
+            f"{export_result.target_path.name}",
+            timeout_ms=5000,
+        )
+
     def _delete_selected_pages(self) -> None:
         document = self._current_document()
         if document is None or document.session.is_saving or document.mutation_in_progress:
@@ -905,6 +1038,28 @@ class MainWindow(QMainWindow):
             current_page_index=document.view.page_index,
         )
 
+    def _capture_extract_pages_context(
+        self,
+        document: DocumentTab,
+    ) -> ExtractPagesDocumentContext | None:
+        try:
+            source_revision = self._page_export_service.read_source_pdf_revision(
+                document.session.document_path
+            )
+        except Exception as exc:
+            logger.exception("Failed to inspect working copy before extraction")
+            self._report_error("ページ抽出に失敗しました", str(exc))
+            return None
+        return ExtractPagesDocumentContext(
+            session_id=document.session.session_id,
+            working_copy_path=document.session.document_path,
+            source_path=document.session.source_path,
+            page_count=document.view.page_count,
+            selected_page_indexes=tuple(sorted(set(document.view.selected_page_indexes))),
+            current_page_index=document.view.page_index,
+            source_revision=source_revision,
+        )
+
     def _resolve_insert_pages_document(
         self,
         context: InsertPagesDocumentContext,
@@ -967,6 +1122,48 @@ class MainWindow(QMainWindow):
             return None
         return document
 
+    def _resolve_extract_pages_document(
+        self,
+        context: ExtractPagesDocumentContext,
+        *,
+        require_selection_match: bool,
+    ) -> DocumentTab | None:
+        document = self._resolve_insert_pages_document(
+            InsertPagesDocumentContext(
+                session_id=context.session_id,
+                working_copy_path=context.working_copy_path,
+                source_path=context.source_path,
+                page_count=context.page_count,
+            )
+        )
+        if document is None:
+            return None
+        if document.view.page_index != context.current_page_index:
+            return None
+        if require_selection_match and (
+            tuple(sorted(set(document.view.selected_page_indexes))) != context.selected_page_indexes
+        ):
+            return None
+        try:
+            current_revision = self._page_export_service.read_source_pdf_revision(
+                document.session.document_path
+            )
+        except Exception as exc:
+            logger.exception("Failed to revalidate working copy before extraction")
+            self._report_error("ページ抽出に失敗しました", str(exc))
+            return None
+        if current_revision != context.source_revision:
+            self._report_error("ページ抽出に失敗しました", "抽出元PDFが変更されました")
+            return None
+        return document
+
+    @staticmethod
+    def _selected_extraction_plan(context: ExtractPagesDocumentContext) -> PageExtractionPlan:
+        return build_selected_page_extraction_plan(
+            context.page_count,
+            context.selected_page_indexes,
+        )
+
     def _choose_insert_source_path(self, document: DocumentTab) -> Path | None:
         filename, _ = QFileDialog.getOpenFileName(
             self,
@@ -1028,6 +1225,44 @@ class MainWindow(QMainWindow):
         if dialog.exec() != dialog.DialogCode.Accepted:
             return None
         return dialog.dialog_result
+
+    def _choose_extract_pages_options(
+        self,
+        document: DocumentTab,
+        *,
+        default_mode: str,
+    ) -> ExtractPagesDialogResult | None:
+        dialog = ExtractPagesDialog(
+            page_count=document.view.page_count,
+            selected_page_indexes=tuple(sorted(set(document.view.selected_page_indexes))),
+            default_mode=default_mode,
+            parent=self,
+        )
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return None
+        return dialog.dialog_result
+
+    def _choose_extract_target_path(
+        self,
+        document: DocumentTab,
+        plan: PageExtractionPlan,
+    ) -> Path | None:
+        stem = document.session.display_path.stem
+        initial_path = document.session.display_path.with_name(
+            f"{stem}-extract-{plan.output_page_count}p.pdf"
+        )
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            "抽出PDFの保存先",
+            str(initial_path),
+            "PDF files (*.pdf)",
+        )
+        if not filename:
+            return None
+        target_path = Path(filename).expanduser().resolve()
+        if target_path.suffix.lower() != ".pdf":
+            target_path = target_path.with_suffix(".pdf")
+        return target_path
 
     def _confirm_source_revision_still_current(
         self,
@@ -1553,6 +1788,17 @@ class MainWindow(QMainWindow):
                 and not document.mutation_in_progress
             )
         )
+        self.extract_selected_pages_action.setEnabled(
+            bool(
+                document
+                and document.view.selected_page_indexes
+                and not document.session.is_saving
+                and not document.mutation_in_progress
+            )
+        )
+        self.extract_page_range_action.setEnabled(
+            bool(document and not document.session.is_saving and not document.mutation_in_progress)
+        )
         self.insert_pages_action.setEnabled(
             bool(document and not document.session.is_saving and not document.mutation_in_progress)
         )
@@ -1700,6 +1946,9 @@ class MainWindow(QMainWindow):
             return
         menu = QMenu(self)
         menu.addAction(self.crop_pages_action)
+        menu.addSeparator()
+        menu.addAction(self.extract_selected_pages_action)
+        menu.addAction(self.extract_page_range_action)
         menu.addSeparator()
         menu.addAction(self.insert_pages_action)
         menu.addAction(self.replace_pages_action)
