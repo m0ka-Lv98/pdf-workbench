@@ -47,6 +47,7 @@ from pdf_workbench.domain.page_commands import DeletePagesCommand, RotatePagesCo
 from pdf_workbench.domain.page_crop import PageCropMargins
 from pdf_workbench.domain.page_extraction import PageExtractionPlan, build_page_extraction_plan
 from pdf_workbench.domain.page_insertion import SourcePageSelection
+from pdf_workbench.domain.page_split import build_max_pages_split_plan
 from pdf_workbench.services.page_coordinates import PageMetadata
 from pdf_workbench.services.pdf_page_export import PageExtractionResult, PdfPageExportService
 from pdf_workbench.services.pdf_page_mutation import (
@@ -54,6 +55,7 @@ from pdf_workbench.services.pdf_page_mutation import (
     PdfPageMutationService,
     SourcePdfRevision,
 )
+from pdf_workbench.services.pdf_page_split import PdfPageSplitService
 from pdf_workbench.services.pdf_renderer import (
     DocumentMetadata,
     DocumentReleaseResult,
@@ -89,6 +91,7 @@ from pdf_workbench.ui.widgets.replace_pages_dialog import (
     ReplacePagesDialogResult,
 )
 from pdf_workbench.ui.widgets.search_bar import SearchBar, SearchInputSurface
+from pdf_workbench.ui.widgets.split_pdf_dialog import SplitPdfDialogResult
 
 
 def patch_pdf_open(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -326,6 +329,23 @@ class FakePageExportService(PdfPageExportService):
         )
 
 
+class FakePageSplitService(PdfPageSplitService):
+    def __init__(self) -> None:
+        super().__init__()
+        self.revision: SourcePdfRevision | None = None
+
+    def read_source_pdf_revision(self, path: Path) -> SourcePdfRevision:
+        resolved = path.expanduser().resolve()
+        if self.revision is not None:
+            return self.revision
+        return SourcePdfRevision(
+            resolved_path=resolved,
+            fingerprint=FileFingerprint.from_path(resolved),
+            sha256="0" * 64,
+            page_count=3,
+        )
+
+
 def test_main_window_insert_pages_action_exists_and_is_enabled_with_document(
     monkeypatch: pytest.MonkeyPatch,
     qtbot: QtBot,
@@ -397,6 +417,185 @@ def test_main_window_extract_actions_follow_document_selection_and_busy_state(
     assert window.extract_selected_pages_action.isEnabled() is False
     assert window.extract_page_range_action.isEnabled() is False
     document.mutation_in_progress = False
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
+def test_main_window_split_action_requires_multi_page_idle_document(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    source_path = create_simple_text_pdf(tmp_path / "split-actions-source.pdf", ["A", "B"])
+
+    assert window.split_pdf_action.text() == "PDFを分割…"
+    assert window.split_pdf_action.isEnabled() is False
+
+    window.open_document(source_path)
+    qtbot.waitUntil(lambda: window._current_document() is not None)
+    document = window._current_document()
+    assert document is not None
+
+    window._update_actions()
+    assert window.split_pdf_action.isEnabled() is False
+
+    configure_fake_view_pages(document.view, 2)
+    window._update_actions()
+    assert window.split_pdf_action.isEnabled() is True
+
+    document.session.is_saving = True
+    window._update_actions()
+    assert window.split_pdf_action.isEnabled() is False
+    document.session.is_saving = False
+
+    document.mutation_in_progress = True
+    window._update_actions()
+    assert window.split_pdf_action.isEnabled() is False
+    document.mutation_in_progress = False
+
+    window._split_in_progress_session_id = document.session.session_id
+    window._update_actions()
+    assert window.split_pdf_action.isEnabled() is False
+    window._split_in_progress_session_id = None
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
+def test_main_window_split_dialog_cancel_does_not_start_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    split_service = FakePageSplitService()
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+        page_split_service=split_service,
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    source_path = create_simple_text_pdf(tmp_path / "split-cancel-source.pdf", ["A", "B", "C"])
+    window.open_document(source_path)
+    qtbot.waitUntil(lambda: window._current_document() is not None)
+    document = window._current_document()
+    assert document is not None
+    configure_fake_view_pages(document.view, 3)
+    started: list[str] = []
+    monkeypatch.setattr(window, "_choose_split_pdf_options", lambda _document: None)
+    monkeypatch.setattr(window, "_start_split_worker", lambda *_args: started.append("started"))
+
+    window._split_pdf()
+
+    assert started == []
+    assert document.session.is_modified is False
+    assert document.command_history.can_undo is False
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
+def test_main_window_split_rejects_stale_page_count_before_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    split_service = FakePageSplitService()
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+        page_split_service=split_service,
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    source_path = create_simple_text_pdf(tmp_path / "split-stale-source.pdf", ["A", "B", "C"])
+    window.open_document(source_path)
+    qtbot.waitUntil(lambda: window._current_document() is not None)
+    document = window._current_document()
+    assert document is not None
+    configure_fake_view_pages(document.view, 3)
+    result = SplitPdfDialogResult(
+        plan=build_max_pages_split_plan(3, 1, source_stem=source_path.stem),
+        output_directory=tmp_path,
+        overwrite=False,
+        mode="max_pages",
+    )
+    started: list[str] = []
+
+    def choose_split(_document: DocumentTab) -> SplitPdfDialogResult:
+        configure_fake_view_pages(document.view, 2)
+        return result
+
+    monkeypatch.setattr(window, "_choose_split_pdf_options", choose_split)
+    monkeypatch.setattr(window, "_start_split_worker", lambda *_args: started.append("started"))
+
+    window._split_pdf()
+
+    assert started == []
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
+def test_main_window_split_starts_without_mutating_document_state(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    split_service = FakePageSplitService()
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+        page_split_service=split_service,
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    source_path = create_simple_text_pdf(tmp_path / "split-start-source.pdf", ["A", "B", "C"])
+    window.open_document(source_path)
+    qtbot.waitUntil(lambda: window._current_document() is not None)
+    document = window._current_document()
+    assert document is not None
+    configure_fake_view_pages(document.view, 3)
+    document.view._page_organizer.set_selected_page_indexes((1,), current_index=1)
+    document.view.set_page(1)
+    before_selection = document.view.selected_page_indexes
+    before_page = document.view.page_index
+    before_dirty = document.session.is_modified
+    result = SplitPdfDialogResult(
+        plan=build_max_pages_split_plan(3, 2, source_stem=source_path.stem),
+        output_directory=tmp_path,
+        overwrite=False,
+        mode="max_pages",
+    )
+    captured: list[tuple[SplitPdfDialogResult, tuple[int, ...], int, bool]] = []
+
+    def start_worker(
+        _context: object,
+        split_result: SplitPdfDialogResult,
+    ) -> None:
+        captured.append(
+            (
+                split_result,
+                document.view.selected_page_indexes,
+                document.view.page_index,
+                document.session.is_modified,
+            )
+        )
+
+    monkeypatch.setattr(window, "_choose_split_pdf_options", lambda _document: result)
+    monkeypatch.setattr(window, "_start_split_worker", start_worker)
+
+    window._split_pdf()
+
+    assert captured == [(result, before_selection, before_page, before_dirty)]
+    assert document.command_history.can_undo is False
     window.close()
     qtbot.waitUntil(lambda: not window.isVisible())
 

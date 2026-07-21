@@ -21,7 +21,10 @@ from PySide6.QtCore import (
     QRect,
     QSettings,
     Qt,
+    QThread,
     QTimer,
+    Signal,
+    Slot,
 )
 from PySide6.QtGui import (
     QAction,
@@ -41,6 +44,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QProgressDialog,
     QSizePolicy,
     QStackedWidget,
     QStatusBar,
@@ -82,11 +86,18 @@ from pdf_workbench.domain.page_reorder import (
     build_page_reorder_plan,
 )
 from pdf_workbench.domain.page_replacement import build_page_replacement_plan
+from pdf_workbench.domain.page_split import PageSplitPlan
 from pdf_workbench.services.pdf_page_export import (
     PdfPageExportError,
     PdfPageExportService,
 )
 from pdf_workbench.services.pdf_page_mutation import PdfPageMutationService, SourcePdfRevision
+from pdf_workbench.services.pdf_page_split import (
+    PageSplitBatchResult,
+    PageSplitOutputStatus,
+    PageSplitProgress,
+    PdfPageSplitService,
+)
 from pdf_workbench.services.pdf_renderer import PdfRenderService
 from pdf_workbench.services.pdf_save_service import (
     PdfSaveError,
@@ -128,6 +139,7 @@ from pdf_workbench.ui.widgets.source_change_banner import (
     SourceChangeBanner,
     SourceChangeBannerState,
 )
+from pdf_workbench.ui.widgets.split_pdf_dialog import SplitPdfDialog, SplitPdfDialogResult
 
 logger = logging.getLogger(__name__)
 
@@ -191,6 +203,71 @@ class ExtractPagesDocumentContext:
     source_revision: SourcePdfRevision
 
 
+@dataclass(frozen=True, slots=True)
+class SplitPdfDocumentContext:
+    session_id: str
+    working_copy_path: Path
+    source_path: Path
+    page_count: int
+    source_revision: SourcePdfRevision
+
+
+class SplitPdfWorker(QObject):
+    progress = Signal(object)
+    succeeded = Signal(object)
+    failed = Signal(str)
+    finished = Signal()
+
+    def __init__(
+        self,
+        *,
+        service: PdfPageSplitService,
+        source_path: Path,
+        output_directory: Path,
+        plan: PageSplitPlan,
+        working_copy_path: Path,
+        expected_source_revision: SourcePdfRevision,
+        overwrite: bool,
+        is_managed_path: Callable[[Path], bool],
+    ) -> None:
+        super().__init__()
+        self._service = service
+        self._source_path = source_path
+        self._output_directory = output_directory
+        self._plan = plan
+        self._working_copy_path = working_copy_path
+        self._expected_source_revision = expected_source_revision
+        self._overwrite = overwrite
+        self._is_managed_path = is_managed_path
+        self._cancel_requested = False
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            result = self._service.split_pdf(
+                self._source_path,
+                self._output_directory,
+                self._plan,
+                working_copy_path=self._working_copy_path,
+                expected_source_revision=self._expected_source_revision,
+                overwrite=self._overwrite,
+                is_managed_path=self._is_managed_path,
+                should_cancel=lambda: self._cancel_requested,
+                progress_callback=self.progress.emit,
+            )
+        except Exception as exc:
+            logger.exception("Failed to split PDF")
+            self.failed.emit(str(exc))
+        else:
+            self.succeeded.emit(result)
+        finally:
+            self.finished.emit()
+
+    @Slot()
+    def cancel(self) -> None:
+        self._cancel_requested = True
+
+
 class MainWindow(QMainWindow):
     _RECENT_FILES_KEY = "main_window/recent_files"
     _GEOMETRY_KEY = "main_window/geometry"
@@ -206,6 +283,7 @@ class MainWindow(QMainWindow):
         workspace_manager: SessionWorkspaceManager | None = None,
         save_service: PdfSaveService | None = None,
         page_export_service: PdfPageExportService | None = None,
+        page_split_service: PdfPageSplitService | None = None,
         recovery_service: SessionRecoveryService | None = None,
         source_change_monitor: SourceChangeMonitor | None = None,
     ) -> None:
@@ -222,6 +300,9 @@ class MainWindow(QMainWindow):
         self._page_export_service = (
             page_export_service if page_export_service is not None else PdfPageExportService()
         )
+        self._page_split_service = (
+            page_split_service if page_split_service is not None else PdfPageSplitService()
+        )
         self._recovery_service = (
             recovery_service
             if recovery_service is not None
@@ -237,6 +318,10 @@ class MainWindow(QMainWindow):
         self._dismissed_source_banner_revisions: dict[str, int] = {}
         self._recent_files: list[Path] = self._load_recent_files()
         self._build_sha = os.environ.get("PDF_WORKBENCH_BUILD_SHA", "").strip()
+        self._split_in_progress_session_id: str | None = None
+        self._split_worker_thread: QThread | None = None
+        self._split_worker: SplitPdfWorker | None = None
+        self._split_progress_dialog: QProgressDialog | None = None
         self._toolbar_widget = DocumentToolbar(self)
         self._search_bar = SearchBar(self)
         self._main_toolbar: QWidget | None = None
@@ -424,6 +509,9 @@ class MainWindow(QMainWindow):
         self.extract_page_range_action = QAction("ページ範囲を抽出…", self)
         self.extract_page_range_action.triggered.connect(self._extract_page_range)
 
+        self.split_pdf_action = QAction("PDFを分割…", self)
+        self.split_pdf_action.triggered.connect(self._split_pdf)
+
         self.insert_pages_action = QAction("別のPDFからページを挿入…", self)
         self.insert_pages_action.triggered.connect(self._insert_pages_from_pdf)
 
@@ -443,6 +531,7 @@ class MainWindow(QMainWindow):
             self.duplicate_pages_action,
             self.extract_selected_pages_action,
             self.extract_page_range_action,
+            self.split_pdf_action,
             self.insert_pages_action,
             self.replace_pages_action,
             self.save_action,
@@ -466,6 +555,8 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self.save_action)
         file_menu.addAction(self.save_as_action)
         file_menu.addSeparator()
+        file_menu.addAction(self.split_pdf_action)
+        file_menu.addSeparator()
         file_menu.addAction(self.close_action)
         self.recent_files_menu = file_menu.addMenu("最近使ったファイル")
         file_menu.addSeparator()
@@ -488,6 +579,7 @@ class MainWindow(QMainWindow):
         edit_menu.addSeparator()
         edit_menu.addAction(self.extract_selected_pages_action)
         edit_menu.addAction(self.extract_page_range_action)
+        edit_menu.addAction(self.split_pdf_action)
         edit_menu.addSeparator()
         edit_menu.addAction(self.insert_pages_action)
         edit_menu.addAction(self.replace_pages_action)
@@ -602,7 +694,10 @@ class MainWindow(QMainWindow):
             return False
 
         document = self._documents[index]
-        if document.mutation_in_progress:
+        if (
+            document.mutation_in_progress
+            or self._split_in_progress_session_id == document.session.session_id
+        ):
             return False
         if document.session.is_modified:
             result = QMessageBox.question(
@@ -651,7 +746,10 @@ class MainWindow(QMainWindow):
 
     def close_current_document(self) -> bool:
         document = self._current_document()
-        if document is not None and document.mutation_in_progress:
+        if document is not None and (
+            document.mutation_in_progress
+            or self._split_in_progress_session_id == document.session.session_id
+        ):
             return False
         return self.close_document_at(self._tabs.currentIndex())
 
@@ -855,6 +953,148 @@ class MainWindow(QMainWindow):
             f"{export_result.target_path.name}",
             timeout_ms=5000,
         )
+
+    def _split_pdf(self) -> None:
+        document = self._current_document()
+        if (
+            document is None
+            or document.session.is_saving
+            or document.mutation_in_progress
+            or self._split_in_progress_session_id is not None
+            or document.view.page_count < 2
+        ):
+            return
+        context = self._capture_split_pdf_context(document)
+        if context is None:
+            return
+        result = self._choose_split_pdf_options(document)
+        if result is None:
+            return
+        target_document = self._resolve_split_pdf_document(context)
+        if target_document is None:
+            return
+        self._start_split_worker(context, result)
+
+    def _start_split_worker(
+        self,
+        context: SplitPdfDocumentContext,
+        result: SplitPdfDialogResult,
+    ) -> None:
+        progress_dialog = QProgressDialog(
+            "PDFを分割しています…",
+            "キャンセル",
+            0,
+            result.plan.output_count,
+            self,
+        )
+        progress_dialog.setWindowTitle("PDFを分割")
+        progress_dialog.setMinimumDuration(0)
+        progress_dialog.setValue(0)
+        thread = QThread(self)
+        worker = SplitPdfWorker(
+            service=self._page_split_service,
+            source_path=context.working_copy_path,
+            output_directory=result.output_directory,
+            plan=result.plan,
+            working_copy_path=context.working_copy_path,
+            expected_source_revision=context.source_revision,
+            overwrite=result.overwrite,
+            is_managed_path=self._workspace_manager.contains_managed_path,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_split_progress)
+        worker.succeeded.connect(self._on_split_succeeded)
+        worker.failed.connect(self._on_split_failed)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        progress_dialog.canceled.connect(worker.cancel)
+        thread.finished.connect(self._on_split_thread_finished)
+        self._split_in_progress_session_id = context.session_id
+        self._split_worker_thread = thread
+        self._split_worker = worker
+        self._split_progress_dialog = progress_dialog
+        self._set_status_message("PDFを分割しています…")
+        self._update_actions()
+        thread.start()
+
+    def _on_split_progress(self, progress: object) -> None:
+        if not isinstance(progress, PageSplitProgress):
+            return
+        if self._split_progress_dialog is not None:
+            self._split_progress_dialog.setLabelText(
+                f"{progress.output_number} / {progress.output_count}: "
+                f"{progress.chunk.display_range} -> {progress.target_path.name}"
+            )
+            if progress.status is not PageSplitOutputStatus.SKIPPED:
+                self._split_progress_dialog.setValue(progress.output_number)
+        self._set_status_message(
+            f"PDFを分割しています… {progress.output_number} / {progress.output_count}"
+        )
+
+    def _on_split_succeeded(self, result: object) -> None:
+        if not isinstance(result, PageSplitBatchResult):
+            return
+        if self._split_progress_dialog is not None:
+            self._split_progress_dialog.setValue(len(result.outputs))
+        self._show_split_result_summary(result)
+        if result.failure_count or result.skipped_count or result.cancelled_count:
+            self._set_status_message("PDF分割が一部完了しました", timeout_ms=5000)
+        else:
+            self._set_status_message(
+                f"{result.success_count}個のPDFを作成しました",
+                timeout_ms=5000,
+            )
+
+    def _on_split_failed(self, message: str) -> None:
+        self._report_error(
+            "PDF分割に失敗しました",
+            f"{message}\n\n元のPDFと現在の作業コピーは変更されていません。",
+        )
+
+    def _on_split_thread_finished(self) -> None:
+        if self._split_progress_dialog is not None:
+            self._split_progress_dialog.close()
+            self._split_progress_dialog.deleteLater()
+        self._split_progress_dialog = None
+        self._split_worker = None
+        self._split_worker_thread = None
+        self._split_in_progress_session_id = None
+        self._update_actions()
+        self._update_status()
+
+    def _show_split_result_summary(self, result: PageSplitBatchResult) -> None:
+        if result.failure_count:
+            headline = (
+                f"{len(result.outputs)}個中{result.success_count}個を作成しました。"
+                f"{result.failure_count}個は失敗しました"
+            )
+        elif result.cancelled_count:
+            headline = (
+                f"{len(result.outputs)}個中{result.success_count}個を作成し、"
+                "残りをキャンセルしました"
+            )
+        else:
+            headline = f"{result.success_count}個のPDFを作成しました"
+        lines = [headline, ""]
+        for output in result.outputs:
+            status_text = {
+                PageSplitOutputStatus.SUCCESS: "成功",
+                PageSplitOutputStatus.FAILED: "失敗",
+                PageSplitOutputStatus.SKIPPED: "スキップ",
+                PageSplitOutputStatus.CANCELLED: "キャンセル",
+            }[output.status]
+            suffix = f" - {output.error_message}" if output.error_message else ""
+            lines.append(
+                f"{output.chunk.display_range}: {output.target_path.name} [{status_text}]{suffix}"
+            )
+        message = QMessageBox(self)
+        message.setWindowTitle("PDF分割結果")
+        message.setIcon(QMessageBox.Icon.Information)
+        message.setText(headline)
+        message.setDetailedText("\n".join(lines))
+        message.exec()
 
     def _delete_selected_pages(self) -> None:
         document = self._current_document()
@@ -1060,6 +1300,26 @@ class MainWindow(QMainWindow):
             source_revision=source_revision,
         )
 
+    def _capture_split_pdf_context(
+        self,
+        document: DocumentTab,
+    ) -> SplitPdfDocumentContext | None:
+        try:
+            source_revision = self._page_split_service.read_source_pdf_revision(
+                document.session.document_path
+            )
+        except Exception as exc:
+            logger.exception("Failed to inspect working copy before split")
+            self._report_error("PDF分割に失敗しました", str(exc))
+            return None
+        return SplitPdfDocumentContext(
+            session_id=document.session.session_id,
+            working_copy_path=document.session.document_path,
+            source_path=document.session.source_path,
+            page_count=document.view.page_count,
+            source_revision=source_revision,
+        )
+
     def _resolve_insert_pages_document(
         self,
         context: InsertPagesDocumentContext,
@@ -1154,6 +1414,35 @@ class MainWindow(QMainWindow):
             return None
         if current_revision != context.source_revision:
             self._report_error("ページ抽出に失敗しました", "抽出元PDFが変更されました")
+            return None
+        return document
+
+    def _resolve_split_pdf_document(
+        self,
+        context: SplitPdfDocumentContext,
+    ) -> DocumentTab | None:
+        document = self._resolve_insert_pages_document(
+            InsertPagesDocumentContext(
+                session_id=context.session_id,
+                working_copy_path=context.working_copy_path,
+                source_path=context.source_path,
+                page_count=context.page_count,
+            )
+        )
+        if document is None:
+            return None
+        if self._split_in_progress_session_id is not None:
+            return None
+        try:
+            current_revision = self._page_split_service.read_source_pdf_revision(
+                document.session.document_path
+            )
+        except Exception as exc:
+            logger.exception("Failed to revalidate working copy before split")
+            self._report_error("PDF分割に失敗しました", str(exc))
+            return None
+        if current_revision != context.source_revision:
+            self._report_error("PDF分割に失敗しました", "分割元PDFが変更されました")
             return None
         return document
 
@@ -1263,6 +1552,17 @@ class MainWindow(QMainWindow):
         if target_path.suffix.lower() != ".pdf":
             target_path = target_path.with_suffix(".pdf")
         return target_path
+
+    def _choose_split_pdf_options(self, document: DocumentTab) -> SplitPdfDialogResult | None:
+        dialog = SplitPdfDialog(
+            source_path=document.session.display_path,
+            page_count=document.view.page_count,
+            default_output_directory=document.session.display_path.parent,
+            parent=self,
+        )
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return None
+        return dialog.dialog_result
 
     def _confirm_source_revision_still_current(
         self,
@@ -1798,6 +2098,15 @@ class MainWindow(QMainWindow):
         )
         self.extract_page_range_action.setEnabled(
             bool(document and not document.session.is_saving and not document.mutation_in_progress)
+        )
+        self.split_pdf_action.setEnabled(
+            bool(
+                document
+                and document.view.page_count >= 2
+                and not document.session.is_saving
+                and not document.mutation_in_progress
+                and self._split_in_progress_session_id is None
+            )
         )
         self.insert_pages_action.setEnabled(
             bool(document and not document.session.is_saving and not document.mutation_in_progress)
