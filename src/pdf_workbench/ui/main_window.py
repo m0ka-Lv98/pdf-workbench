@@ -67,6 +67,7 @@ from pdf_workbench.domain.command_history import (
     DocumentCommand,
 )
 from pdf_workbench.domain.document_session import DocumentSession, SourceStatus
+from pdf_workbench.domain.image_to_pdf import ImageSourceRevision, ImageToPdfPlan
 from pdf_workbench.domain.page_commands import (
     CropPagesCommand,
     DeletePagesCommand,
@@ -90,6 +91,12 @@ from pdf_workbench.domain.page_reorder import (
 from pdf_workbench.domain.page_replacement import build_page_replacement_plan
 from pdf_workbench.domain.page_split import PageSplitPlan
 from pdf_workbench.domain.pdf_merge import PdfMergeBookmarkPolicy, PdfMergePlan
+from pdf_workbench.services.image_to_pdf import (
+    ImageToPdfCancelled,
+    ImageToPdfProgress,
+    ImageToPdfResult,
+    ImageToPdfService,
+)
 from pdf_workbench.services.pdf_merge import (
     PdfMergeCancelled,
     PdfMergeProgress,
@@ -134,6 +141,10 @@ from pdf_workbench.ui.widgets.empty_state import EmptyState
 from pdf_workbench.ui.widgets.extract_pages_dialog import (
     ExtractPagesDialog,
     ExtractPagesDialogResult,
+)
+from pdf_workbench.ui.widgets.image_to_pdf_dialog import (
+    ImageToPdfDialog,
+    ImageToPdfDialogResult,
 )
 from pdf_workbench.ui.widgets.insert_pages_dialog import (
     InsertPagesDialog,
@@ -325,6 +336,56 @@ class MergePdfWorker(QObject):
             self.finished.emit()
 
 
+class ImageToPdfWorker(QObject):
+    progress = Signal(object)
+    succeeded = Signal(object)
+    cancelled = Signal(str)
+    failed = Signal(str)
+    finished = Signal()
+
+    def __init__(
+        self,
+        *,
+        service: ImageToPdfService,
+        plan: ImageToPdfPlan,
+        overwrite: bool,
+        expected_source_revisions: dict[Path, ImageSourceRevision],
+        expected_target_snapshot: TargetSnapshot,
+        is_managed_path: Callable[[Path], bool],
+        cancel_event: Event,
+    ) -> None:
+        super().__init__()
+        self._service = service
+        self._plan = plan
+        self._overwrite = overwrite
+        self._expected_source_revisions = expected_source_revisions
+        self._expected_target_snapshot = expected_target_snapshot
+        self._is_managed_path = is_managed_path
+        self._cancel_event = cancel_event
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            result = self._service.create_pdf(
+                self._plan,
+                overwrite=self._overwrite,
+                expected_source_revisions=self._expected_source_revisions,
+                expected_target_snapshot=self._expected_target_snapshot,
+                is_managed_path=self._is_managed_path,
+                should_cancel=self._cancel_event.is_set,
+                progress_callback=self.progress.emit,
+            )
+        except ImageToPdfCancelled as exc:
+            self.cancelled.emit(str(exc))
+        except Exception as exc:
+            logger.exception("Failed to create PDF from images")
+            self.failed.emit(str(exc))
+        else:
+            self.succeeded.emit(result)
+        finally:
+            self.finished.emit()
+
+
 class MainWindow(QMainWindow):
     _RECENT_FILES_KEY = "main_window/recent_files"
     _GEOMETRY_KEY = "main_window/geometry"
@@ -342,6 +403,7 @@ class MainWindow(QMainWindow):
         page_export_service: PdfPageExportService | None = None,
         page_split_service: PdfPageSplitService | None = None,
         pdf_merge_service: PdfMergeService | None = None,
+        image_to_pdf_service: ImageToPdfService | None = None,
         recovery_service: SessionRecoveryService | None = None,
         source_change_monitor: SourceChangeMonitor | None = None,
     ) -> None:
@@ -363,6 +425,9 @@ class MainWindow(QMainWindow):
         )
         self._pdf_merge_service = (
             pdf_merge_service if pdf_merge_service is not None else PdfMergeService()
+        )
+        self._image_to_pdf_service = (
+            image_to_pdf_service if image_to_pdf_service is not None else ImageToPdfService()
         )
         self._recovery_service = (
             recovery_service
@@ -388,6 +453,10 @@ class MainWindow(QMainWindow):
         self._merge_worker: MergePdfWorker | None = None
         self._merge_progress_dialog: QProgressDialog | None = None
         self._merge_cancel_event: Event | None = None
+        self._image_to_pdf_worker_thread: QThread | None = None
+        self._image_to_pdf_worker: ImageToPdfWorker | None = None
+        self._image_to_pdf_progress_dialog: QProgressDialog | None = None
+        self._image_to_pdf_cancel_event: Event | None = None
         self._toolbar_widget = DocumentToolbar(self)
         self._search_bar = SearchBar(self)
         self._main_toolbar: QWidget | None = None
@@ -581,6 +650,9 @@ class MainWindow(QMainWindow):
         self.merge_pdfs_action = QAction("PDFを結合…", self)
         self.merge_pdfs_action.triggered.connect(self._merge_pdfs)
 
+        self.image_to_pdf_action = QAction("画像からPDFを作成…", self)
+        self.image_to_pdf_action.triggered.connect(self._create_pdf_from_images)
+
         self.insert_pages_action = QAction("別のPDFからページを挿入…", self)
         self.insert_pages_action.triggered.connect(self._insert_pages_from_pdf)
 
@@ -602,6 +674,7 @@ class MainWindow(QMainWindow):
             self.extract_page_range_action,
             self.split_pdf_action,
             self.merge_pdfs_action,
+            self.image_to_pdf_action,
             self.insert_pages_action,
             self.replace_pages_action,
             self.save_action,
@@ -627,6 +700,7 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         file_menu.addAction(self.split_pdf_action)
         file_menu.addAction(self.merge_pdfs_action)
+        file_menu.addAction(self.image_to_pdf_action)
         file_menu.addSeparator()
         file_menu.addAction(self.close_action)
         self.recent_files_menu = file_menu.addMenu("最近使ったファイル")
@@ -1032,8 +1106,7 @@ class MainWindow(QMainWindow):
             document is None
             or document.session.is_saving
             or document.mutation_in_progress
-            or self._split_in_progress_session_id is not None
-            or self._merge_worker_thread is not None
+            or self._background_pdf_operation_in_progress()
             or document.view.page_count < 2
         ):
             return
@@ -1193,7 +1266,7 @@ class MainWindow(QMainWindow):
         message.exec()
 
     def _merge_pdfs(self) -> None:
-        if self._merge_worker_thread is not None or self._split_in_progress_session_id is not None:
+        if self._background_pdf_operation_in_progress():
             return
         dialog = MergePdfsDialog(
             input_reader=self._pdf_merge_service.inspect_merge_input,
@@ -1328,6 +1401,144 @@ class MainWindow(QMainWindow):
             )
         message = QMessageBox(self)
         message.setWindowTitle("PDF結合結果")
+        message.setIcon(QMessageBox.Icon.Information)
+        message.setText(headline)
+        message.setDetailedText("\n".join(lines))
+        message.exec()
+
+    def _create_pdf_from_images(self) -> None:
+        if self._background_pdf_operation_in_progress():
+            return
+        dialog = ImageToPdfDialog(
+            input_reader=self._image_to_pdf_service.inspect_image_input,
+            target_snapshot_reader=TargetSnapshot.capture,
+            is_managed_path=self._workspace_manager.contains_managed_path,
+            default_output_directory=Path.home(),
+            parent=self,
+        )
+        if dialog.exec() != int(QDialog.DialogCode.Accepted) or dialog.dialog_result is None:
+            return
+        self._start_image_to_pdf_worker(dialog.dialog_result)
+
+    def _start_image_to_pdf_worker(self, result: ImageToPdfDialogResult) -> None:
+        progress_dialog = QProgressDialog(
+            "画像からPDFを作成しています…",
+            "キャンセル",
+            0,
+            result.plan.total_page_count,
+            self,
+        )
+        progress_dialog.setWindowTitle("画像からPDFを作成")
+        progress_dialog.setMinimumDuration(0)
+        progress_dialog.setValue(0)
+        cancel_event = Event()
+        thread = QThread(self)
+        worker = ImageToPdfWorker(
+            service=self._image_to_pdf_service,
+            plan=result.plan,
+            overwrite=result.overwrite,
+            expected_source_revisions=result.expected_source_revisions,
+            expected_target_snapshot=result.expected_target_snapshot,
+            is_managed_path=self._workspace_manager.contains_managed_path,
+            cancel_event=cancel_event,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_image_to_pdf_progress)
+        worker.succeeded.connect(self._on_image_to_pdf_succeeded)
+        worker.cancelled.connect(self._on_image_to_pdf_cancelled)
+        worker.failed.connect(self._on_image_to_pdf_failed)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        progress_dialog.canceled.connect(self._request_image_to_pdf_cancel)
+        thread.finished.connect(self._on_image_to_pdf_thread_finished)
+        self._image_to_pdf_worker_thread = thread
+        self._image_to_pdf_worker = worker
+        self._image_to_pdf_progress_dialog = progress_dialog
+        self._image_to_pdf_cancel_event = cancel_event
+        self._set_status_message("画像からPDFを作成しています…")
+        self._update_actions()
+        thread.start()
+
+    @Slot()
+    def _request_image_to_pdf_cancel(self) -> None:
+        if self._image_to_pdf_cancel_event is None:
+            return
+        self._image_to_pdf_cancel_event.set()
+        if self._image_to_pdf_progress_dialog is not None:
+            self._image_to_pdf_progress_dialog.setLabelText("安全な中断点でキャンセルします…")
+        self._set_status_message("画像PDF作成をキャンセルしています…")
+
+    def _on_image_to_pdf_progress(self, progress: object) -> None:
+        if not isinstance(progress, ImageToPdfProgress):
+            return
+        if self._image_to_pdf_progress_dialog is not None:
+            self._image_to_pdf_progress_dialog.setLabelText(
+                f"{progress.input_number} / {progress.input_count}: "
+                f"{progress.filename}\n"
+                f"フレーム {progress.frame_number} / {progress.frame_count}"
+            )
+            self._image_to_pdf_progress_dialog.setValue(progress.completed_pages)
+        self._set_status_message(
+            f"画像PDFを作成しています… {progress.completed_pages} / {progress.total_pages}"
+        )
+
+    def _on_image_to_pdf_succeeded(self, result: object) -> None:
+        if not isinstance(result, ImageToPdfResult):
+            return
+        if self._image_to_pdf_progress_dialog is not None:
+            self._image_to_pdf_progress_dialog.setValue(result.total_page_count)
+        self._show_image_to_pdf_result_summary(result)
+        self._set_status_message(
+            f"{result.input_count}個の画像からPDFを作成しました: {result.target_path.name}",
+            timeout_ms=5000,
+        )
+
+    def _on_image_to_pdf_cancelled(self, message: str) -> None:
+        self._report_error(
+            "画像PDF作成をキャンセルしました",
+            f"{message}\n\n入力画像と出力先PDFは変更されていません。",
+        )
+
+    def _on_image_to_pdf_failed(self, message: str) -> None:
+        self._report_error(
+            "画像PDF作成に失敗しました",
+            f"{message}\n\n入力画像と出力先PDFは変更されていません。",
+        )
+
+    def _on_image_to_pdf_thread_finished(self) -> None:
+        if self._image_to_pdf_progress_dialog is not None:
+            self._image_to_pdf_progress_dialog.close()
+            self._image_to_pdf_progress_dialog.deleteLater()
+        self._image_to_pdf_progress_dialog = None
+        self._image_to_pdf_worker = None
+        self._image_to_pdf_worker_thread = None
+        self._image_to_pdf_cancel_event = None
+        self._update_actions()
+        self._update_status()
+
+    def _show_image_to_pdf_result_summary(self, result: ImageToPdfResult) -> None:
+        headline = (
+            f"{result.input_count}個の画像から{result.total_page_count}ページのPDFを作成しました"
+        )
+        lines = [
+            headline,
+            "",
+            f"出力先: {result.target_path}",
+            f"入力ファイル: {result.input_count}",
+            f"出力ページ: {result.total_page_count}",
+            f"Page size: {result.page_size_mode.value}",
+            f"Scaling: {result.scaling_mode.value}",
+            f"Transparency: {result.transparency_policy.value}",
+            "",
+        ]
+        for index, item in enumerate(result.inputs, start=1):
+            lines.append(
+                f"{index}. {item.label} — {item.frame_count}ページ — 出力 {item.display_range}"
+            )
+        message = QMessageBox(self)
+        message.setWindowTitle("画像PDF作成結果")
         message.setIcon(QMessageBox.Icon.Information)
         message.setText(headline)
         message.setDetailedText("\n".join(lines))
@@ -2218,6 +2429,13 @@ class MainWindow(QMainWindow):
                 self._set_status_message("PDF結合の終了を待ち切れませんでした", error=True)
                 event.ignore()
                 return
+        if self._image_to_pdf_worker_thread is not None:
+            self._request_image_to_pdf_cancel()
+            self._image_to_pdf_worker_thread.quit()
+            if not self._image_to_pdf_worker_thread.wait(5000):
+                self._set_status_message("画像PDF作成の終了を待ち切れませんでした", error=True)
+                event.ignore()
+                return
         for index in range(len(self._documents) - 1, -1, -1):
             if not self.close_document_at(index):
                 event.ignore()
@@ -2290,9 +2508,7 @@ class MainWindow(QMainWindow):
         document = self._current_document()
         document_selection = bool(document and document.view.selected_text)
         mutation_blocked = bool(document and document.mutation_in_progress)
-        background_pdf_operation = bool(
-            self._split_in_progress_session_id is not None or self._merge_worker_thread is not None
-        )
+        background_pdf_operation = self._background_pdf_operation_in_progress()
         if document is not None:
             document.view.set_page_reordering_enabled(
                 not document.session.is_saving and not document.mutation_in_progress
@@ -2356,6 +2572,7 @@ class MainWindow(QMainWindow):
             )
         )
         self.merge_pdfs_action.setEnabled(not background_pdf_operation)
+        self.image_to_pdf_action.setEnabled(not background_pdf_operation)
         self.insert_pages_action.setEnabled(
             bool(document and not document.session.is_saving and not document.mutation_in_progress)
         )
@@ -2380,6 +2597,13 @@ class MainWindow(QMainWindow):
             self._search_toolbar.hide()
         self._update_overlay_geometry()
         self._apply_search_inset()
+
+    def _background_pdf_operation_in_progress(self) -> bool:
+        return bool(
+            self._split_in_progress_session_id is not None
+            or self._merge_worker_thread is not None
+            or self._image_to_pdf_worker_thread is not None
+        )
 
     def _on_current_tab_changed(self, _index: int) -> None:
         document = self._current_document()

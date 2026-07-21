@@ -7311,3 +7311,40 @@ def test_main_window_undo_action_prefers_line_edit_history(
     assert command.redo_calls == 0
     assert document.session.operation_history == ["Document edit"]
     assert recovery_service.write_calls == []
+
+
+def test_main_window_image_to_pdf_action_is_available_without_document(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+        recovery_service=FakeRecoveryService(),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    assert window.image_to_pdf_action.isEnabled() is True
+
+
+def test_main_window_disables_image_to_pdf_during_background_pdf_operation(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+        recovery_service=FakeRecoveryService(),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    window._merge_worker_thread = QThread(window)
+    try:
+        window._update_actions()
+        assert window.image_to_pdf_action.isEnabled() is False
+        assert window.merge_pdfs_action.isEnabled() is False
+    finally:
+        window._merge_worker_thread = None
+        window._update_actions()

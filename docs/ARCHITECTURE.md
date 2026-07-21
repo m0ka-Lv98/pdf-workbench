@@ -150,9 +150,9 @@ working copy を直接 mutate する専用サービス。Issue #7では、select
 - crop execute では target box を selected page の direct `/CropBox` として materialize し、undo では元の direct presence/value を復元する。対話型 drag overlay は導入せず、現在は numeric dialog だけを提供する
 - crop candidate validation では changed page の effective CropBox と rendered dimensions を検証しつつ、MediaBox、rotation、resources、contents、annotations、document-level metadata が不変であることを確認する
 
-### PdfPageExportService / PdfPageSplitService / PdfMergeService
+### PdfPageExportService / PdfPageSplitService / PdfMergeService / ImageToPdfService
 
-現在の文書または選択された入力PDFから別PDFを作る非破壊exportを担当する。selected pages / page range extraction は `PdfPageExportService` が単一outputとして扱い、PDF split は `PdfPageSplitService` が同じ export service を複数outputへ逐次適用する。PDF merge は `PdfMergeService` が複数入力を1つの独立outputへ逐次copyする。image-to-PDF は別Phaseに残す。
+現在の文書、選択された入力PDF、または明示的に選んだ画像から別PDFを作る非破壊exportを担当する。selected pages / page range extraction は `PdfPageExportService` が単一outputとして扱い、PDF split は `PdfPageSplitService` が同じ export service を複数outputへ逐次適用する。PDF merge は `PdfMergeService` が複数入力を1つの独立outputへ逐次copyする。Image-to-PDF は `ImageToPdfService` が Pillow で検査した画像入力を新しい独立PDFへ逐次変換する。
 
 - `PageExtractionPlan` は Qt 非依存のdomain objectで、正の page count、昇順・重複なし・範囲内の source page indexes、source-to-output mapping を検証する
 - range parser は UI の 1-based `1-3, 5, 8-10` 構文を 0-based ascending unique tuple へ正規化し、空入力、0以下、page count 超過、逆順range、不正形式、非ASCII数字を拒否する
@@ -179,6 +179,14 @@ working copy を直接 mutate する専用サービス。Issue #7では、select
 - Merge用validationでは `PdfDocumentValidator` に全output page indexを渡し、PDFiumで1ページずつrenderしてbitmap/PIL imageを各iterationでcloseする。render imageをlistへ保持しない
 - mergeでも `TargetSnapshot` をpreflightとreplace直前に確認し、overwrite offの既存target、snapshot後のtarget作成/変更、managed workspace配下出力を拒否する
 - merge worker はGUI threadをブロックせず、progress/cancel/result summaryをQt signalで返す。Split workerとは同時実行しない。window close時はcancel tokenをsetし、GUI threadから`QThread.quit()`を明示してbounded waitし、終了できない場合はcloseを拒否する
+- `ImageToPdfPlan` は Qt 非依存のdomain objectで、resolved unique image inputs、frame mapping、output `.pdf` invariant、page size mode、orientation、margins、scaling、transparency policy を検証する
+- Image-to-PDF は JPEG / PNG / TIFF / BMP / WebP を Pillow の実formatで判定し、multi-page TIFF は各frameをページ化する。animated GIF / animated WebP / APNG / static GIF、未対応format、拡張子と実formatの不整合は fail-closed にする
+- Image-to-PDF geometry は EXIF orientation 後のpixel sizeとDPIから作り、Image Fit / A4 / Letter / Custom、auto orientation、fit / fill / actual size、mm marginを point 単位の page box と draw matrix へ変換する
+- transparency は白/黒flattenまたは soft mask で保持する。ICC付きCMYKはsRGBへ変換し、ICCなしCMYKやNaN / infinite pixelを含むfloating imageは拒否する
+- Image-to-PDF service はsource revisionをdialog時点で固定し、candidate作成前後とreplace直前に再確認する。targetは `TargetSnapshot` をpreflightとreplace直前に確認し、managed workspace配下出力を拒否する
+- Image-to-PDF candidate はtarget directoryに作成し、pikepdf reopen、root構造検証、全ページPDFium render validation、source revision再確認、target snapshot再確認を通過した場合だけ `os.replace()` でatomicに置換する
+- Image-to-PDF worker はGUI threadをブロックせず、progress/cancel/result summaryをQt signalで返す。Split / Merge / Image-to-PDF は同時実行しない。window close時はcancel tokenをsetし、GUI threadから`QThread.quit()`を明示してbounded waitし、終了できない場合はcloseを拒否する
+- Image-to-PDF は現在開いている document、working copy、selection、current page、dirty state、command history を変更しない。OCR、既存PDFへの画像挿入、metadata/bookmark/attachment生成、Undo / Redo command化は別scopeとする
 
 ### SessionRecoveryService
 
