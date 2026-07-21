@@ -3145,7 +3145,13 @@ def test_main_window_resolve_crop_context_rejects_document_changes(
     )
     assert window._resolve_crop_pages_document(replace(context, page_count=3)) is None
     assert window._resolve_crop_pages_document(replace(context, selected_page_indexes=(1,))) is None
-    assert window._resolve_crop_pages_document(replace(context, current_page_index=1)) is None
+    stale_current_page_index = 1 - context.current_page_index
+    assert (
+        window._resolve_crop_pages_document(
+            replace(context, current_page_index=stale_current_page_index)
+        )
+        is None
+    )
 
     document.session.is_saving = True
     assert window._resolve_crop_pages_document(context) is None
