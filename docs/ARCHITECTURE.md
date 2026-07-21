@@ -167,14 +167,18 @@ working copy を直接 mutate する専用サービス。Issue #7では、select
 - overwrite off / on のどちらでも各targetの `TargetSnapshot` をbatch開始前に固定する。overwrite off ではsnapshot上の既存target衝突を global preflight failure とし、snapshot後に出現・変更したtargetは置換せず、そのoutputだけ failed として後続outputを継続する
 - source revision はbatch開始時に固定し、各output開始前と export service 内で再確認する。途中driftが見つかった場合は現在outputをfailed、残りをskippedにして、異なるsource revisionの混在output setを作らない
 - cancellation はGUI threadが所有するthread-safe cancel tokenでoutput間だけに観測し、worker threadのqueued slot処理には依存しない。進行中のatomic exportは中断せず、完了済みoutputは維持し、残りはcancelledとしてcopy可能なsummaryへ含める
-- `PdfMergePlan` は Qt 非依存のdomain objectで、2件以上のresolved unique input、positive page count、output path、source-to-output range mapping、metadata source policy、bookmark policy を検証する
+- `PdfMergePlan` は Qt 非依存のdomain objectで、2件以上のresolved unique input、positive page count、`.pdf` output path、source-to-output range mapping、metadata source policy、bookmark policy を検証する
 - merge は active document に依存しない独立exportで、現在開いているdirty working copyを暗黙に含めない。input listはdialogで明示的に選択・並べ替えたPDFだけを使う
-- merge service はsource revisionをbatch開始時に固定し、各sourceのsnapshot前、snapshot検証時、replace前に再確認する。処理中にsourceが変わった場合はcandidateを破棄してtargetを維持する
-- merge candidate はtarget directoryに作成し、各sourceは同時に1件だけsnapshot/openする。ページはpikepdf page/object copyで追加し、全ページrasterizeや複数source openは行わない
+- merge dialog はinput追加時のcanonical path、page count、fingerprint、SHAを保持し、OK時に全inputを再検査する。workerにはdialog時点のexpected source revisionsとtarget snapshotを渡し、service境界でmissing / extra / driftをfail-closedにする
+- merge service はsource revisionをdialog時点で固定し、各sourceのsnapshot前、snapshot検証時、replace前に再確認する。処理中にsourceが変わった場合はcandidateを破棄してtargetを維持する
+- merge candidate とsource snapshotはtarget directoryに作成し、source directoryへ一時ファイルを書かない。各sourceは同時に1件だけsnapshot/openし、処理後ただちにsnapshotを削除する。ページはpikepdf page/object copyで追加し、全ページrasterizeや複数source openは行わない
+- source snapshot cleanup failureは正常完了を拒否する。primary errorが既にある場合はprimary errorを維持し、cleanup failureをログへ残す
 - metadataは既定off。選択sourceから `/Title`、`/Author`、`/Subject`、`/Keywords`、`/Creator` だけをコピーし、Producer、日付、custom info、XMPはコピーしない
-- bookmarksは既定off。保持する場合は入力filenameごとのsynthetic top-level groupを作り、重複filenameは `(2)` のようにsuffixを付ける。ローカルGoTo destinationだけをoutput page indexへoffsetし、remote/file/action/JavaScript/Launchや解決不能destinationはfail-closedにする
+- bookmarksは既定off。保持する場合は入力filenameごとのsynthetic top-level groupを作り、重複filenameは `(2)` のようにsuffixを付ける。ローカルGoTo destinationだけをoutput page indexへoffsetし、source-local named destinationは明示destinationへ解決する。outputへname treeをコピーせず、remote/file/action/JavaScript/Launchや解決不能destinationはfail-closedにする
+- candidate validation はpage countだけでなく、input order、source-to-output mapping、content、resources、MediaBox / CropBox / TrimBox / BleedBox / ArtBox、rotation、安全な annotationsとannotation `/P`、metadata policy、bookmark hierarchy / destination、unsupported root entriesを独立再オープン後に検証する
+- Merge用validationでは `PdfDocumentValidator` に全output page indexを渡し、PDFiumで1ページずつrenderしてbitmap/PIL imageを各iterationでcloseする。render imageをlistへ保持しない
 - mergeでも `TargetSnapshot` をpreflightとreplace直前に確認し、overwrite offの既存target、snapshot後のtarget作成/変更、managed workspace配下出力を拒否する
-- merge worker はGUI threadをブロックせず、progress/cancel/result summaryをQt signalで返す。Split workerとは同時実行しない
+- merge worker はGUI threadをブロックせず、progress/cancel/result summaryをQt signalで返す。Split workerとは同時実行しない。window close時はcancel tokenをsetし、GUI threadから`QThread.quit()`を明示してbounded waitし、終了できない場合はcloseを拒否する
 
 ### SessionRecoveryService
 

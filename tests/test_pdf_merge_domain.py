@@ -44,6 +44,14 @@ def test_merge_plan_rejects_output_matching_input(tmp_path: Path) -> None:
         build_pdf_merge_plan((first, second), first.path)
 
 
+def test_merge_plan_rejects_non_pdf_output_path(tmp_path: Path) -> None:
+    first = merge_input(tmp_path / "a.pdf", 1)
+    second = merge_input(tmp_path / "b.pdf", 1)
+
+    with pytest.raises(ValueError, match="PDF"):
+        build_pdf_merge_plan((first, second), tmp_path / "merged.txt")
+
+
 def test_merge_plan_requires_selected_metadata_source_to_be_input(tmp_path: Path) -> None:
     first = merge_input(tmp_path / "a.pdf", 1)
     second = merge_input(tmp_path / "b.pdf", 1)

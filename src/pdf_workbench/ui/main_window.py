@@ -288,6 +288,8 @@ class MergePdfWorker(QObject):
         service: PdfMergeService,
         plan: PdfMergePlan,
         overwrite: bool,
+        expected_source_revisions: dict[Path, SourcePdfRevision],
+        expected_target_snapshot: TargetSnapshot,
         is_managed_path: Callable[[Path], bool],
         cancel_event: Event,
     ) -> None:
@@ -295,6 +297,8 @@ class MergePdfWorker(QObject):
         self._service = service
         self._plan = plan
         self._overwrite = overwrite
+        self._expected_source_revisions = expected_source_revisions
+        self._expected_target_snapshot = expected_target_snapshot
         self._is_managed_path = is_managed_path
         self._cancel_event = cancel_event
 
@@ -304,6 +308,8 @@ class MergePdfWorker(QObject):
             result = self._service.merge_pdfs(
                 self._plan,
                 overwrite=self._overwrite,
+                expected_source_revisions=self._expected_source_revisions,
+                expected_target_snapshot=self._expected_target_snapshot,
                 is_managed_path=self._is_managed_path,
                 should_cancel=self._cancel_event.is_set,
                 progress_callback=self.progress.emit,
@@ -1190,7 +1196,9 @@ class MainWindow(QMainWindow):
         if self._merge_worker_thread is not None or self._split_in_progress_session_id is not None:
             return
         dialog = MergePdfsDialog(
-            input_reader=self._pdf_merge_service.read_merge_input,
+            input_reader=self._pdf_merge_service.inspect_merge_input,
+            target_snapshot_reader=TargetSnapshot.capture,
+            is_managed_path=self._workspace_manager.contains_managed_path,
             default_output_directory=Path.home(),
             parent=self,
         )
@@ -1215,6 +1223,8 @@ class MainWindow(QMainWindow):
             service=self._pdf_merge_service,
             plan=result.plan,
             overwrite=result.overwrite,
+            expected_source_revisions=result.expected_source_revisions,
+            expected_target_snapshot=result.expected_target_snapshot,
             is_managed_path=self._workspace_manager.contains_managed_path,
             cancel_event=cancel_event,
         )
@@ -2203,6 +2213,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:
         if self._merge_worker_thread is not None:
             self._request_merge_cancel()
+            self._merge_worker_thread.quit()
             if not self._merge_worker_thread.wait(5000):
                 self._set_status_message("PDF結合の終了を待ち切れませんでした", error=True)
                 event.ignore()

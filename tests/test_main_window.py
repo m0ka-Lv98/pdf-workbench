@@ -53,7 +53,14 @@ from pdf_workbench.domain.page_insertion import SourcePageSelection
 from pdf_workbench.domain.page_split import build_max_pages_split_plan
 from pdf_workbench.domain.pdf_merge import PdfMergeInput, build_pdf_merge_plan
 from pdf_workbench.services.page_coordinates import PageMetadata
-from pdf_workbench.services.pdf_merge import PdfMergeResult, PdfMergeService
+from pdf_workbench.services.pdf_merge import (
+    InspectedPdfMergeInput,
+    PdfMergeCancelled,
+    PdfMergeProgress,
+    PdfMergeResult,
+    PdfMergeService,
+    PdfMergeStage,
+)
 from pdf_workbench.services.pdf_page_export import PageExtractionResult, PdfPageExportService
 from pdf_workbench.services.pdf_page_mutation import (
     PdfPageMutationError,
@@ -362,12 +369,22 @@ class FakePdfMergeService(PdfMergeService):
     def __init__(self) -> None:
         super().__init__()
         self.read_inputs: list[Path] = []
-        self.calls: list[tuple[object, bool]] = []
+        self.calls: list[tuple[object, bool, object, object]] = []
 
-    def read_merge_input(self, path: Path) -> PdfMergeInput:
+    def inspect_merge_input(self, path: Path) -> InspectedPdfMergeInput:
         resolved = path.expanduser().resolve()
         self.read_inputs.append(resolved)
-        return PdfMergeInput(resolved, 1, resolved.name)
+        if not resolved.exists():
+            resolved.write_bytes(b"%PDF fake")
+        return InspectedPdfMergeInput(
+            merge_input=PdfMergeInput(resolved, 1, resolved.name),
+            source_revision=SourcePdfRevision(
+                resolved_path=resolved,
+                fingerprint=FileFingerprint.from_path(resolved),
+                sha256="1" * 64,
+                page_count=1,
+            ),
+        )
 
     def merge_pdfs(
         self,
@@ -380,9 +397,9 @@ class FakePdfMergeService(PdfMergeService):
         should_cancel: Callable[[], bool] | None = None,
         progress_callback: object = None,
     ) -> PdfMergeResult:
-        del expected_source_revisions, expected_target_snapshot, is_managed_path
+        del is_managed_path
         del should_cancel, progress_callback
-        self.calls.append((plan, overwrite))
+        self.calls.append((plan, overwrite, expected_source_revisions, expected_target_snapshot))
         assert hasattr(plan, "output_path")
         output_path = plan.output_path
         output_path.write_bytes(b"%PDF-1.7\n% fake merged PDF\n")
@@ -396,6 +413,62 @@ class FakePdfMergeService(PdfMergeService):
             inputs=(),
             merged_at=datetime.now(UTC),
         )
+
+
+class BlockingPdfMergeService(FakePdfMergeService):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.progress_events: list[PdfMergeProgress] = []
+
+    def merge_pdfs(
+        self,
+        plan: object,
+        *,
+        overwrite: bool = False,
+        expected_source_revisions: object = None,
+        expected_target_snapshot: object = None,
+        is_managed_path: Callable[[Path], bool] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+        progress_callback: Callable[[PdfMergeProgress], None] | None = None,
+    ) -> PdfMergeResult:
+        assert hasattr(plan, "inputs")
+        merge_plan = plan
+        self.calls.append(
+            (merge_plan, overwrite, expected_source_revisions, expected_target_snapshot)
+        )
+        self.started.set()
+        if progress_callback is not None:
+            progress = PdfMergeProgress(
+                stage=PdfMergeStage.IMPORTING,
+                input_number=1,
+                input_count=len(merge_plan.inputs),
+                filename=merge_plan.inputs[0].label,
+                source_page_count=merge_plan.inputs[0].page_count,
+                completed_output_pages=0,
+                total_output_pages=merge_plan.total_page_count,
+                message="importing",
+            )
+            self.progress_events.append(progress)
+            progress_callback(progress)
+        self.release.wait(timeout=5)
+        if should_cancel is not None and should_cancel():
+            raise PdfMergeCancelled("PDF結合をキャンセルしました")
+        return super().merge_pdfs(
+            merge_plan,
+            overwrite=overwrite,
+            expected_source_revisions=expected_source_revisions,
+            expected_target_snapshot=expected_target_snapshot,
+            is_managed_path=is_managed_path,
+            should_cancel=should_cancel,
+            progress_callback=progress_callback,
+        )
+
+
+class FailingPdfMergeService(FakePdfMergeService):
+    def merge_pdfs(self, *_args: object, **_kwargs: object) -> PdfMergeResult:
+        raise RuntimeError("merge boom")
 
 
 class BlockingPageSplitService(FakePageSplitService):
@@ -745,9 +818,18 @@ def test_main_window_merge_starts_from_dialog_result_without_active_document(
     show_window(qtbot, window)
     first = PdfMergeInput((tmp_path / "a.pdf").resolve(), 1, "a.pdf")
     second = PdfMergeInput((tmp_path / "b.pdf").resolve(), 2, "b.pdf")
+    expected_revision = SourcePdfRevision(
+        resolved_path=first.path,
+        fingerprint=FileFingerprint(size_bytes=1, modified_time_ns=1),
+        sha256="2" * 64,
+        page_count=1,
+    )
+    target_snapshot = TargetSnapshot.capture(tmp_path / "merged.pdf")
     result = MergePdfsDialogResult(
         plan=build_pdf_merge_plan((first, second), tmp_path / "merged.pdf"),
         overwrite=True,
+        expected_source_revisions={first.path: expected_revision},
+        expected_target_snapshot=target_snapshot,
     )
     started: list[MergePdfsDialogResult] = []
 
@@ -766,6 +848,126 @@ def test_main_window_merge_starts_from_dialog_result_without_active_document(
     window._merge_pdfs()
 
     assert started == [result]
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
+def _merge_dialog_result_for_thread_tests(tmp_path: Path) -> MergePdfsDialogResult:
+    first = PdfMergeInput((tmp_path / "thread-a.pdf").resolve(), 1, "thread-a.pdf")
+    second = PdfMergeInput((tmp_path / "thread-b.pdf").resolve(), 1, "thread-b.pdf")
+    for path in (first.path, second.path):
+        path.write_bytes(b"%PDF fake")
+    revisions = {
+        item.path: SourcePdfRevision(
+            resolved_path=item.path,
+            fingerprint=FileFingerprint.from_path(item.path),
+            sha256=str(index) * 64,
+            page_count=item.page_count,
+        )
+        for index, item in enumerate((first, second), start=3)
+    }
+    return MergePdfsDialogResult(
+        plan=build_pdf_merge_plan((first, second), tmp_path / "thread-merged.pdf"),
+        overwrite=True,
+        expected_source_revisions=revisions,
+        expected_target_snapshot=TargetSnapshot.capture(tmp_path / "thread-merged.pdf"),
+    )
+
+
+def test_main_window_merge_actual_qthread_success_cleans_up(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    merge_service = BlockingPdfMergeService()
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+        pdf_merge_service=merge_service,
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    monkeypatch.setattr(window, "_show_merge_result_summary", lambda _result: None)
+
+    result = _merge_dialog_result_for_thread_tests(tmp_path)
+    window._start_merge_worker(result)
+    qtbot.waitUntil(merge_service.started.is_set)
+    merge_service.release.set()
+
+    qtbot.waitUntil(lambda: window._merge_worker_thread is None)
+
+    assert merge_service.calls
+    assert merge_service.calls[-1][2] == result.expected_source_revisions
+    assert merge_service.calls[-1][3] == result.expected_target_snapshot
+    assert window._merge_worker is None
+    assert window._merge_cancel_event is None
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
+def test_main_window_merge_actual_qthread_cancel_cleans_up(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    merge_service = BlockingPdfMergeService()
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+        pdf_merge_service=merge_service,
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    errors: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        window,
+        "_report_error",
+        lambda title, message: errors.append((title, message)),
+    )
+
+    window._start_merge_worker(_merge_dialog_result_for_thread_tests(tmp_path))
+    qtbot.waitUntil(merge_service.started.is_set)
+    window._request_merge_cancel()
+    merge_service.release.set()
+
+    qtbot.waitUntil(lambda: window._merge_worker_thread is None)
+
+    assert errors
+    assert "キャンセル" in errors[0][0]
+    assert window._merge_worker is None
+    assert window._merge_cancel_event is None
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
+def test_main_window_merge_actual_qthread_failure_cleans_up(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    merge_service = FailingPdfMergeService()
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+        pdf_merge_service=merge_service,
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    errors: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        window,
+        "_report_error",
+        lambda title, message: errors.append((title, message)),
+    )
+
+    window._start_merge_worker(_merge_dialog_result_for_thread_tests(tmp_path))
+
+    qtbot.waitUntil(lambda: window._merge_worker_thread is None)
+
+    assert errors
+    assert "失敗" in errors[0][0]
+    assert window._merge_worker is None
+    assert window._merge_cancel_event is None
     window.close()
     qtbot.waitUntil(lambda: not window.isVisible())
 

@@ -5,7 +5,8 @@ import os
 import shutil
 import stat
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -26,7 +27,15 @@ from pdf_workbench.services.pdf_document_validator import (
     PdfDocumentValidator,
 )
 from pdf_workbench.services.pdf_page_import import PdfPageImportInspector
-from pdf_workbench.services.pdf_page_mutation import PdfPageMutationService, SourcePdfRevision
+from pdf_workbench.services.pdf_page_mutation import (
+    AnnotationParentState,
+    PdfAnnotationStructureSnapshot,
+    PdfDocumentStructureSnapshot,
+    PdfPageMutationError,
+    PdfPageMutationService,
+    PdfPageStructureSnapshot,
+    SourcePdfRevision,
+)
 from pdf_workbench.services.pdf_save_service import TargetChangedError, TargetSnapshot
 
 logger = logging.getLogger(__name__)
@@ -97,6 +106,38 @@ class PdfMergeResult:
     merged_at: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class InspectedPdfMergeInput:
+    merge_input: PdfMergeInput
+    source_revision: SourcePdfRevision
+
+
+@dataclass(frozen=True, slots=True)
+class PdfMergeExpectedContext:
+    source_revisions: Mapping[Path, SourcePdfRevision]
+    target_snapshot: TargetSnapshot
+
+
+@dataclass(frozen=True, slots=True)
+class PdfMergeAnnotationSnapshot:
+    subtype: str
+    rect: tuple[float, float, float, float]
+    has_appearance: bool
+    appearance_fingerprint: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class PdfMergePageSnapshot:
+    source_path: Path
+    source_page_index: int
+    output_page_index: int
+    content_fingerprint: str
+    resources_fingerprint: str
+    boxes: object
+    effective_rotation: int
+    annotations: tuple[PdfMergeAnnotationSnapshot, ...]
+
+
 class PdfMergeService:
     def __init__(
         self,
@@ -129,12 +170,24 @@ class PdfMergeService:
             label=resolved_path.name,
         )
 
+    def inspect_merge_input(self, path: Path) -> InspectedPdfMergeInput:
+        resolved_path = path.expanduser().resolve()
+        revision = self.read_source_pdf_revision(resolved_path)
+        return InspectedPdfMergeInput(
+            merge_input=PdfMergeInput(
+                path=resolved_path,
+                page_count=revision.page_count,
+                label=resolved_path.name,
+            ),
+            source_revision=revision,
+        )
+
     def merge_pdfs(
         self,
         plan: PdfMergePlan,
         *,
         overwrite: bool = False,
-        expected_source_revisions: dict[Path, SourcePdfRevision] | None = None,
+        expected_source_revisions: Mapping[Path, SourcePdfRevision] | None = None,
         expected_target_snapshot: TargetSnapshot | None = None,
         is_managed_path: Callable[[Path], bool] | None = None,
         should_cancel: Callable[[], bool] | None = None,
@@ -143,6 +196,7 @@ class PdfMergeService:
         candidate_path: Path | None = None
         source_snapshot_path: Path | None = None
         primary_error: BaseException | None = None
+        expected_pages: list[PdfMergePageSnapshot] = []
         merged_at = datetime.now(UTC)
         try:
             self._check_cancelled(should_cancel)
@@ -178,11 +232,15 @@ class PdfMergeService:
                         input_item.path,
                         source_revisions[input_item.path],
                     )
-                    source_snapshot_path = self._create_source_snapshot(input_item.path)
+                    source_snapshot_path = self._create_source_snapshot(
+                        input_item.path,
+                        snapshot_directory=plan.output_path.parent,
+                    )
                     self._ensure_snapshot_matches_revision(
                         source_snapshot_path,
                         source_revisions[input_item.path],
                     )
+                    source_operation_error: BaseException | None = None
                     try:
                         self._check_cancelled(should_cancel)
                         self._emit_progress(
@@ -206,7 +264,19 @@ class PdfMergeService:
                             ):
                                 metadata_source_docinfo = self._extract_allowed_metadata(source_pdf)
                             output_start = len(output_pdf.pages)
+                            source_structure = self._mutation_service.snapshot_document_structure(
+                                source_snapshot_path
+                            )
                             for page in source_pdf.pages:
+                                source_page_index = len(output_pdf.pages) - output_start
+                                expected_pages.append(
+                                    self._merge_page_snapshot(
+                                        source_structure.pages[source_page_index],
+                                        source_path=input_item.path,
+                                        source_page_index=source_page_index,
+                                        output_page_index=len(output_pdf.pages),
+                                    )
+                                )
                                 output_pdf.pages.append(page)
                                 self._import_inspector.rewrite_annotation_parents(
                                     output_pdf.pages[-1]
@@ -220,11 +290,24 @@ class PdfMergeService:
                                     group_title=source_group_titles[input_item.path],
                                     output_start_index=output_start,
                                 )
+                    except BaseException as exc:
+                        source_operation_error = exc
+                        raise
                     finally:
-                        self._cleanup_source_snapshot(
-                            source_snapshot_path,
-                            primary_error=primary_error,
-                        )
+                        try:
+                            self._cleanup_source_snapshot(
+                                source_snapshot_path,
+                                primary_error=source_operation_error,
+                            )
+                        except Exception as cleanup_exc:
+                            if source_operation_error is None:
+                                raise
+                            logger.warning(
+                                "Failed to cleanup source snapshot after primary error: "
+                                "primary_error=%s cleanup_error=%s",
+                                type(source_operation_error).__name__,
+                                cleanup_exc,
+                            )
                         source_snapshot_path = None
                 self._check_cancelled(should_cancel)
                 self._emit_progress(
@@ -248,7 +331,7 @@ class PdfMergeService:
                 )
                 output_pdf.save(candidate_path)
             self._fsync_file(candidate_path)
-            self._validate_candidate(plan, candidate_path)
+            self._validate_candidate(plan, candidate_path, expected_pages=tuple(expected_pages))
             for input_item in plan.inputs:
                 self._ensure_source_revision_unchanged(
                     input_item.path,
@@ -336,18 +419,30 @@ class PdfMergeService:
     def _read_and_validate_source_revisions(
         self,
         plan: PdfMergePlan,
-        expected_source_revisions: dict[Path, SourcePdfRevision] | None,
+        expected_source_revisions: Mapping[Path, SourcePdfRevision] | None,
     ) -> dict[Path, SourcePdfRevision]:
+        expected_by_path: dict[Path, SourcePdfRevision] | None = None
+        plan_paths = {item.path for item in plan.inputs}
+        if expected_source_revisions is not None:
+            expected_by_path = {
+                path.expanduser().resolve(): revision
+                for path, revision in expected_source_revisions.items()
+            }
+            expected_paths = set(expected_by_path)
+            missing_paths = plan_paths - expected_paths
+            extra_paths = expected_paths - plan_paths
+            if missing_paths:
+                missing = ", ".join(sorted(path.name for path in missing_paths))
+                raise PdfMergeError(f"結合元PDFの期待revisionが不足しています: {missing}")
+            if extra_paths:
+                extra = ", ".join(sorted(path.name for path in extra_paths))
+                raise PdfMergeError(f"結合元PDFの期待revisionが余分です: {extra}")
         revisions: dict[Path, SourcePdfRevision] = {}
         for input_item in plan.inputs:
             revision = self.read_source_pdf_revision(input_item.path)
             if revision.page_count != input_item.page_count:
                 raise SourcePdfChangedError(f"{input_item.label} のページ数が変更されました")
-            expected_revision = (
-                expected_source_revisions.get(input_item.path)
-                if expected_source_revisions is not None
-                else None
-            )
+            expected_revision = expected_by_path[input_item.path] if expected_by_path else None
             if expected_revision is not None and revision != expected_revision:
                 raise SourcePdfChangedError(
                     f"{input_item.label} が変更されたため結合を中止しました"
@@ -399,24 +494,41 @@ class PdfMergeService:
         return Path(temp_name)
 
     @staticmethod
-    def _create_source_snapshot(source_path: Path) -> Path:
+    def _create_source_snapshot(source_path: Path, *, snapshot_directory: Path) -> Path:
         file_descriptor, temp_name = tempfile.mkstemp(
-            dir=source_path.parent,
+            dir=snapshot_directory,
             prefix=f".{source_path.stem}.",
             suffix=".merge-source.tmp.pdf",
         )
-        os.close(file_descriptor)
         snapshot_path = Path(temp_name)
-        shutil.copy2(source_path, snapshot_path)
+        try:
+            with os.fdopen(file_descriptor, "wb") as target:
+                with source_path.open("rb") as source:
+                    shutil.copyfileobj(source, target, length=1024 * 1024)
+                target.flush()
+                os.fsync(target.fileno())
+        except Exception:
+            with suppress(OSError):
+                os.close(file_descriptor)
+            with suppress(OSError):
+                snapshot_path.unlink()
+            raise
         return snapshot_path
 
-    def _validate_candidate(self, plan: PdfMergePlan, candidate_path: Path) -> None:
+    def _validate_candidate(
+        self,
+        plan: PdfMergePlan,
+        candidate_path: Path,
+        *,
+        expected_pages: tuple[PdfMergePageSnapshot, ...],
+    ) -> None:
         if not candidate_path.exists() or candidate_path.stat().st_size <= 0:
             raise PdfMergeError("結合候補PDFが作成されていません")
         try:
             self._validator.validate(
                 str(candidate_path),
                 expected_page_count=plan.total_page_count,
+                render_page_indexes=range(plan.total_page_count),
             )
         except PdfDocumentValidationError as exc:
             raise PdfMergeError(str(exc)) from exc
@@ -424,14 +536,134 @@ class PdfMergeService:
             with pikepdf.open(candidate_path) as pdf:
                 if len(pdf.pages) != plan.total_page_count:
                     raise PdfMergeError("結合候補PDFのページ数が一致しません")
-                root = pdf.Root
-                for key in ("/Names", "/AcroForm", "/PageLabels", "/Threads", "/OpenAction"):
-                    if key in root:
-                        raise PdfMergeError(f"結合候補PDFに未対応の{key}が残っています")
+                self._reject_unsupported_candidate_root(pdf)
+            candidate_structure = self._mutation_service.snapshot_document_structure(candidate_path)
+            self._validate_candidate_pages(plan, candidate_structure, expected_pages)
+            self._validate_candidate_metadata(plan, candidate_path)
+            self._validate_candidate_bookmarks(plan, candidate_path)
         except PdfMergeError:
             raise
+        except PdfPageMutationError as exc:
+            raise PdfMergeError(str(exc)) from exc
         except Exception as exc:
             raise PdfMergeError("結合候補PDFの構造検証に失敗しました") from exc
+
+    @staticmethod
+    def _reject_unsupported_candidate_root(pdf: pikepdf.Pdf) -> None:
+        root = pdf.Root
+        for key in (
+            "/Names",
+            "/AcroForm",
+            "/PageLabels",
+            "/Threads",
+            "/OpenAction",
+            "/StructTreeRoot",
+        ):
+            if key in root:
+                raise PdfMergeError(f"結合候補PDFに未対応の{key}が残っています")
+
+    def _validate_candidate_pages(
+        self,
+        plan: PdfMergePlan,
+        candidate_structure: PdfDocumentStructureSnapshot,
+        expected_pages: tuple[PdfMergePageSnapshot, ...],
+    ) -> None:
+        if len(expected_pages) != plan.total_page_count:
+            raise PdfMergeError("結合候補PDFのページ検証情報が不足しています")
+        if candidate_structure.page_count != plan.total_page_count:
+            raise PdfMergeError("結合候補PDFのページ数が一致しません")
+        for expected, actual_page in zip(
+            expected_pages,
+            candidate_structure.pages,
+            strict=True,
+        ):
+            actual = self._merge_page_snapshot(
+                actual_page,
+                source_path=expected.source_path,
+                source_page_index=expected.source_page_index,
+                output_page_index=expected.output_page_index,
+            )
+            if actual != expected:
+                raise PdfMergeError(
+                    f"結合候補PDFの{expected.output_page_index + 1}ページ目が"
+                    "結合元PDFと一致しません"
+                )
+            for annotation in actual_page.annotations:
+                if annotation.parent_state is not AnnotationParentState.POINTS_TO_OWN_PAGE:
+                    raise PdfMergeError(
+                        f"結合候補PDFの{expected.output_page_index + 1}ページ目の"
+                        "annotation /P が自身のページを参照していません"
+                    )
+
+    @staticmethod
+    def _merge_page_snapshot(
+        page: PdfPageStructureSnapshot,
+        *,
+        source_path: Path,
+        source_page_index: int,
+        output_page_index: int,
+    ) -> PdfMergePageSnapshot:
+        return PdfMergePageSnapshot(
+            source_path=source_path,
+            source_page_index=source_page_index,
+            output_page_index=output_page_index,
+            content_fingerprint=page.content_fingerprint,
+            resources_fingerprint=page.resources_fingerprint,
+            boxes=page.boxes,
+            effective_rotation=page.effective_rotation,
+            annotations=tuple(
+                PdfMergeService._merge_annotation_snapshot(annotation)
+                for annotation in page.annotations
+            ),
+        )
+
+    @staticmethod
+    def _merge_annotation_snapshot(
+        annotation: PdfAnnotationStructureSnapshot,
+    ) -> PdfMergeAnnotationSnapshot:
+        return PdfMergeAnnotationSnapshot(
+            subtype=annotation.subtype,
+            rect=annotation.rect,
+            has_appearance=annotation.has_appearance,
+            appearance_fingerprint=annotation.appearance_fingerprint,
+        )
+
+    def _validate_candidate_metadata(self, plan: PdfMergePlan, candidate_path: Path) -> None:
+        with pikepdf.open(candidate_path) as pdf:
+            docinfo = {str(key): str(value) for key, value in pdf.docinfo.items()}
+            if "/Metadata" in pdf.Root:
+                raise PdfMergeError("結合候補PDFにXMP metadataが残っています")
+        copied = {key: value for key, value in docinfo.items() if key in _COPIED_METADATA_KEYS}
+        if plan.metadata_policy is PdfMergeMetadataPolicy.NONE:
+            if copied:
+                raise PdfMergeError("結合候補PDFにsource metadataが残っています")
+            custom_keys = set(docinfo) - {"/Producer", "/CreationDate", "/ModDate"}
+            if custom_keys:
+                raise PdfMergeError("結合候補PDFにcustom metadataが残っています")
+            return
+        if plan.metadata_source_path is None:
+            raise PdfMergeError("metadata sourceが不正です")
+        with pikepdf.open(plan.metadata_source_path) as source_pdf:
+            expected = self._extract_allowed_metadata(source_pdf)
+        if copied != expected:
+            raise PdfMergeError("結合候補PDFのmetadataが選択元と一致しません")
+        custom_keys = set(docinfo) - set(_COPIED_METADATA_KEYS) - {"/Producer"}
+        if custom_keys:
+            raise PdfMergeError("結合候補PDFに未許可のmetadataが残っています")
+
+    def _validate_candidate_bookmarks(self, plan: PdfMergePlan, candidate_path: Path) -> None:
+        structure = self._mutation_service.snapshot_document_structure(candidate_path)
+        if structure.named_destinations:
+            raise PdfMergeError("結合候補PDFにnamed destinationが残っています")
+        if plan.bookmark_policy is PdfMergeBookmarkPolicy.NONE:
+            if structure.outlines:
+                raise PdfMergeError("結合候補PDFにbookmarkが残っています")
+            return
+        group_titles = self._unique_group_titles(plan.inputs)
+        expected_group_titles = tuple(group_titles[item.path] for item in plan.inputs)
+        actual_group_titles = tuple(item.title for item in structure.outlines)
+        if actual_group_titles != expected_group_titles[: len(actual_group_titles)]:
+            raise PdfMergeError("結合候補PDFのbookmark group順が一致しません")
 
     @staticmethod
     def _extract_allowed_metadata(pdf: pikepdf.Pdf) -> dict[str, str]:
@@ -454,10 +686,14 @@ class PdfMergeService:
         try:
             with source_pdf.open_outline() as source_outline:
                 page_objgen_to_index = self._page_objgen_to_index(source_pdf)
+                named_destinations = self._source_named_destinations(source_pdf)
                 copied_children = self._copy_outline_items(
                     source_outline.root,
                     output_start_index=output_start_index,
                     page_objgen_to_index=page_objgen_to_index,
+                    named_destinations=named_destinations,
+                    visited=set(),
+                    depth=0,
                 )
             if not copied_children:
                 return
@@ -476,14 +712,24 @@ class PdfMergeService:
         *,
         output_start_index: int,
         page_objgen_to_index: dict[tuple[int, int], int],
+        named_destinations: dict[str, object],
+        visited: set[int],
+        depth: int,
     ) -> list[pikepdf.OutlineItem]:
+        if depth > 64:
+            raise PdfMergeError("bookmark階層が深すぎるため結合できません")
         copied: list[pikepdf.OutlineItem] = []
         for item in items:
+            identity = id(item)
+            if identity in visited:
+                raise PdfMergeError("bookmark階層にcycleがあります")
+            visited.add(identity)
             destination = self._destination_from_outline_item(item)
             output_destination = self._offset_outline_destination(
                 destination,
                 output_start_index=output_start_index,
                 page_objgen_to_index=page_objgen_to_index,
+                named_destinations=named_destinations,
             )
             copied_item = pikepdf.OutlineItem(str(item.title), output_destination)
             copied_item.children.extend(
@@ -491,8 +737,12 @@ class PdfMergeService:
                     getattr(item, "children", []),
                     output_start_index=output_start_index,
                     page_objgen_to_index=page_objgen_to_index,
+                    named_destinations=named_destinations,
+                    visited=visited,
+                    depth=depth + 1,
                 )
             )
+            visited.remove(identity)
             copied.append(copied_item)
         return copied
 
@@ -516,6 +766,7 @@ class PdfMergeService:
         *,
         output_start_index: int,
         page_objgen_to_index: dict[tuple[int, int], int],
+        named_destinations: dict[str, object],
     ) -> pikepdf.Array | pikepdf.String | pikepdf.Name | int | None:
         if destination is None:
             raise PdfMergeError("解決できないbookmark destinationがあります")
@@ -541,10 +792,111 @@ class PdfMergeService:
                 raise PdfMergeError("入力PDF内で解決できないbookmark destinationがあります")
             copied = pikepdf.Array(destination)
             copied[0] = page_index + output_start_index
+            self._validate_destination_array(copied)
             return copied
         if isinstance(destination, (pikepdf.String, pikepdf.Name)):
-            raise PdfMergeError("named destinationは明示destinationへの解決が必要です")
+            name = str(destination)
+            if name not in named_destinations:
+                raise PdfMergeError("解決できないnamed destinationがあります")
+            return self._offset_outline_destination(
+                named_destinations[name],
+                output_start_index=output_start_index,
+                page_objgen_to_index=page_objgen_to_index,
+                named_destinations=named_destinations,
+            )
         raise PdfMergeError("未対応のbookmark destinationがあります")
+
+    @staticmethod
+    def _validate_destination_array(destination: pikepdf.Array) -> None:
+        if len(destination) < 2:
+            raise PdfMergeError("bookmark destinationが不正です")
+        destination_type = str(destination[1])
+        expected_lengths = {
+            "/Fit": 2,
+            "/FitB": 2,
+            "/FitH": 3,
+            "/FitBH": 3,
+            "/FitV": 3,
+            "/FitBV": 3,
+            "/FitR": 6,
+            "/XYZ": 5,
+        }
+        if destination_type not in expected_lengths:
+            raise PdfMergeError(f"{destination_type} bookmark destinationは未対応です")
+        if len(destination) != expected_lengths[destination_type]:
+            raise PdfMergeError("bookmark destinationのparameter数が不正です")
+
+    def _source_named_destinations(self, source_pdf: pikepdf.Pdf) -> dict[str, object]:
+        resolved: dict[str, object] = {}
+        legacy = source_pdf.Root.get("/Dests", None)
+        if legacy is not None:
+            legacy_dict = self._import_inspector.dereference(legacy)
+            if not isinstance(legacy_dict, pikepdf.Dictionary):
+                raise PdfMergeError("legacy Dests辞書が不正です")
+            for key, value in legacy_dict.items():
+                resolved[str(key)] = self._destination_value(value)
+        names = source_pdf.Root.get("/Names", None)
+        if names is None:
+            return resolved
+        names_dict = self._import_inspector.dereference(names)
+        if not isinstance(names_dict, pikepdf.Dictionary):
+            raise PdfMergeError("Names辞書が不正です")
+        dests = names_dict.get("/Dests", None)
+        if dests is None:
+            return resolved
+        self._collect_name_tree_dests(dests, resolved, visited=set(), depth=0)
+        return resolved
+
+    def _collect_name_tree_dests(
+        self,
+        node_object: object,
+        destinations: dict[str, object],
+        *,
+        visited: set[tuple[int, int]],
+        depth: int,
+    ) -> None:
+        if depth > 32:
+            raise PdfMergeError("named destination treeが深すぎます")
+        node = self._import_inspector.dereference(node_object)
+        if not isinstance(node, pikepdf.Dictionary):
+            raise PdfMergeError("named destination treeが不正です")
+        objgen = getattr(node, "objgen", None)
+        if isinstance(objgen, tuple) and objgen != (0, 0):
+            if objgen in visited:
+                raise PdfMergeError("named destination treeにcycleがあります")
+            visited.add(objgen)
+        names = node.get("/Names", None)
+        if names is not None:
+            names_array = self._import_inspector.dereference(names)
+            if not isinstance(names_array, pikepdf.Array) or len(names_array) % 2 != 0:
+                raise PdfMergeError("named destination treeのNames配列が不正です")
+            for index in range(0, len(names_array), 2):
+                name_object = names_array[index]
+                if not isinstance(name_object, (pikepdf.String, pikepdf.Name)):
+                    raise PdfMergeError("named destination名が不正です")
+                destinations[str(name_object)] = self._destination_value(names_array[index + 1])
+        kids = node.get("/Kids", None)
+        if kids is not None:
+            kids_array = self._import_inspector.dereference(kids)
+            if not isinstance(kids_array, pikepdf.Array):
+                raise PdfMergeError("named destination treeのKids配列が不正です")
+            for kid in kids_array:
+                self._collect_name_tree_dests(
+                    kid,
+                    destinations,
+                    visited=visited,
+                    depth=depth + 1,
+                )
+        if isinstance(objgen, tuple) and objgen != (0, 0):
+            visited.remove(objgen)
+
+    def _destination_value(self, value: object) -> object:
+        destination = self._import_inspector.dereference(value)
+        if isinstance(destination, pikepdf.Dictionary):
+            destination = destination.get("/D", None)
+        if destination is None:
+            raise PdfMergeError("named destinationの値が不正です")
+        return destination
 
     @staticmethod
     def _page_objgen_to_index(pdf: pikepdf.Pdf) -> dict[tuple[int, int], int]:
@@ -703,11 +1055,9 @@ class PdfMergeService:
             snapshot_path.unlink()
         except OSError as exc:
             if primary_error is None:
-                logger.warning(
-                    "Failed to remove merge source snapshot: %s (%s)",
-                    snapshot_path,
-                    exc,
-                )
+                raise PdfMergeError(
+                    f"結合元PDF snapshotを削除できませんでした: {snapshot_path}"
+                ) from exc
             else:
                 logger.warning(
                     "Failed to remove merge source snapshot after error: snapshot=%s "

@@ -24,17 +24,21 @@ from PySide6.QtWidgets import (
 
 from pdf_workbench.domain.pdf_merge import (
     PdfMergeBookmarkPolicy,
-    PdfMergeInput,
     PdfMergeMetadataPolicy,
     PdfMergePlan,
     build_pdf_merge_plan,
 )
+from pdf_workbench.services.pdf_merge import InspectedPdfMergeInput, SourcePdfChangedError
+from pdf_workbench.services.pdf_page_mutation import SourcePdfRevision
+from pdf_workbench.services.pdf_save_service import TargetSnapshot
 
 
 @dataclass(frozen=True, slots=True)
 class MergePdfsDialogResult:
     plan: PdfMergePlan
     overwrite: bool
+    expected_source_revisions: dict[Path, SourcePdfRevision]
+    expected_target_snapshot: TargetSnapshot
 
 
 class MergeInputListWidget(QListWidget):
@@ -61,7 +65,9 @@ class MergePdfsDialog(QDialog):
     def __init__(
         self,
         *,
-        input_reader: Callable[[Path], PdfMergeInput],
+        input_reader: Callable[[Path], InspectedPdfMergeInput],
+        target_snapshot_reader: Callable[[Path], TargetSnapshot] = TargetSnapshot.capture,
+        is_managed_path: Callable[[Path], bool] | None = None,
         default_output_directory: Path,
         parent: QWidget | None = None,
     ) -> None:
@@ -69,6 +75,8 @@ class MergePdfsDialog(QDialog):
         self.setWindowTitle("PDFを結合")
         self.setModal(True)
         self._input_reader = input_reader
+        self._target_snapshot_reader = target_snapshot_reader
+        self._is_managed_path = is_managed_path
         self._dialog_result: MergePdfsDialogResult | None = None
 
         root = QVBoxLayout(self)
@@ -171,12 +179,16 @@ class MergePdfsDialog(QDialog):
 
     def add_inputs(self, paths: tuple[Path, ...]) -> None:
         rejected: list[str] = []
-        existing_paths = {item.path for item in self._current_inputs()}
+        existing_paths = {item.merge_input.path for item in self._current_inputs()}
         for path in paths:
             try:
-                merge_input = self._input_reader(path)
+                inspected_input = self._input_reader(path)
             except Exception as exc:
                 rejected.append(f"{path.name}: {exc}")
+                continue
+            merge_input = inspected_input.merge_input
+            if merge_input.page_count != inspected_input.source_revision.page_count:
+                rejected.append(f"{merge_input.label}: revisionとページ数が一致しません")
                 continue
             if merge_input.path in existing_paths:
                 rejected.append(f"{merge_input.label}: 既に追加されています")
@@ -186,7 +198,7 @@ class MergePdfsDialog(QDialog):
                 f"{merge_input.label} — {merge_input.page_count}ページ",
                 self.input_list,
             )
-            item.setData(Qt.ItemDataRole.UserRole, merge_input)
+            item.setData(Qt.ItemDataRole.UserRole, inspected_input)
         self.update_preview()
         if rejected:
             QMessageBox.warning(self, "追加できないPDF", "\n".join(rejected))
@@ -209,13 +221,26 @@ class MergePdfsDialog(QDialog):
             "PDF files (*.pdf)",
         )
         if filename:
-            self.output_path_edit.setText(str(Path(filename).expanduser().resolve()))
+            self.output_path_edit.setText(str(self._normalize_output_path(Path(filename))))
 
     def remove_selected_inputs(self) -> None:
+        selected_metadata_source = self._metadata_policy()[1]
+        removed_metadata_source = False
         for item in self.input_list.selectedItems():
+            inspected_input = item.data(Qt.ItemDataRole.UserRole)
+            if (
+                isinstance(inspected_input, InspectedPdfMergeInput)
+                and selected_metadata_source == inspected_input.merge_input.path
+            ):
+                removed_metadata_source = True
             row = self.input_list.row(item)
             self.input_list.takeItem(row)
         self.update_preview()
+        if removed_metadata_source:
+            self.metadata_combo.setCurrentIndex(0)
+            self.feedback_label.setText(
+                "Metadata取得元が削除されたため、引き継がない設定へ戻しました"
+            )
 
     def move_selected_input_up(self) -> None:
         self._move_selected_input(-1)
@@ -248,12 +273,22 @@ class MergePdfsDialog(QDialog):
     def accept_with_validation(self) -> None:
         try:
             plan = self._build_plan()
-        except (OSError, TypeError, ValueError) as exc:
+            inspected_inputs = self._current_inputs()
+            revisions = self._validated_current_revisions(inspected_inputs, plan)
+            if self._is_managed_path is not None and self._is_managed_path(plan.output_path):
+                raise ValueError("アプリの一時作業フォルダ内には出力できません")
+            target_snapshot = self._target_snapshot_reader(plan.output_path)
+            if target_snapshot.exists and not self.overwrite_checkbox.isChecked():
+                raise ValueError("出力先PDFが既に存在します")
+        except (OSError, TypeError, ValueError, SourcePdfChangedError) as exc:
+            self.feedback_label.setText(str(exc))
             QMessageBox.warning(self, "入力エラー", str(exc))
             return
         self._dialog_result = MergePdfsDialogResult(
             plan=plan,
             overwrite=self.overwrite_checkbox.isChecked(),
+            expected_source_revisions=revisions,
+            expected_target_snapshot=target_snapshot,
         )
         self.accept()
 
@@ -267,19 +302,20 @@ class MergePdfsDialog(QDialog):
         self.input_list.setCurrentRow(target_row)
         self.update_preview()
 
-    def _current_inputs(self) -> tuple[PdfMergeInput, ...]:
-        inputs: list[PdfMergeInput] = []
+    def _current_inputs(self) -> tuple[InspectedPdfMergeInput, ...]:
+        inputs: list[InspectedPdfMergeInput] = []
         for row in range(self.input_list.count()):
             item = self.input_list.item(row)
-            merge_input = item.data(Qt.ItemDataRole.UserRole)
-            if not isinstance(merge_input, PdfMergeInput):
+            inspected_input = item.data(Qt.ItemDataRole.UserRole)
+            if not isinstance(inspected_input, InspectedPdfMergeInput):
                 raise ValueError("結合入力の状態が不正です")
-            inputs.append(merge_input)
+            inputs.append(inspected_input)
         return tuple(inputs)
 
     def _build_plan(self) -> PdfMergePlan:
-        inputs = self._current_inputs()
-        output_path = Path(self.output_path_edit.text()).expanduser().resolve()
+        inspected_inputs = self._current_inputs()
+        inputs = tuple(item.merge_input for item in inspected_inputs)
+        output_path = self._normalize_output_path(Path(self.output_path_edit.text()))
         metadata_policy, metadata_source_path = self._metadata_policy()
         bookmark_policy = PdfMergeBookmarkPolicy(str(self.bookmark_combo.currentData()))
         return build_pdf_merge_plan(
@@ -302,9 +338,48 @@ class MergePdfsDialog(QDialog):
         self.metadata_combo.clear()
         self.metadata_combo.addItem("引き継がない", PdfMergeMetadataPolicy.NONE.value)
         for item in self._current_inputs():
-            self.metadata_combo.addItem(f"{item.label} から引き継ぐ", str(item.path))
+            self.metadata_combo.addItem(
+                f"{item.merge_input.label} から引き継ぐ",
+                str(item.merge_input.path),
+            )
         if current_data is not None:
             index = self.metadata_combo.findData(current_data)
             if index >= 0:
                 self.metadata_combo.setCurrentIndex(index)
         self.metadata_combo.blockSignals(False)
+
+    def _validated_current_revisions(
+        self,
+        inspected_inputs: tuple[InspectedPdfMergeInput, ...],
+        plan: PdfMergePlan,
+    ) -> dict[Path, SourcePdfRevision]:
+        refreshed: dict[Path, SourcePdfRevision] = {}
+        inspected_by_path = {item.merge_input.path: item for item in inspected_inputs}
+        if set(inspected_by_path) != {item.path for item in plan.inputs}:
+            raise ValueError("結合入力の状態が不正です")
+        for input_item in plan.inputs:
+            original = inspected_by_path[input_item.path]
+            refreshed_input = self._input_reader(input_item.path)
+            if refreshed_input.merge_input.path != input_item.path:
+                raise SourcePdfChangedError(f"{input_item.label} の場所が変更されました")
+            if refreshed_input.merge_input.page_count != input_item.page_count:
+                raise SourcePdfChangedError(f"{input_item.label} のページ数が変更されました")
+            if refreshed_input.source_revision != original.source_revision:
+                raise SourcePdfChangedError(
+                    f"{input_item.label} が変更されたため結合を開始できません"
+                )
+            refreshed[input_item.path] = original.source_revision
+        metadata_policy, metadata_source = self._metadata_policy()
+        if (
+            metadata_policy is PdfMergeMetadataPolicy.SELECTED_SOURCE
+            and metadata_source not in refreshed
+        ):
+            raise ValueError("Metadata取得元が結合入力に含まれていません")
+        return refreshed
+
+    @staticmethod
+    def _normalize_output_path(path: Path) -> Path:
+        resolved = path.expanduser().resolve()
+        if resolved.suffix:
+            return resolved
+        return resolved.with_suffix(".pdf")

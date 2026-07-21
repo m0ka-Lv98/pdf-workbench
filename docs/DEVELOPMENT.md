@@ -106,11 +106,13 @@ PDF-writing PR の最低限の回帰チェック:
 - PDF split では thread-safe cancel tokenを実QThread経路で検証し、queued worker slotへ依存せずoutput間で処理し、完了済みoutputを維持しつつ残りをcancelledとしてsummaryへ表示することを確認する
 - PDF split では source PDF、working copy、current tab/page、selection、dirty state、command historyを変更しないことをUI経路で確認する
 - PDF split では page/object copyを逐次実行し、QImage/Pixmapへのrasterize、並列export、複数candidate同時保持を行わないことを設計レビューとテストdoubleで確認する
-- PDF merge では `PdfMergePlan` をQt非依存でテストし、2件以上のresolved unique inputs、source-to-output range mapping、metadata source policy、bookmark policy、output/input同一path拒否を検証する
-- PDF merge では input validation、duplicate canonical path、managed workspace rejection、target snapshot drift、source revision drift、cancel、candidate/source snapshot cleanup、existing target preservation を確認する
-- PDF merge では output PDF の page count、input order、content、page boxes、rotation、安全な annotations を pikepdf reopen と PDFium render で検証する
-- PDF merge では metadata none / selected-source whitelist、bookmark none / grouped preserve、duplicate filename group suffix、unsupported bookmark action / named destination / document action の fail-closed を fixture で明示する
-- PDF merge では worker thread経路で progress、cancel、result summary、Splitとの同時実行ブロック、active documentを暗黙に含めないことを確認する
+- PDF merge では `PdfMergePlan` をQt非依存でテストし、2件以上のresolved unique inputs、source-to-output range mapping、metadata source policy、bookmark policy、output/input同一path拒否、output `.pdf` invariantを検証する
+- PDF merge では dialogで固定したsource revisions / target snapshotをworkerとserviceへ渡し、same-page-count content drift、missing / extra expected revision mapping、target creation raceを拒否することを確認する
+- PDF merge では input validation、duplicate canonical path、managed workspace rejection、target snapshot drift、source revision drift、cancel、source snapshot cleanup failure、candidate/source snapshot cleanup、existing target preservation を確認する
+- PDF merge では source snapshotをsource directoryではなくtarget directoryへ作り、read-only source directory、max concurrent source snapshot count = 1、snapshot fsync、cleanupをinstrumentationで確認する
+- PDF merge では output PDF の page count、input order、content、resources、page boxes、rotation、安全な annotations、annotation `/P` を pikepdf reopen と全ページ逐次PDFium renderで検証する
+- PDF merge では metadata none / selected-source whitelist、bookmark none / grouped preserve、duplicate filename group suffix、source-local named destinationの明示destination化、output name tree非保持、unsupported bookmark action / malformed destination / document action の fail-closed を fixture で明示する
+- PDF merge では worker thread経路で progress、cancel、failure、result summary、thread cleanup、window close cancel、Splitとの同時実行ブロック、active documentを暗黙に含めないことを確認する
 - page object と annotation object の独立性、annotation `/P` back-reference、raw/effective rotation、all page boxes の保存を検証する
 - execute / undo / redo の各経路で、pikepdf 再オープンと PDFium render を通して semantic restoration を確認する
 - form / widget page duplication は fail-closed とし、working copy hash が変わらないことを確認する

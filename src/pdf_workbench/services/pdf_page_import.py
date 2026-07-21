@@ -58,10 +58,10 @@ class PdfPageImportInspector:
             ("/PageLabels", "PageLabelsを含むPDFの結合は未対応です"),
             ("/Threads", "Article Threadsを含むPDFの結合は未対応です"),
             ("/OpenAction", "OpenActionを含むPDFの結合は未対応です"),
-            ("/Names", "Names辞書を含むPDFの結合は未対応です"),
         ):
             if key in root:
                 raise PdfPageImportError(message)
+        self._validate_names_dictionary(pdf, inspect_bookmarks=inspect_bookmarks)
         if inspect_bookmarks:
             self._reject_unsupported_outline_actions(pdf)
         page_objgens = {
@@ -163,6 +163,25 @@ class PdfPageImportInspector:
             children = getattr(item, "children", ())
             if children:
                 yield from self._walk_outline(children)
+
+    def _validate_names_dictionary(self, pdf: pikepdf.Pdf, *, inspect_bookmarks: bool) -> None:
+        root = pdf.Root
+        names_object = root.get("/Names", None)
+        if names_object is None:
+            return
+        names = self.dereference(names_object)
+        if not isinstance(names, pikepdf.Dictionary):
+            raise PdfPageImportError("Names辞書が不正です")
+        allowed_keys = {"/Dests"} if inspect_bookmarks else set()
+        for key_object in names:
+            key = str(key_object)
+            if key in allowed_keys:
+                continue
+            if key == "/EmbeddedFiles":
+                raise PdfPageImportError("添付ファイルを含むPDFの結合は未対応です")
+            if key == "/JavaScript":
+                raise PdfPageImportError("JavaScriptを含むPDFの結合は未対応です")
+            raise PdfPageImportError(f"未対応のNames entry {key} を含むPDFは結合できません")
 
     @staticmethod
     def dereference(value: Any) -> Any:

@@ -60,6 +60,12 @@ class PdfMergePlan:
         resolved_output = self.output_path.expanduser().resolve()
         if self.output_path != resolved_output:
             raise ValueError("output path must be resolved")
+        if not self.output_path.name:
+            raise ValueError("output path filename must not be empty")
+        if self.output_path.suffix.lower() != ".pdf":
+            raise ValueError("output path must be a PDF file")
+        if self.output_path.exists() and self.output_path.is_dir():
+            raise ValueError("output path must not be a directory")
         if len(self.inputs) < 2:
             raise ValueError("at least two input PDFs are required")
         seen_paths: set[Path] = set()
