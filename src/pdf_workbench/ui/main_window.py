@@ -38,6 +38,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -88,6 +89,13 @@ from pdf_workbench.domain.page_reorder import (
 )
 from pdf_workbench.domain.page_replacement import build_page_replacement_plan
 from pdf_workbench.domain.page_split import PageSplitPlan
+from pdf_workbench.domain.pdf_merge import PdfMergeBookmarkPolicy, PdfMergePlan
+from pdf_workbench.services.pdf_merge import (
+    PdfMergeCancelled,
+    PdfMergeProgress,
+    PdfMergeResult,
+    PdfMergeService,
+)
 from pdf_workbench.services.pdf_page_export import (
     PdfPageExportError,
     PdfPageExportService,
@@ -131,6 +139,7 @@ from pdf_workbench.ui.widgets.insert_pages_dialog import (
     InsertPagesDialog,
     InsertPagesDialogResult,
 )
+from pdf_workbench.ui.widgets.merge_pdfs_dialog import MergePdfsDialog, MergePdfsDialogResult
 from pdf_workbench.ui.widgets.replace_pages_dialog import (
     ReplacePagesDialog,
     ReplacePagesDialogResult,
@@ -266,6 +275,56 @@ class SplitPdfWorker(QObject):
             self.finished.emit()
 
 
+class MergePdfWorker(QObject):
+    progress = Signal(object)
+    succeeded = Signal(object)
+    cancelled = Signal(str)
+    failed = Signal(str)
+    finished = Signal()
+
+    def __init__(
+        self,
+        *,
+        service: PdfMergeService,
+        plan: PdfMergePlan,
+        overwrite: bool,
+        expected_source_revisions: dict[Path, SourcePdfRevision],
+        expected_target_snapshot: TargetSnapshot,
+        is_managed_path: Callable[[Path], bool],
+        cancel_event: Event,
+    ) -> None:
+        super().__init__()
+        self._service = service
+        self._plan = plan
+        self._overwrite = overwrite
+        self._expected_source_revisions = expected_source_revisions
+        self._expected_target_snapshot = expected_target_snapshot
+        self._is_managed_path = is_managed_path
+        self._cancel_event = cancel_event
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            result = self._service.merge_pdfs(
+                self._plan,
+                overwrite=self._overwrite,
+                expected_source_revisions=self._expected_source_revisions,
+                expected_target_snapshot=self._expected_target_snapshot,
+                is_managed_path=self._is_managed_path,
+                should_cancel=self._cancel_event.is_set,
+                progress_callback=self.progress.emit,
+            )
+        except PdfMergeCancelled as exc:
+            self.cancelled.emit(str(exc))
+        except Exception as exc:
+            logger.exception("Failed to merge PDFs")
+            self.failed.emit(str(exc))
+        else:
+            self.succeeded.emit(result)
+        finally:
+            self.finished.emit()
+
+
 class MainWindow(QMainWindow):
     _RECENT_FILES_KEY = "main_window/recent_files"
     _GEOMETRY_KEY = "main_window/geometry"
@@ -282,6 +341,7 @@ class MainWindow(QMainWindow):
         save_service: PdfSaveService | None = None,
         page_export_service: PdfPageExportService | None = None,
         page_split_service: PdfPageSplitService | None = None,
+        pdf_merge_service: PdfMergeService | None = None,
         recovery_service: SessionRecoveryService | None = None,
         source_change_monitor: SourceChangeMonitor | None = None,
     ) -> None:
@@ -300,6 +360,9 @@ class MainWindow(QMainWindow):
         )
         self._page_split_service = (
             page_split_service if page_split_service is not None else PdfPageSplitService()
+        )
+        self._pdf_merge_service = (
+            pdf_merge_service if pdf_merge_service is not None else PdfMergeService()
         )
         self._recovery_service = (
             recovery_service
@@ -321,6 +384,10 @@ class MainWindow(QMainWindow):
         self._split_worker: SplitPdfWorker | None = None
         self._split_progress_dialog: QProgressDialog | None = None
         self._split_cancel_event: Event | None = None
+        self._merge_worker_thread: QThread | None = None
+        self._merge_worker: MergePdfWorker | None = None
+        self._merge_progress_dialog: QProgressDialog | None = None
+        self._merge_cancel_event: Event | None = None
         self._toolbar_widget = DocumentToolbar(self)
         self._search_bar = SearchBar(self)
         self._main_toolbar: QWidget | None = None
@@ -511,6 +578,9 @@ class MainWindow(QMainWindow):
         self.split_pdf_action = QAction("PDFを分割…", self)
         self.split_pdf_action.triggered.connect(self._split_pdf)
 
+        self.merge_pdfs_action = QAction("PDFを結合…", self)
+        self.merge_pdfs_action.triggered.connect(self._merge_pdfs)
+
         self.insert_pages_action = QAction("別のPDFからページを挿入…", self)
         self.insert_pages_action.triggered.connect(self._insert_pages_from_pdf)
 
@@ -531,6 +601,7 @@ class MainWindow(QMainWindow):
             self.extract_selected_pages_action,
             self.extract_page_range_action,
             self.split_pdf_action,
+            self.merge_pdfs_action,
             self.insert_pages_action,
             self.replace_pages_action,
             self.save_action,
@@ -555,6 +626,7 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self.save_as_action)
         file_menu.addSeparator()
         file_menu.addAction(self.split_pdf_action)
+        file_menu.addAction(self.merge_pdfs_action)
         file_menu.addSeparator()
         file_menu.addAction(self.close_action)
         self.recent_files_menu = file_menu.addMenu("最近使ったファイル")
@@ -579,6 +651,7 @@ class MainWindow(QMainWindow):
         edit_menu.addAction(self.extract_selected_pages_action)
         edit_menu.addAction(self.extract_page_range_action)
         edit_menu.addAction(self.split_pdf_action)
+        edit_menu.addAction(self.merge_pdfs_action)
         edit_menu.addSeparator()
         edit_menu.addAction(self.insert_pages_action)
         edit_menu.addAction(self.replace_pages_action)
@@ -960,6 +1033,7 @@ class MainWindow(QMainWindow):
             or document.session.is_saving
             or document.mutation_in_progress
             or self._split_in_progress_session_id is not None
+            or self._merge_worker_thread is not None
             or document.view.page_count < 2
         ):
             return
@@ -1113,6 +1187,147 @@ class MainWindow(QMainWindow):
             )
         message = QMessageBox(self)
         message.setWindowTitle("PDF分割結果")
+        message.setIcon(QMessageBox.Icon.Information)
+        message.setText(headline)
+        message.setDetailedText("\n".join(lines))
+        message.exec()
+
+    def _merge_pdfs(self) -> None:
+        if self._merge_worker_thread is not None or self._split_in_progress_session_id is not None:
+            return
+        dialog = MergePdfsDialog(
+            input_reader=self._pdf_merge_service.inspect_merge_input,
+            target_snapshot_reader=TargetSnapshot.capture,
+            is_managed_path=self._workspace_manager.contains_managed_path,
+            default_output_directory=Path.home(),
+            parent=self,
+        )
+        if dialog.exec() != int(QDialog.DialogCode.Accepted) or dialog.dialog_result is None:
+            return
+        self._start_merge_worker(dialog.dialog_result)
+
+    def _start_merge_worker(self, result: MergePdfsDialogResult) -> None:
+        progress_dialog = QProgressDialog(
+            "PDFを結合しています…",
+            "キャンセル",
+            0,
+            result.plan.total_page_count,
+            self,
+        )
+        progress_dialog.setWindowTitle("PDFを結合")
+        progress_dialog.setMinimumDuration(0)
+        progress_dialog.setValue(0)
+        cancel_event = Event()
+        thread = QThread(self)
+        worker = MergePdfWorker(
+            service=self._pdf_merge_service,
+            plan=result.plan,
+            overwrite=result.overwrite,
+            expected_source_revisions=result.expected_source_revisions,
+            expected_target_snapshot=result.expected_target_snapshot,
+            is_managed_path=self._workspace_manager.contains_managed_path,
+            cancel_event=cancel_event,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_merge_progress)
+        worker.succeeded.connect(self._on_merge_succeeded)
+        worker.cancelled.connect(self._on_merge_cancelled)
+        worker.failed.connect(self._on_merge_failed)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        progress_dialog.canceled.connect(self._request_merge_cancel)
+        thread.finished.connect(self._on_merge_thread_finished)
+        self._merge_worker_thread = thread
+        self._merge_worker = worker
+        self._merge_progress_dialog = progress_dialog
+        self._merge_cancel_event = cancel_event
+        self._set_status_message("PDFを結合しています…")
+        self._update_actions()
+        thread.start()
+
+    @Slot()
+    def _request_merge_cancel(self) -> None:
+        if self._merge_cancel_event is None:
+            return
+        self._merge_cancel_event.set()
+        if self._merge_progress_dialog is not None:
+            self._merge_progress_dialog.setLabelText("安全な中断点でキャンセルします…")
+        self._set_status_message("PDF結合をキャンセルしています…")
+
+    def _on_merge_progress(self, progress: object) -> None:
+        if not isinstance(progress, PdfMergeProgress):
+            return
+        if self._merge_progress_dialog is not None:
+            self._merge_progress_dialog.setLabelText(
+                f"{progress.input_number} / {progress.input_count}: "
+                f"{progress.filename} ({progress.stage.value})"
+            )
+            self._merge_progress_dialog.setValue(progress.completed_output_pages)
+        self._set_status_message(
+            f"PDFを結合しています… {progress.completed_output_pages} / "
+            f"{progress.total_output_pages}"
+        )
+
+    def _on_merge_succeeded(self, result: object) -> None:
+        if not isinstance(result, PdfMergeResult):
+            return
+        if self._merge_progress_dialog is not None:
+            self._merge_progress_dialog.setValue(result.total_page_count)
+        self._show_merge_result_summary(result)
+        self._set_status_message(
+            f"{result.input_count}個のPDFを結合しました: {result.target_path.name}",
+            timeout_ms=5000,
+        )
+
+    def _on_merge_cancelled(self, message: str) -> None:
+        self._report_error(
+            "PDF結合をキャンセルしました",
+            f"{message}\n\n入力PDFと出力先PDFは変更されていません。",
+        )
+
+    def _on_merge_failed(self, message: str) -> None:
+        self._report_error(
+            "PDF結合に失敗しました",
+            f"{message}\n\n入力PDFと出力先PDFは変更されていません。",
+        )
+
+    def _on_merge_thread_finished(self) -> None:
+        if self._merge_progress_dialog is not None:
+            self._merge_progress_dialog.close()
+            self._merge_progress_dialog.deleteLater()
+        self._merge_progress_dialog = None
+        self._merge_worker = None
+        self._merge_worker_thread = None
+        self._merge_cancel_event = None
+        self._update_actions()
+        self._update_status()
+
+    def _show_merge_result_summary(self, result: PdfMergeResult) -> None:
+        headline = f"{result.input_count}個のPDFを結合しました"
+        metadata_text = result.metadata_source_label or "引き継がない"
+        bookmarks_text = (
+            "入力PDFごとに保持"
+            if result.bookmark_policy is PdfMergeBookmarkPolicy.GROUPED_BY_SOURCE
+            else "含めない"
+        )
+        lines = [
+            headline,
+            "",
+            f"出力先: {result.target_path}",
+            f"入力ファイル: {result.input_count}",
+            f"合計ページ: {result.total_page_count}",
+            f"Metadata: {metadata_text}",
+            f"Bookmarks: {bookmarks_text}",
+            "",
+        ]
+        for index, item in enumerate(result.inputs, start=1):
+            lines.append(
+                f"{index}. {item.label} — {item.page_count}ページ — 出力 {item.display_range}"
+            )
+        message = QMessageBox(self)
+        message.setWindowTitle("PDF結合結果")
         message.setIcon(QMessageBox.Icon.Information)
         message.setText(headline)
         message.setDetailedText("\n".join(lines))
@@ -1996,6 +2211,13 @@ class MainWindow(QMainWindow):
         self._sync_toolbar(document)
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        if self._merge_worker_thread is not None:
+            self._request_merge_cancel()
+            self._merge_worker_thread.quit()
+            if not self._merge_worker_thread.wait(5000):
+                self._set_status_message("PDF結合の終了を待ち切れませんでした", error=True)
+                event.ignore()
+                return
         for index in range(len(self._documents) - 1, -1, -1):
             if not self.close_document_at(index):
                 event.ignore()
@@ -2068,6 +2290,9 @@ class MainWindow(QMainWindow):
         document = self._current_document()
         document_selection = bool(document and document.view.selected_text)
         mutation_blocked = bool(document and document.mutation_in_progress)
+        background_pdf_operation = bool(
+            self._split_in_progress_session_id is not None or self._merge_worker_thread is not None
+        )
         if document is not None:
             document.view.set_page_reordering_enabled(
                 not document.session.is_saving and not document.mutation_in_progress
@@ -2127,9 +2352,10 @@ class MainWindow(QMainWindow):
                 and document.view.page_count >= 2
                 and not document.session.is_saving
                 and not document.mutation_in_progress
-                and self._split_in_progress_session_id is None
+                and not background_pdf_operation
             )
         )
+        self.merge_pdfs_action.setEnabled(not background_pdf_operation)
         self.insert_pages_action.setEnabled(
             bool(document and not document.session.is_saving and not document.mutation_in_progress)
         )
