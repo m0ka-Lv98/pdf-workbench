@@ -16,7 +16,7 @@ from typing import ClassVar
 import pikepdf
 import pypdfium2 as pdfium  # type: ignore[import-untyped]
 import pytest
-from PySide6.QtCore import QMimeData, QPoint, QPointF, QRect, QSettings, Qt, QTimer, QUrl
+from PySide6.QtCore import QMimeData, QPoint, QPointF, QRect, QSettings, Qt, QThread, QTimer, QUrl
 from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent, QImage, QKeySequence
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
@@ -51,7 +51,9 @@ from pdf_workbench.domain.page_crop import PageCropMargins
 from pdf_workbench.domain.page_extraction import PageExtractionPlan, build_page_extraction_plan
 from pdf_workbench.domain.page_insertion import SourcePageSelection
 from pdf_workbench.domain.page_split import build_max_pages_split_plan
+from pdf_workbench.domain.pdf_merge import PdfMergeInput, build_pdf_merge_plan
 from pdf_workbench.services.page_coordinates import PageMetadata
+from pdf_workbench.services.pdf_merge import PdfMergeResult, PdfMergeService
 from pdf_workbench.services.pdf_page_export import PageExtractionResult, PdfPageExportService
 from pdf_workbench.services.pdf_page_mutation import (
     PdfPageMutationError,
@@ -96,6 +98,7 @@ from pdf_workbench.ui.widgets.extract_pages_dialog import (
     ExtractPagesDialogResult,
 )
 from pdf_workbench.ui.widgets.insert_pages_dialog import InsertPagesDialog, InsertPagesDialogResult
+from pdf_workbench.ui.widgets.merge_pdfs_dialog import MergePdfsDialogResult
 from pdf_workbench.ui.widgets.replace_pages_dialog import (
     ReplacePagesDialogResult,
 )
@@ -352,6 +355,46 @@ class FakePageSplitService(PdfPageSplitService):
             fingerprint=FileFingerprint.from_path(resolved),
             sha256="0" * 64,
             page_count=3,
+        )
+
+
+class FakePdfMergeService(PdfMergeService):
+    def __init__(self) -> None:
+        super().__init__()
+        self.read_inputs: list[Path] = []
+        self.calls: list[tuple[object, bool]] = []
+
+    def read_merge_input(self, path: Path) -> PdfMergeInput:
+        resolved = path.expanduser().resolve()
+        self.read_inputs.append(resolved)
+        return PdfMergeInput(resolved, 1, resolved.name)
+
+    def merge_pdfs(
+        self,
+        plan: object,
+        *,
+        overwrite: bool = False,
+        expected_source_revisions: object = None,
+        expected_target_snapshot: object = None,
+        is_managed_path: Callable[[Path], bool] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+        progress_callback: object = None,
+    ) -> PdfMergeResult:
+        del expected_source_revisions, expected_target_snapshot, is_managed_path
+        del should_cancel, progress_callback
+        self.calls.append((plan, overwrite))
+        assert hasattr(plan, "output_path")
+        output_path = plan.output_path
+        output_path.write_bytes(b"%PDF-1.7\n% fake merged PDF\n")
+        return PdfMergeResult(
+            target_path=output_path,
+            fingerprint=FileFingerprint.from_path(output_path),
+            input_count=len(plan.inputs),
+            total_page_count=plan.total_page_count,
+            metadata_source_label=None,
+            bookmark_policy=plan.bookmark_policy,
+            inputs=(),
+            merged_at=datetime.now(UTC),
         )
 
 
@@ -620,6 +663,109 @@ def test_main_window_split_action_requires_multi_page_idle_document(
     window._update_actions()
     assert window.split_pdf_action.isEnabled() is False
     window._split_in_progress_session_id = None
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
+def test_main_window_merge_action_is_available_without_document_and_blocks_during_background_ops(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    assert window.merge_pdfs_action.text() == "PDFを結合…"
+    assert window.merge_pdfs_action.isEnabled() is True
+
+    window._merge_worker_thread = QThread(window)
+    window._update_actions()
+    assert window.merge_pdfs_action.isEnabled() is False
+    assert window.split_pdf_action.isEnabled() is False
+    window._merge_worker_thread.deleteLater()
+    window._merge_worker_thread = None
+
+    window._split_in_progress_session_id = "split-session"
+    window._update_actions()
+    assert window.merge_pdfs_action.isEnabled() is False
+    window._split_in_progress_session_id = None
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
+def test_main_window_merge_dialog_cancel_does_not_start_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    merge_service = FakePdfMergeService()
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+        pdf_merge_service=merge_service,
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    started: list[str] = []
+
+    class CancelDialog:
+        dialog_result = None
+
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def exec(self) -> int:
+            return 0
+
+    monkeypatch.setattr(main_window_module, "MergePdfsDialog", CancelDialog)
+    monkeypatch.setattr(window, "_start_merge_worker", lambda *_args: started.append("started"))
+
+    window._merge_pdfs()
+
+    assert started == []
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
+def test_main_window_merge_starts_from_dialog_result_without_active_document(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    merge_service = FakePdfMergeService()
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+        pdf_merge_service=merge_service,
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    first = PdfMergeInput((tmp_path / "a.pdf").resolve(), 1, "a.pdf")
+    second = PdfMergeInput((tmp_path / "b.pdf").resolve(), 2, "b.pdf")
+    result = MergePdfsDialogResult(
+        plan=build_pdf_merge_plan((first, second), tmp_path / "merged.pdf"),
+        overwrite=True,
+    )
+    started: list[MergePdfsDialogResult] = []
+
+    class AcceptDialog:
+        dialog_result = result
+
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def exec(self) -> int:
+            return 1
+
+    monkeypatch.setattr(main_window_module, "MergePdfsDialog", AcceptDialog)
+    monkeypatch.setattr(window, "_start_merge_worker", started.append)
+
+    window._merge_pdfs()
+
+    assert started == [result]
     window.close()
     qtbot.waitUntil(lambda: not window.isVisible())
 
