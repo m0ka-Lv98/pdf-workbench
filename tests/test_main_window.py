@@ -473,10 +473,11 @@ def build_split_result(
 ) -> PageSplitBatchResult:
     plan = build_max_pages_split_plan(len(statuses), 1, source_stem=source_stem)
     now = datetime.now(UTC)
+    base_path = Path.cwd().resolve()
     outputs = tuple(
         PageSplitOutputResult(
             chunk=chunk,
-            target_path=Path(f"/tmp/{chunk.filename}"),
+            target_path=base_path / chunk.filename,
             status=status,
             fingerprint=None,
             error_message="boom" if status is PageSplitOutputStatus.FAILED else "",
@@ -490,7 +491,7 @@ def build_split_result(
         started_at=now,
         completed_at=now,
         source_revision=SourcePdfRevision(
-            resolved_path=Path("/tmp/source.pdf"),
+            resolved_path=base_path / "source.pdf",
             fingerprint=FileFingerprint(size_bytes=1, modified_time_ns=1),
             sha256="0" * 64,
             page_count=len(statuses),
