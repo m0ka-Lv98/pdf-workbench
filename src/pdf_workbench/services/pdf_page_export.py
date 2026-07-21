@@ -67,6 +67,10 @@ class PdfPageExportValidationError(PdfPageExportError):
     """Raised when an export candidate fails structural or render validation."""
 
 
+class SourcePdfChangedError(PdfPageExportError):
+    """Raised when the source PDF changed or cannot be revalidated during export."""
+
+
 @dataclass(frozen=True, slots=True)
 class PageExtractionResult:
     target_path: Path
@@ -168,11 +172,11 @@ class PdfPageExportService:
         try:
             revision = self._mutation_service.read_source_pdf_revision(source_path)
         except Exception as exc:
-            raise PdfPageExportError("抽出元PDFの状態を確認できませんでした") from exc
+            raise SourcePdfChangedError("抽出元PDFの状態を確認できませんでした") from exc
         if revision.page_count != plan.page_count:
-            raise PdfPageExportError("抽出元PDFのページ数が変更されました")
+            raise SourcePdfChangedError("抽出元PDFのページ数が変更されました")
         if expected_revision is not None and revision != expected_revision:
-            raise PdfPageExportError("抽出元PDFが変更されたため、抽出を中止しました")
+            raise SourcePdfChangedError("抽出元PDFが変更されたため、抽出を中止しました")
         return revision
 
     def _ensure_source_revision_unchanged(
@@ -183,9 +187,9 @@ class PdfPageExportService:
         try:
             current = self._mutation_service.read_source_pdf_revision(source_path)
         except Exception as exc:
-            raise PdfPageExportError("抽出元PDFの状態を再確認できませんでした") from exc
+            raise SourcePdfChangedError("抽出元PDFの状態を再確認できませんでした") from exc
         if current != expected_revision:
-            raise PdfPageExportError("抽出中に抽出元PDFが変更されました")
+            raise SourcePdfChangedError("抽出中に抽出元PDFが変更されました")
 
     @staticmethod
     def _ensure_paths_are_allowed(

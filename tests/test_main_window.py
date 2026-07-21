@@ -4,12 +4,14 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pikepdf
 import pypdfium2 as pdfium  # type: ignore[import-untyped]
@@ -29,6 +31,7 @@ from PySide6.QtWidgets import (
 )
 from pytestqt.qtbot import QtBot
 
+import pdf_workbench.ui.main_window as main_window_module
 from pdf_regression_utils import extract_pdfium_text, file_sha256
 from pdf_test_utils import (
     copy_pdf_fixture,
@@ -47,12 +50,20 @@ from pdf_workbench.domain.page_commands import DeletePagesCommand, RotatePagesCo
 from pdf_workbench.domain.page_crop import PageCropMargins
 from pdf_workbench.domain.page_extraction import PageExtractionPlan, build_page_extraction_plan
 from pdf_workbench.domain.page_insertion import SourcePageSelection
+from pdf_workbench.domain.page_split import build_max_pages_split_plan
 from pdf_workbench.services.page_coordinates import PageMetadata
 from pdf_workbench.services.pdf_page_export import PageExtractionResult, PdfPageExportService
 from pdf_workbench.services.pdf_page_mutation import (
     PdfPageMutationError,
     PdfPageMutationService,
     SourcePdfRevision,
+)
+from pdf_workbench.services.pdf_page_split import (
+    PageSplitBatchResult,
+    PageSplitOutputResult,
+    PageSplitOutputStatus,
+    PageSplitProgress,
+    PdfPageSplitService,
 )
 from pdf_workbench.services.pdf_renderer import (
     DocumentMetadata,
@@ -89,6 +100,7 @@ from pdf_workbench.ui.widgets.replace_pages_dialog import (
     ReplacePagesDialogResult,
 )
 from pdf_workbench.ui.widgets.search_bar import SearchBar, SearchInputSurface
+from pdf_workbench.ui.widgets.split_pdf_dialog import SplitPdfDialogResult
 
 
 def patch_pdf_open(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -326,6 +338,170 @@ class FakePageExportService(PdfPageExportService):
         )
 
 
+class FakePageSplitService(PdfPageSplitService):
+    def __init__(self) -> None:
+        super().__init__()
+        self.revision: SourcePdfRevision | None = None
+
+    def read_source_pdf_revision(self, path: Path) -> SourcePdfRevision:
+        resolved = path.expanduser().resolve()
+        if self.revision is not None:
+            return self.revision
+        return SourcePdfRevision(
+            resolved_path=resolved,
+            fingerprint=FileFingerprint.from_path(resolved),
+            sha256="0" * 64,
+            page_count=3,
+        )
+
+
+class BlockingPageSplitService(FakePageSplitService):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = threading.Event()
+        self.allow_current_output_to_finish = threading.Event()
+        self.observed_cancel = threading.Event()
+        self.results: PageSplitBatchResult | None = None
+        self.progress_events: list[PageSplitProgress] = []
+
+    def split_pdf(
+        self,
+        source_path: Path,
+        output_directory: Path,
+        plan: object,
+        *,
+        working_copy_path: Path | None = None,
+        expected_source_revision: SourcePdfRevision | None = None,
+        overwrite: bool = False,
+        expected_target_snapshots: object = None,
+        is_managed_path: Callable[[Path], bool] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+        progress_callback: Callable[[PageSplitProgress], None] | None = None,
+    ) -> PageSplitBatchResult:
+        del working_copy_path, expected_source_revision, overwrite
+        del expected_target_snapshots, is_managed_path
+        assert not isinstance(plan, bool)
+        split_plan = plan
+        assert hasattr(split_plan, "chunks")
+        chunks = split_plan.chunks
+        started_at = datetime.now(UTC)
+        first_target = output_directory / chunks[0].filename
+        if progress_callback is not None:
+            progress = PageSplitProgress(
+                chunk=chunks[0],
+                target_path=first_target,
+                output_number=1,
+                output_count=len(chunks),
+                status=PageSplitOutputStatus.SKIPPED,
+                message="処理中",
+            )
+            self.progress_events.append(progress)
+            progress_callback(progress)
+        self.started.set()
+        assert self.allow_current_output_to_finish.wait(timeout=5)
+        if should_cancel is not None and should_cancel():
+            self.observed_cancel.set()
+        first_target.write_bytes(b"%PDF-1.7\n% split fake\n")
+        first_completed_at = datetime.now(UTC)
+        outputs = [
+            PageSplitOutputResult(
+                chunk=chunks[0],
+                target_path=first_target,
+                status=PageSplitOutputStatus.SUCCESS,
+                fingerprint=FileFingerprint.from_path(first_target),
+                error_message="",
+                started_at=started_at,
+                completed_at=first_completed_at,
+            )
+        ]
+        for chunk in chunks[1:]:
+            outputs.append(
+                PageSplitOutputResult(
+                    chunk=chunk,
+                    target_path=output_directory / chunk.filename,
+                    status=PageSplitOutputStatus.CANCELLED,
+                    fingerprint=None,
+                    error_message="キャンセルされました",
+                    started_at=first_completed_at,
+                    completed_at=datetime.now(UTC),
+                )
+            )
+        result = PageSplitBatchResult(
+            outputs=tuple(outputs),
+            output_directory=output_directory.resolve(),
+            started_at=started_at,
+            completed_at=datetime.now(UTC),
+            source_revision=self.read_source_pdf_revision(source_path),
+        )
+        self.results = result
+        return result
+
+
+class CapturedMessageBox:
+    class Icon:
+        Information = object()
+
+    instances: ClassVar[list[CapturedMessageBox]] = []
+
+    def __init__(self, _parent: QWidget) -> None:
+        self.window_title = ""
+        self.icon: object | None = None
+        self.text = ""
+        self.detailed_text = ""
+        self.executed = False
+        self.instances.append(self)
+
+    def setWindowTitle(self, title: str) -> None:
+        self.window_title = title
+
+    def setIcon(self, icon: object) -> None:
+        self.icon = icon
+
+    def setText(self, text: str) -> None:
+        self.text = text
+
+    def setDetailedText(self, text: str) -> None:
+        self.detailed_text = text
+
+    def exec(self) -> None:
+        self.executed = True
+
+
+def build_split_result(
+    statuses: tuple[PageSplitOutputStatus, ...],
+    *,
+    source_stem: str = "source",
+    output_directory: Path | None = None,
+) -> PageSplitBatchResult:
+    plan = build_max_pages_split_plan(len(statuses), 1, source_stem=source_stem)
+    now = datetime.now(UTC)
+    base_path = (output_directory if output_directory is not None else Path.cwd()).resolve()
+    outputs = tuple(
+        PageSplitOutputResult(
+            chunk=chunk,
+            target_path=base_path / chunk.filename,
+            status=status,
+            fingerprint=None,
+            error_message="boom" if status is PageSplitOutputStatus.FAILED else "",
+            started_at=now,
+            completed_at=now,
+        )
+        for chunk, status in zip(plan.chunks, statuses, strict=True)
+    )
+    return PageSplitBatchResult(
+        outputs=outputs,
+        output_directory=base_path,
+        started_at=now,
+        completed_at=now,
+        source_revision=SourcePdfRevision(
+            resolved_path=base_path / "source.pdf",
+            fingerprint=FileFingerprint(size_bytes=1, modified_time_ns=1),
+            sha256="0" * 64,
+            page_count=len(statuses),
+        ),
+    )
+
+
 def test_main_window_insert_pages_action_exists_and_is_enabled_with_document(
     monkeypatch: pytest.MonkeyPatch,
     qtbot: QtBot,
@@ -399,6 +575,582 @@ def test_main_window_extract_actions_follow_document_selection_and_busy_state(
     document.mutation_in_progress = False
     window.close()
     qtbot.waitUntil(lambda: not window.isVisible())
+
+
+def test_main_window_split_action_requires_multi_page_idle_document(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    source_path = create_simple_text_pdf(tmp_path / "split-actions-source.pdf", ["A", "B"])
+
+    assert window.split_pdf_action.text() == "PDFを分割…"
+    assert window.split_pdf_action.isEnabled() is False
+
+    window.open_document(source_path)
+    qtbot.waitUntil(lambda: window._current_document() is not None)
+    document = window._current_document()
+    assert document is not None
+
+    window._update_actions()
+    assert window.split_pdf_action.isEnabled() is False
+
+    configure_fake_view_pages(document.view, 2)
+    window._update_actions()
+    assert window.split_pdf_action.isEnabled() is True
+
+    document.session.is_saving = True
+    window._update_actions()
+    assert window.split_pdf_action.isEnabled() is False
+    document.session.is_saving = False
+
+    document.mutation_in_progress = True
+    window._update_actions()
+    assert window.split_pdf_action.isEnabled() is False
+    document.mutation_in_progress = False
+
+    window._split_in_progress_session_id = document.session.session_id
+    window._update_actions()
+    assert window.split_pdf_action.isEnabled() is False
+    window._split_in_progress_session_id = None
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
+def test_main_window_split_dialog_cancel_does_not_start_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    split_service = FakePageSplitService()
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+        page_split_service=split_service,
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    source_path = create_simple_text_pdf(tmp_path / "split-cancel-source.pdf", ["A", "B", "C"])
+    window.open_document(source_path)
+    qtbot.waitUntil(lambda: window._current_document() is not None)
+    document = window._current_document()
+    assert document is not None
+    configure_fake_view_pages(document.view, 3)
+    started: list[str] = []
+    monkeypatch.setattr(window, "_choose_split_pdf_options", lambda _document: None)
+    monkeypatch.setattr(window, "_start_split_worker", lambda *_args: started.append("started"))
+
+    window._split_pdf()
+
+    assert started == []
+    assert document.session.is_modified is False
+    assert document.command_history.can_undo is False
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
+def test_main_window_split_rejects_stale_page_count_before_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    split_service = FakePageSplitService()
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+        page_split_service=split_service,
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    source_path = create_simple_text_pdf(tmp_path / "split-stale-source.pdf", ["A", "B", "C"])
+    window.open_document(source_path)
+    qtbot.waitUntil(lambda: window._current_document() is not None)
+    document = window._current_document()
+    assert document is not None
+    configure_fake_view_pages(document.view, 3)
+    result = SplitPdfDialogResult(
+        plan=build_max_pages_split_plan(3, 1, source_stem=source_path.stem),
+        output_directory=tmp_path,
+        overwrite=False,
+        mode="max_pages",
+    )
+    started: list[str] = []
+
+    def choose_split(_document: DocumentTab) -> SplitPdfDialogResult:
+        configure_fake_view_pages(document.view, 2)
+        return result
+
+    monkeypatch.setattr(window, "_choose_split_pdf_options", choose_split)
+    monkeypatch.setattr(window, "_start_split_worker", lambda *_args: started.append("started"))
+
+    window._split_pdf()
+
+    assert started == []
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
+def test_main_window_split_starts_without_mutating_document_state(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    split_service = FakePageSplitService()
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+        page_split_service=split_service,
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    source_path = create_simple_text_pdf(tmp_path / "split-start-source.pdf", ["A", "B", "C"])
+    window.open_document(source_path)
+    qtbot.waitUntil(lambda: window._current_document() is not None)
+    document = window._current_document()
+    assert document is not None
+    configure_fake_view_pages(document.view, 3)
+    document.view._page_organizer.set_selected_page_indexes((1,), current_index=1)
+    document.view.set_page(1)
+    before_selection = document.view.selected_page_indexes
+    before_page = document.view.page_index
+    before_dirty = document.session.is_modified
+    result = SplitPdfDialogResult(
+        plan=build_max_pages_split_plan(3, 2, source_stem=source_path.stem),
+        output_directory=tmp_path,
+        overwrite=False,
+        mode="max_pages",
+    )
+    captured: list[tuple[SplitPdfDialogResult, tuple[int, ...], int, bool]] = []
+
+    def start_worker(
+        _context: object,
+        split_result: SplitPdfDialogResult,
+    ) -> None:
+        captured.append(
+            (
+                split_result,
+                document.view.selected_page_indexes,
+                document.view.page_index,
+                document.session.is_modified,
+            )
+        )
+
+    monkeypatch.setattr(window, "_choose_split_pdf_options", lambda _document: result)
+    monkeypatch.setattr(window, "_start_split_worker", start_worker)
+
+    window._split_pdf()
+
+    assert captured == [(result, before_selection, before_page, before_dirty)]
+    assert document.command_history.can_undo is False
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
+def test_split_cancel_finishes_thread_and_cleans_ui_state(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    split_service = BlockingPageSplitService()
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+        page_split_service=split_service,
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    source_path = create_simple_text_pdf(tmp_path / "split-thread-source.pdf", ["A", "B", "C"])
+    window.open_document(source_path)
+    qtbot.waitUntil(lambda: window._current_document() is not None)
+    document = window._current_document()
+    assert document is not None
+    configure_fake_view_pages(document.view, 3)
+    document.view._page_organizer.set_selected_page_indexes((1,), current_index=1)
+    document.view.set_page(1)
+    before_selection = document.view.selected_page_indexes
+    before_page = document.view.page_index
+    before_dirty = document.session.is_modified
+    before_can_undo = document.command_history.can_undo
+    result = SplitPdfDialogResult(
+        plan=build_max_pages_split_plan(3, 1, source_stem=source_path.stem),
+        output_directory=tmp_path,
+        overwrite=False,
+        mode="max_pages",
+    )
+    summaries: list[PageSplitBatchResult] = []
+    errors: list[tuple[str, str]] = []
+    monkeypatch.setattr(window, "_choose_split_pdf_options", lambda _document: result)
+    monkeypatch.setattr(window, "_show_split_result_summary", summaries.append)
+    monkeypatch.setattr(
+        window, "_report_error", lambda title, message: errors.append((title, message))
+    )
+
+    window._split_pdf()
+    qtbot.waitUntil(lambda: split_service.started.is_set())
+    assert window._split_worker_thread is not None
+    assert window._split_progress_dialog is not None
+
+    window._split_progress_dialog.canceled.emit()
+    qtbot.waitUntil(
+        lambda: window._split_cancel_event is not None and window._split_cancel_event.is_set()
+    )
+    split_service.allow_current_output_to_finish.set()
+    qtbot.waitUntil(lambda: window._split_worker_thread is None)
+
+    assert split_service.observed_cancel.is_set()
+    assert errors == []
+    assert split_service.results is not None
+    assert [output.status for output in split_service.results.outputs] == [
+        PageSplitOutputStatus.SUCCESS,
+        PageSplitOutputStatus.CANCELLED,
+        PageSplitOutputStatus.CANCELLED,
+    ]
+    assert summaries == [split_service.results]
+    assert (tmp_path / "split-thread-source_pages_0001-0001.pdf").exists()
+    assert not (tmp_path / "split-thread-source_pages_0002-0002.pdf").exists()
+    assert window._split_progress_dialog is None
+    assert window._split_worker is None
+    assert window._split_cancel_event is None
+    assert window._split_in_progress_session_id is None
+    assert document.view.selected_page_indexes == before_selection
+    assert document.view.page_index == before_page
+    assert document.session.is_modified is before_dirty
+    assert document.command_history.can_undo is before_can_undo
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
+def test_split_summary_dialog_contains_copyable_success_details(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    CapturedMessageBox.instances.clear()
+    monkeypatch.setattr(main_window_module, "QMessageBox", CapturedMessageBox)
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+    )
+    qtbot.addWidget(window)
+
+    window._show_split_result_summary(
+        build_split_result(
+            (
+                PageSplitOutputStatus.SUCCESS,
+                PageSplitOutputStatus.SUCCESS,
+            )
+        )
+    )
+
+    message = CapturedMessageBox.instances[-1]
+    assert message.executed is True
+    assert message.window_title == "PDF分割結果"
+    assert message.text == "2個のPDFを作成しました"
+    assert f"出力先: {Path.cwd().resolve()}" in message.detailed_text
+    assert "成功: 2" in message.detailed_text
+    assert "失敗: 0" in message.detailed_text
+    assert "スキップ: 0" in message.detailed_text
+    assert "キャンセル: 0" in message.detailed_text
+    assert "1-1: source_pages_0001-0001.pdf [成功]" in message.detailed_text
+    assert "2-2: source_pages_0002-0002.pdf [成功]" in message.detailed_text
+
+
+def test_split_summary_dialog_contains_all_status_counts(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    CapturedMessageBox.instances.clear()
+    monkeypatch.setattr(main_window_module, "QMessageBox", CapturedMessageBox)
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+    )
+    qtbot.addWidget(window)
+
+    window._show_split_result_summary(
+        build_split_result(
+            (
+                PageSplitOutputStatus.SUCCESS,
+                PageSplitOutputStatus.FAILED,
+                PageSplitOutputStatus.SKIPPED,
+                PageSplitOutputStatus.CANCELLED,
+            )
+        )
+    )
+
+    message = CapturedMessageBox.instances[-1]
+    assert "成功: 1" in message.detailed_text
+    assert "失敗: 1" in message.detailed_text
+    assert "スキップ: 1" in message.detailed_text
+    assert "キャンセル: 1" in message.detailed_text
+
+
+def test_split_summary_dialog_contains_output_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    CapturedMessageBox.instances.clear()
+    monkeypatch.setattr(main_window_module, "QMessageBox", CapturedMessageBox)
+    output_directory = (tmp_path / "exports").resolve()
+    output_directory.mkdir()
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+    )
+    qtbot.addWidget(window)
+
+    window._show_split_result_summary(
+        build_split_result(
+            (
+                PageSplitOutputStatus.SUCCESS,
+                PageSplitOutputStatus.SUCCESS,
+            ),
+            output_directory=output_directory,
+        )
+    )
+
+    message = CapturedMessageBox.instances[-1]
+    assert f"出力先: {output_directory}" in message.detailed_text
+    assert str(output_directory / "source_pages_0001-0001.pdf") not in message.detailed_text
+
+
+def test_split_summary_dialog_reports_zero_counts(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    CapturedMessageBox.instances.clear()
+    monkeypatch.setattr(main_window_module, "QMessageBox", CapturedMessageBox)
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+    )
+    qtbot.addWidget(window)
+
+    window._show_split_result_summary(
+        build_split_result(
+            (
+                PageSplitOutputStatus.SUCCESS,
+                PageSplitOutputStatus.SUCCESS,
+            )
+        )
+    )
+
+    message = CapturedMessageBox.instances[-1]
+    assert "失敗: 0" in message.detailed_text
+    assert "スキップ: 0" in message.detailed_text
+    assert "キャンセル: 0" in message.detailed_text
+
+
+def test_split_summary_dialog_reports_failures_and_skipped_outputs(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    CapturedMessageBox.instances.clear()
+    monkeypatch.setattr(main_window_module, "QMessageBox", CapturedMessageBox)
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+    )
+    qtbot.addWidget(window)
+
+    window._show_split_result_summary(
+        build_split_result(
+            (
+                PageSplitOutputStatus.SUCCESS,
+                PageSplitOutputStatus.FAILED,
+                PageSplitOutputStatus.SKIPPED,
+                PageSplitOutputStatus.CANCELLED,
+            )
+        )
+    )
+
+    message = CapturedMessageBox.instances[-1]
+    assert message.text == "4個中1個を作成しました。1個は失敗しました"
+    assert "成功: 1" in message.detailed_text
+    assert "失敗: 1" in message.detailed_text
+    assert "スキップ: 1" in message.detailed_text
+    assert "キャンセル: 1" in message.detailed_text
+    assert "2-2: source_pages_0002-0002.pdf [失敗] - boom" in message.detailed_text
+    assert "3-3: source_pages_0003-0003.pdf [スキップ]" in message.detailed_text
+    assert "4-4: source_pages_0004-0004.pdf [キャンセル]" in message.detailed_text
+
+
+def test_split_summary_dialog_reports_partial_failure_counts(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    CapturedMessageBox.instances.clear()
+    monkeypatch.setattr(main_window_module, "QMessageBox", CapturedMessageBox)
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+    )
+    qtbot.addWidget(window)
+
+    window._show_split_result_summary(
+        build_split_result(
+            (
+                PageSplitOutputStatus.SUCCESS,
+                PageSplitOutputStatus.FAILED,
+                PageSplitOutputStatus.SKIPPED,
+            )
+        )
+    )
+
+    message = CapturedMessageBox.instances[-1]
+    assert message.text == "3個中1個を作成しました。1個は失敗しました"
+    assert "成功: 1" in message.detailed_text
+    assert "失敗: 1" in message.detailed_text
+    assert "スキップ: 1" in message.detailed_text
+    assert "キャンセル: 0" in message.detailed_text
+    assert "2-2: source_pages_0002-0002.pdf [失敗] - boom" in message.detailed_text
+    assert "3-3: source_pages_0003-0003.pdf [スキップ]" in message.detailed_text
+
+
+def test_split_summary_dialog_reports_cancel_without_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    CapturedMessageBox.instances.clear()
+    monkeypatch.setattr(main_window_module, "QMessageBox", CapturedMessageBox)
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+    )
+    qtbot.addWidget(window)
+
+    window._show_split_result_summary(
+        build_split_result(
+            (
+                PageSplitOutputStatus.SUCCESS,
+                PageSplitOutputStatus.CANCELLED,
+            )
+        )
+    )
+
+    message = CapturedMessageBox.instances[-1]
+    assert message.text == "2個中1個を作成し、残りをキャンセルしました"
+    assert "成功: 1" in message.detailed_text
+    assert "失敗: 0" in message.detailed_text
+    assert "スキップ: 0" in message.detailed_text
+    assert "キャンセル: 1" in message.detailed_text
+    assert "2-2: source_pages_0002-0002.pdf [キャンセル]" in message.detailed_text
+
+
+def test_split_summary_dialog_reports_cancelled_and_skipped_counts(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    CapturedMessageBox.instances.clear()
+    monkeypatch.setattr(main_window_module, "QMessageBox", CapturedMessageBox)
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+    )
+    qtbot.addWidget(window)
+
+    window._show_split_result_summary(
+        build_split_result(
+            (
+                PageSplitOutputStatus.SUCCESS,
+                PageSplitOutputStatus.SKIPPED,
+                PageSplitOutputStatus.CANCELLED,
+            )
+        )
+    )
+
+    message = CapturedMessageBox.instances[-1]
+    assert "成功: 1" in message.detailed_text
+    assert "失敗: 0" in message.detailed_text
+    assert "スキップ: 1" in message.detailed_text
+    assert "キャンセル: 1" in message.detailed_text
+    assert "2-2: source_pages_0002-0002.pdf [スキップ]" in message.detailed_text
+    assert "3-3: source_pages_0003-0003.pdf [キャンセル]" in message.detailed_text
+
+
+def test_split_failed_reports_non_mutating_error(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+    )
+    qtbot.addWidget(window)
+    errors: list[tuple[str, str]] = []
+    window._report_error = lambda title, message: errors.append((title, message))  # type: ignore[method-assign]
+
+    window._on_split_failed("boom")
+
+    assert errors == [
+        (
+            "PDF分割に失敗しました",
+            "boom\n\n元のPDFと現在の作業コピーは変更されていません。",
+        )
+    ]
+
+
+def test_split_cancel_request_without_active_token_is_noop(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+    )
+    qtbot.addWidget(window)
+
+    window._request_split_cancel()
+
+    assert window._split_cancel_event is None
+
+
+def test_split_success_updates_status_for_all_successful_outputs(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+    )
+    qtbot.addWidget(window)
+    monkeypatch.setattr(window, "_show_split_result_summary", lambda _result: None)
+    statuses: list[tuple[str, int | None]] = []
+    monkeypatch.setattr(
+        window,
+        "_set_status_message",
+        lambda text, timeout_ms=None, *, is_error=False: statuses.append((text, timeout_ms)),
+    )
+
+    window._on_split_succeeded(
+        build_split_result(
+            (
+                PageSplitOutputStatus.SUCCESS,
+                PageSplitOutputStatus.SUCCESS,
+            )
+        )
+    )
+
+    assert statuses[-1] == ("2個のPDFを作成しました", 5000)
 
 
 def test_main_window_extract_selected_pages_runs_service_without_mutating_document(
