@@ -428,6 +428,7 @@ class BlockingPageSplitService(FakePageSplitService):
             )
         result = PageSplitBatchResult(
             outputs=tuple(outputs),
+            output_directory=output_directory.resolve(),
             started_at=started_at,
             completed_at=datetime.now(UTC),
             source_revision=self.read_source_pdf_revision(source_path),
@@ -470,10 +471,11 @@ def build_split_result(
     statuses: tuple[PageSplitOutputStatus, ...],
     *,
     source_stem: str = "source",
+    output_directory: Path | None = None,
 ) -> PageSplitBatchResult:
     plan = build_max_pages_split_plan(len(statuses), 1, source_stem=source_stem)
     now = datetime.now(UTC)
-    base_path = Path.cwd().resolve()
+    base_path = (output_directory if output_directory is not None else Path.cwd()).resolve()
     outputs = tuple(
         PageSplitOutputResult(
             chunk=chunk,
@@ -488,6 +490,7 @@ def build_split_result(
     )
     return PageSplitBatchResult(
         outputs=outputs,
+        output_directory=base_path,
         started_at=now,
         completed_at=now,
         source_revision=SourcePdfRevision(
@@ -854,8 +857,102 @@ def test_split_summary_dialog_contains_copyable_success_details(
     assert message.executed is True
     assert message.window_title == "PDF分割結果"
     assert message.text == "2個のPDFを作成しました"
+    assert f"出力先: {Path.cwd().resolve()}" in message.detailed_text
+    assert "成功: 2" in message.detailed_text
+    assert "失敗: 0" in message.detailed_text
+    assert "スキップ: 0" in message.detailed_text
+    assert "キャンセル: 0" in message.detailed_text
     assert "1-1: source_pages_0001-0001.pdf [成功]" in message.detailed_text
     assert "2-2: source_pages_0002-0002.pdf [成功]" in message.detailed_text
+
+
+def test_split_summary_dialog_contains_all_status_counts(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    CapturedMessageBox.instances.clear()
+    monkeypatch.setattr(main_window_module, "QMessageBox", CapturedMessageBox)
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+    )
+    qtbot.addWidget(window)
+
+    window._show_split_result_summary(
+        build_split_result(
+            (
+                PageSplitOutputStatus.SUCCESS,
+                PageSplitOutputStatus.FAILED,
+                PageSplitOutputStatus.SKIPPED,
+                PageSplitOutputStatus.CANCELLED,
+            )
+        )
+    )
+
+    message = CapturedMessageBox.instances[-1]
+    assert "成功: 1" in message.detailed_text
+    assert "失敗: 1" in message.detailed_text
+    assert "スキップ: 1" in message.detailed_text
+    assert "キャンセル: 1" in message.detailed_text
+
+
+def test_split_summary_dialog_contains_output_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    CapturedMessageBox.instances.clear()
+    monkeypatch.setattr(main_window_module, "QMessageBox", CapturedMessageBox)
+    output_directory = (tmp_path / "exports").resolve()
+    output_directory.mkdir()
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+    )
+    qtbot.addWidget(window)
+
+    window._show_split_result_summary(
+        build_split_result(
+            (
+                PageSplitOutputStatus.SUCCESS,
+                PageSplitOutputStatus.SUCCESS,
+            ),
+            output_directory=output_directory,
+        )
+    )
+
+    message = CapturedMessageBox.instances[-1]
+    assert f"出力先: {output_directory}" in message.detailed_text
+    assert str(output_directory / "source_pages_0001-0001.pdf") not in message.detailed_text
+
+
+def test_split_summary_dialog_reports_zero_counts(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    CapturedMessageBox.instances.clear()
+    monkeypatch.setattr(main_window_module, "QMessageBox", CapturedMessageBox)
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+    )
+    qtbot.addWidget(window)
+
+    window._show_split_result_summary(
+        build_split_result(
+            (
+                PageSplitOutputStatus.SUCCESS,
+                PageSplitOutputStatus.SUCCESS,
+            )
+        )
+    )
+
+    message = CapturedMessageBox.instances[-1]
+    assert "失敗: 0" in message.detailed_text
+    assert "スキップ: 0" in message.detailed_text
+    assert "キャンセル: 0" in message.detailed_text
 
 
 def test_split_summary_dialog_reports_failures_and_skipped_outputs(
@@ -884,9 +981,46 @@ def test_split_summary_dialog_reports_failures_and_skipped_outputs(
 
     message = CapturedMessageBox.instances[-1]
     assert message.text == "4個中1個を作成しました。1個は失敗しました"
+    assert "成功: 1" in message.detailed_text
+    assert "失敗: 1" in message.detailed_text
+    assert "スキップ: 1" in message.detailed_text
+    assert "キャンセル: 1" in message.detailed_text
     assert "2-2: source_pages_0002-0002.pdf [失敗] - boom" in message.detailed_text
     assert "3-3: source_pages_0003-0003.pdf [スキップ]" in message.detailed_text
     assert "4-4: source_pages_0004-0004.pdf [キャンセル]" in message.detailed_text
+
+
+def test_split_summary_dialog_reports_partial_failure_counts(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    CapturedMessageBox.instances.clear()
+    monkeypatch.setattr(main_window_module, "QMessageBox", CapturedMessageBox)
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+    )
+    qtbot.addWidget(window)
+
+    window._show_split_result_summary(
+        build_split_result(
+            (
+                PageSplitOutputStatus.SUCCESS,
+                PageSplitOutputStatus.FAILED,
+                PageSplitOutputStatus.SKIPPED,
+            )
+        )
+    )
+
+    message = CapturedMessageBox.instances[-1]
+    assert message.text == "3個中1個を作成しました。1個は失敗しました"
+    assert "成功: 1" in message.detailed_text
+    assert "失敗: 1" in message.detailed_text
+    assert "スキップ: 1" in message.detailed_text
+    assert "キャンセル: 0" in message.detailed_text
+    assert "2-2: source_pages_0002-0002.pdf [失敗] - boom" in message.detailed_text
+    assert "3-3: source_pages_0003-0003.pdf [スキップ]" in message.detailed_text
 
 
 def test_split_summary_dialog_reports_cancel_without_failure(
@@ -913,7 +1047,43 @@ def test_split_summary_dialog_reports_cancel_without_failure(
 
     message = CapturedMessageBox.instances[-1]
     assert message.text == "2個中1個を作成し、残りをキャンセルしました"
+    assert "成功: 1" in message.detailed_text
+    assert "失敗: 0" in message.detailed_text
+    assert "スキップ: 0" in message.detailed_text
+    assert "キャンセル: 1" in message.detailed_text
     assert "2-2: source_pages_0002-0002.pdf [キャンセル]" in message.detailed_text
+
+
+def test_split_summary_dialog_reports_cancelled_and_skipped_counts(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    CapturedMessageBox.instances.clear()
+    monkeypatch.setattr(main_window_module, "QMessageBox", CapturedMessageBox)
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+    )
+    qtbot.addWidget(window)
+
+    window._show_split_result_summary(
+        build_split_result(
+            (
+                PageSplitOutputStatus.SUCCESS,
+                PageSplitOutputStatus.SKIPPED,
+                PageSplitOutputStatus.CANCELLED,
+            )
+        )
+    )
+
+    message = CapturedMessageBox.instances[-1]
+    assert "成功: 1" in message.detailed_text
+    assert "失敗: 0" in message.detailed_text
+    assert "スキップ: 1" in message.detailed_text
+    assert "キャンセル: 1" in message.detailed_text
+    assert "2-2: source_pages_0002-0002.pdf [スキップ]" in message.detailed_text
+    assert "3-3: source_pages_0003-0003.pdf [キャンセル]" in message.detailed_text
 
 
 def test_split_failed_reports_non_mutating_error(

@@ -59,9 +59,20 @@ class PageSplitOutputResult:
 @dataclass(frozen=True, slots=True)
 class PageSplitBatchResult:
     outputs: tuple[PageSplitOutputResult, ...]
+    output_directory: Path
     started_at: datetime
     completed_at: datetime
     source_revision: SourcePdfRevision
+
+    def __post_init__(self) -> None:
+        resolved_output_directory = self.output_directory.expanduser().resolve()
+        if resolved_output_directory != self.output_directory:
+            raise ValueError("output_directory must be resolved")
+        if any(
+            output.target_path.parent.resolve() != resolved_output_directory
+            for output in self.outputs
+        ):
+            raise ValueError("all split outputs must be inside output_directory")
 
     @property
     def success_count(self) -> int:
@@ -243,6 +254,7 @@ class PdfPageSplitService:
             )
         return PageSplitBatchResult(
             outputs=tuple(outputs),
+            output_directory=resolved_output_directory,
             started_at=started_at,
             completed_at=datetime.now(UTC),
             source_revision=source_revision,

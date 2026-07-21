@@ -21,7 +21,9 @@ from pdf_workbench.services.pdf_page_export import (
 )
 from pdf_workbench.services.pdf_page_mutation import SourcePdfRevision
 from pdf_workbench.services.pdf_page_split import (
+    PageSplitBatchResult,
     PageSplitError,
+    PageSplitOutputResult,
     PageSplitOutputStatus,
     PdfPageSplitService,
 )
@@ -80,6 +82,58 @@ def make_revision(path: Path, page_count: int) -> SourcePdfRevision:
     )
 
 
+def make_split_output_result(
+    target_path: Path,
+    *,
+    page_count: int = 2,
+) -> PageSplitOutputResult:
+    plan = build_max_pages_split_plan(page_count, 1, source_stem="source")
+    now = datetime.now(UTC)
+    return PageSplitOutputResult(
+        chunk=plan.chunks[0],
+        target_path=target_path,
+        status=PageSplitOutputStatus.SUCCESS,
+        fingerprint=None,
+        error_message="",
+        started_at=now,
+        completed_at=now,
+    )
+
+
+def test_split_batch_result_rejects_unresolved_output_directory(tmp_path: Path) -> None:
+    output_directory = tmp_path / "exports"
+    output_directory.mkdir()
+    source = tmp_path / "source.pdf"
+    revision = make_revision(source, 1)
+    output = make_split_output_result(output_directory / "source_pages_0001-0001.pdf")
+
+    with pytest.raises(ValueError, match="output_directory must be resolved"):
+        PageSplitBatchResult(
+            outputs=(output,),
+            output_directory=Path("exports"),
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            source_revision=revision,
+        )
+
+
+def test_split_batch_result_rejects_output_outside_directory(tmp_path: Path) -> None:
+    output_directory = (tmp_path / "exports").resolve()
+    output_directory.mkdir()
+    source = tmp_path / "source.pdf"
+    revision = make_revision(source, 1)
+    output = make_split_output_result(tmp_path / "source_pages_0001-0001.pdf")
+
+    with pytest.raises(ValueError, match="all split outputs"):
+        PageSplitBatchResult(
+            outputs=(output,),
+            output_directory=output_directory,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            source_revision=revision,
+        )
+
+
 def test_split_service_processes_outputs_in_order_and_reports_success(tmp_path: Path) -> None:
     source = tmp_path / "source.pdf"
     exporter = FakeExporter(make_revision(source, 5))
@@ -102,6 +156,8 @@ def test_split_service_processes_outputs_in_order_and_reports_success(tmp_path: 
     ]
     assert result.success_count == 3
     assert result.failure_count == 0
+    assert result.output_directory == tmp_path.resolve()
+    assert all(output.target_path.parent == result.output_directory for output in result.outputs)
     assert all(output.status is PageSplitOutputStatus.SUCCESS for output in result.outputs)
     assert progress
 

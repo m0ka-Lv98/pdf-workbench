@@ -1089,7 +1089,17 @@ class MainWindow(QMainWindow):
             )
         else:
             headline = f"{result.success_count}個のPDFを作成しました"
-        lines = [headline, ""]
+        lines = [
+            headline,
+            "",
+            f"出力先: {result.output_directory}",
+            "",
+            f"成功: {result.success_count}",
+            f"失敗: {result.failure_count}",
+            f"スキップ: {result.skipped_count}",
+            f"キャンセル: {result.cancelled_count}",
+            "",
+        ]
         for output in result.outputs:
             status_text = {
                 PageSplitOutputStatus.SUCCESS: "成功",
