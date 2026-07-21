@@ -656,6 +656,18 @@ def test_merge_atomic_io_failures_are_reported(
     with pytest.raises(PdfMergeError, match="置換"):
         service._replace_atomically(candidate, target)
 
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode semantics are not available on Windows")
+def test_merge_existing_target_mode_failure_is_reported(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    service = PdfMergeService()
+    candidate = tmp_path / "candidate.pdf"
+    target = tmp_path / "target.pdf"
+    candidate.write_bytes(b"x")
+    target.write_bytes(b"y")
+
     monkeypatch.setattr(os, "chmod", lambda *_args: (_ for _ in ()).throw(OSError("boom")))
     with pytest.raises(PdfMergeError, match="属性"):
         service._apply_existing_target_mode(candidate, target)
