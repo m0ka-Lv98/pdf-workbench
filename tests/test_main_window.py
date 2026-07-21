@@ -45,11 +45,14 @@ from pdf_workbench.domain.document_session import DocumentSession, FileFingerpri
 from pdf_workbench.domain.mutation import PageIndexTransition, WorkingCopyMutationResult
 from pdf_workbench.domain.page_commands import DeletePagesCommand, RotatePagesCommand
 from pdf_workbench.domain.page_crop import PageCropMargins
+from pdf_workbench.domain.page_extraction import PageExtractionPlan, build_page_extraction_plan
 from pdf_workbench.domain.page_insertion import SourcePageSelection
 from pdf_workbench.services.page_coordinates import PageMetadata
+from pdf_workbench.services.pdf_page_export import PageExtractionResult, PdfPageExportService
 from pdf_workbench.services.pdf_page_mutation import (
     PdfPageMutationError,
     PdfPageMutationService,
+    SourcePdfRevision,
 )
 from pdf_workbench.services.pdf_renderer import (
     DocumentMetadata,
@@ -78,6 +81,9 @@ from pdf_workbench.services.source_change_monitor import (
 from pdf_workbench.ui.main_window import DocumentTab, MainWindow, RestoreSessionResult
 from pdf_workbench.ui.pdf_view import PdfView, PdfViewMutationSnapshot
 from pdf_workbench.ui.widgets.crop_pages_dialog import CropPagesDialog, CropPagesDialogResult
+from pdf_workbench.ui.widgets.extract_pages_dialog import (
+    ExtractPagesDialogResult,
+)
 from pdf_workbench.ui.widgets.insert_pages_dialog import InsertPagesDialog, InsertPagesDialogResult
 from pdf_workbench.ui.widgets.replace_pages_dialog import (
     ReplacePagesDialogResult,
@@ -285,6 +291,41 @@ class FakeSaveService(PdfSaveService):
         )
 
 
+class FakePageExportService(PdfPageExportService):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[tuple[Path, Path, PageExtractionPlan, Path | None, object, object]] = []
+
+    def extract_pages(
+        self,
+        source_path: Path,
+        target_path: Path,
+        plan: PageExtractionPlan,
+        *,
+        working_copy_path: Path | None = None,
+        expected_source_revision: SourcePdfRevision | None = None,
+        expected_target_snapshot: TargetSnapshot | None = None,
+    ) -> PageExtractionResult:
+        resolved_target = target_path.expanduser().resolve()
+        self.calls.append(
+            (
+                source_path.expanduser().resolve(),
+                resolved_target,
+                plan,
+                working_copy_path.expanduser().resolve() if working_copy_path else None,
+                expected_source_revision,
+                expected_target_snapshot,
+            )
+        )
+        resolved_target.write_bytes(b"%PDF-1.7\n% fake extracted PDF\n")
+        return PageExtractionResult(
+            target_path=resolved_target,
+            fingerprint=FileFingerprint.from_path(resolved_target),
+            exported_page_count=plan.output_page_count,
+            exported_at=datetime.now(UTC),
+        )
+
+
 def test_main_window_insert_pages_action_exists_and_is_enabled_with_document(
     monkeypatch: pytest.MonkeyPatch,
     qtbot: QtBot,
@@ -307,6 +348,225 @@ def test_main_window_insert_pages_action_exists_and_is_enabled_with_document(
     assert window.insert_pages_action.text() == "別のPDFからページを挿入…"
     assert window.insert_pages_action.isEnabled() is True
     assert window.replace_pages_action.text() == "選択ページを別のPDFで置換…"
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
+def test_main_window_extract_actions_follow_document_selection_and_busy_state(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    target_path = create_simple_text_pdf(tmp_path / "extract-actions-target.pdf", ["A", "B"])
+
+    assert window.extract_selected_pages_action.text() == "選択ページを抽出…"
+    assert window.extract_page_range_action.text() == "ページ範囲を抽出…"
+    assert window.extract_selected_pages_action.isEnabled() is False
+    assert window.extract_page_range_action.isEnabled() is False
+
+    window.open_document(target_path)
+    qtbot.waitUntil(lambda: window._current_document() is not None)
+    document = window._current_document()
+    assert document is not None
+    configure_fake_view_pages(document.view, 2)
+    document.view._page_organizer.set_selected_page_indexes((), current_index=0)
+
+    window._update_actions()
+    assert window.extract_selected_pages_action.isEnabled() is False
+    assert window.extract_page_range_action.isEnabled() is True
+
+    document.view._page_organizer.set_selected_page_indexes((1,), current_index=1)
+    window._update_actions()
+    assert window.extract_selected_pages_action.isEnabled() is True
+    assert window.extract_page_range_action.isEnabled() is True
+
+    document.session.is_saving = True
+    window._update_actions()
+    assert window.extract_selected_pages_action.isEnabled() is False
+    assert window.extract_page_range_action.isEnabled() is False
+    document.session.is_saving = False
+    document.mutation_in_progress = True
+    window._update_actions()
+    assert window.extract_selected_pages_action.isEnabled() is False
+    assert window.extract_page_range_action.isEnabled() is False
+    document.mutation_in_progress = False
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
+def test_main_window_extract_selected_pages_runs_service_without_mutating_document(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    export_service = FakePageExportService()
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+        page_export_service=export_service,
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    source_path = create_simple_text_pdf(tmp_path / "extract-selected-source.pdf", ["A", "B", "C"])
+    target_path = tmp_path / "selected-output.pdf"
+    window.open_document(source_path)
+    qtbot.waitUntil(lambda: window._current_document() is not None)
+    document = window._current_document()
+    assert document is not None
+    configure_fake_view_pages(document.view, 3)
+    document.view._page_organizer.set_selected_page_indexes((2, 0), current_index=2)
+    before_sha = file_sha256(document.session.document_path)
+    before_selection = document.view.selected_page_indexes
+
+    monkeypatch.setattr(window, "_choose_extract_target_path", lambda *_args: target_path)
+
+    window._extract_selected_pages()
+
+    assert len(export_service.calls) == 1
+    source, target, plan, working_copy, _source_revision, _target_snapshot = export_service.calls[0]
+    assert source == document.session.document_path
+    assert target == target_path.resolve()
+    assert working_copy == document.session.document_path
+    assert plan.source_page_indexes == (0, 2)
+    assert plan.output_page_count == 2
+    assert file_sha256(document.session.document_path) == before_sha
+    assert document.view.selected_page_indexes == before_selection
+    assert document.command_history.can_undo is False
+    assert document.session.is_modified is False
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
+def test_main_window_extract_range_uses_dialog_plan_independent_of_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    export_service = FakePageExportService()
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+        page_export_service=export_service,
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    source_path = create_simple_text_pdf(tmp_path / "extract-range-source.pdf", ["A", "B", "C"])
+    target_path = tmp_path / "range-output.pdf"
+    window.open_document(source_path)
+    qtbot.waitUntil(lambda: window._current_document() is not None)
+    document = window._current_document()
+    assert document is not None
+    configure_fake_view_pages(document.view, 3)
+    document.view._page_organizer.set_selected_page_indexes((1,), current_index=1)
+    document.view.set_page(1)
+    chosen = ExtractPagesDialogResult(
+        plan=build_page_extraction_plan(3, (0, 2)),
+        mode="range",
+    )
+
+    def choose_options(_document: DocumentTab, *, default_mode: str) -> ExtractPagesDialogResult:
+        assert default_mode == "range"
+        document.view._page_organizer.set_selected_page_indexes((2,), current_index=1)
+        return chosen
+
+    monkeypatch.setattr(window, "_choose_extract_pages_options", choose_options)
+    monkeypatch.setattr(window, "_choose_extract_target_path", lambda *_args: target_path)
+
+    window._extract_page_range()
+
+    assert len(export_service.calls) == 1
+    assert export_service.calls[0][2].source_page_indexes == (0, 2)
+    assert document.view.selected_page_indexes == (2,)
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
+def test_main_window_extract_selected_pages_rejects_stale_selection_before_save_path(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    export_service = FakePageExportService()
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+        page_export_service=export_service,
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    source_path = create_simple_text_pdf(tmp_path / "extract-stale-source.pdf", ["A", "B", "C"])
+    window.open_document(source_path)
+    qtbot.waitUntil(lambda: window._current_document() is not None)
+    document = window._current_document()
+    assert document is not None
+    configure_fake_view_pages(document.view, 3)
+    document.view._page_organizer.set_selected_page_indexes((0, 2), current_index=2)
+    target_choices: list[str] = []
+
+    def choose_target(_document: DocumentTab, _plan: PageExtractionPlan) -> Path:
+        target_choices.append("called")
+        document.view._page_organizer.set_selected_page_indexes((1,), current_index=2)
+        return tmp_path / "stale-output.pdf"
+
+    monkeypatch.setattr(window, "_choose_extract_target_path", choose_target)
+
+    window._extract_selected_pages()
+
+    assert target_choices == ["called"]
+    assert export_service.calls == []
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
+def test_main_window_extract_pages_rejects_original_source_as_target(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    patch_pdf_open(monkeypatch)
+    export_service = FakePageExportService()
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+        page_export_service=export_service,
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    source_path = create_simple_text_pdf(tmp_path / "extract-source-target.pdf", ["A", "B"])
+    window.open_document(source_path)
+    qtbot.waitUntil(lambda: window._current_document() is not None)
+    document = window._current_document()
+    assert document is not None
+    configure_fake_view_pages(document.view, 2)
+    document.view._page_organizer.set_selected_page_indexes((0,), current_index=0)
+    reported: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(window, "_choose_extract_target_path", lambda *_args: source_path.resolve())
+    monkeypatch.setattr(
+        window,
+        "_report_error",
+        lambda title, message: reported.append((title, message)),
+    )
+
+    window._extract_selected_pages()
+
+    assert export_service.calls == []
+    assert reported == [
+        (
+            "ページ抽出に失敗しました",
+            "抽出元PDFと同じ場所には出力できません。別の保存先を選択してください。",
+        )
+    ]
     window.close()
     qtbot.waitUntil(lambda: not window.isVisible())
 
@@ -2885,7 +3145,13 @@ def test_main_window_resolve_crop_context_rejects_document_changes(
     )
     assert window._resolve_crop_pages_document(replace(context, page_count=3)) is None
     assert window._resolve_crop_pages_document(replace(context, selected_page_indexes=(1,))) is None
-    assert window._resolve_crop_pages_document(replace(context, current_page_index=1)) is None
+    stale_current_page_index = 1 - context.current_page_index
+    assert (
+        window._resolve_crop_pages_document(
+            replace(context, current_page_index=stale_current_page_index)
+        )
+        is None
+    )
 
     document.session.is_saving = True
     assert window._resolve_crop_pages_document(context) is None

@@ -91,6 +91,12 @@ PDF-writing PR の最低限の回帰チェック:
 - crop-box editing では numeric dialog cancel、active document 変更、save/mutation 開始後の stale context で command history、dirty state、working copy SHA が変わらないことを確認する
 - crop-box editing では content を削除せず annotation も移動しない方針を README と test に明記し、inside / partial / outside annotation で `/Rect` と fingerprint が不変なことを確認する
 - crop-box editing では drag overlay を追加せず、numeric dialog 方式だけを対象にする
+- page extraction では `PageExtractionPlan` と range parser を Qt 非依存でテストし、selected pages / range が ascending unique な 0-based tuple へ正規化されることを確認する
+- page extraction では source PDF、working copy、current page、selection、dirty state、command history を変更しないことを UI 経路で確認する
+- page extraction では output PDF の page count、source order、content、resources、page boxes、rotation、安全な annotations を pikepdf reopen と PDFium render で検証する
+- page extraction では source metadata / outlines / named destinations / attachments を統合しないことを fixture で明示する
+- page extraction では `/AcroForm`、`/Widget` annotations、annotation action、file attachment、media、cross-page dependency を fail-closed にし、silent removal しないことを確認する
+- page extraction では `TargetSnapshot` drift、source revision drift、atomic replace failure、candidate validation failure で source / working copy / existing target が維持されることを確認する
 - page object と annotation object の独立性、annotation `/P` back-reference、raw/effective rotation、all page boxes の保存を検証する
 - execute / undo / redo の各経路で、pikepdf 再オープンと PDFium render を通して semantic restoration を確認する
 - form / widget page duplication は fail-closed とし、working copy hash が変わらないことを確認する
