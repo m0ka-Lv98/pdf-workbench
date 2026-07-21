@@ -18,6 +18,7 @@ from pdf_workbench.services.pdf_page_export import (
     PageExtractionResult,
     PdfPageExportError,
     PdfPageExportService,
+    SourcePdfChangedError,
 )
 from pdf_workbench.services.pdf_page_mutation import SourcePdfRevision
 from pdf_workbench.services.pdf_save_service import TargetChangedError, TargetSnapshot
@@ -132,7 +133,6 @@ class PdfPageSplitService:
             resolved_output_directory,
             resolved_working_copy,
             targets,
-            overwrite=overwrite,
             is_managed_path=is_managed_path,
         )
         source_revision = self._exporter.read_source_pdf_revision(resolved_source)
@@ -157,26 +157,27 @@ class PdfPageSplitService:
                     )
                 )
                 break
-            current_revision = self._exporter.read_source_pdf_revision(resolved_source)
-            if current_revision != source_revision:
-                now = datetime.now(UTC)
-                outputs.append(
-                    PageSplitOutputResult(
-                        chunk=chunk,
-                        target_path=target_path,
-                        status=PageSplitOutputStatus.FAILED,
-                        fingerprint=None,
-                        error_message="分割元PDFが変更されたため、この出力を中止しました",
-                        started_at=now,
-                        completed_at=now,
-                    )
-                )
+            try:
+                current_revision = self._exporter.read_source_pdf_revision(resolved_source)
+            except Exception as exc:
                 outputs.extend(
-                    self._remaining_results(
+                    self._source_changed_results(
+                        chunk,
+                        target_path,
                         plan.chunks[index + 1 :],
                         targets[index + 1 :],
-                        PageSplitOutputStatus.SKIPPED,
-                        "分割元PDFが変更されたためスキップしました",
+                        f"分割元PDFの状態を確認できませんでした: {exc}",
+                    )
+                )
+                break
+            if current_revision != source_revision:
+                outputs.extend(
+                    self._source_changed_results(
+                        chunk,
+                        target_path,
+                        plan.chunks[index + 1 :],
+                        targets[index + 1 :],
+                        "分割元PDFが変更されたため、この出力を中止しました",
                     )
                 )
                 break
@@ -199,6 +200,17 @@ class PdfPageSplitService:
                     expected_source_revision=source_revision,
                     expected_target_snapshot=target_snapshots[target_path],
                 )
+            except SourcePdfChangedError as exc:
+                outputs.extend(
+                    self._source_changed_results(
+                        chunk,
+                        target_path,
+                        plan.chunks[index + 1 :],
+                        targets[index + 1 :],
+                        str(exc),
+                    )
+                )
+                break
             except (PdfPageExportError, TargetChangedError, OSError) as exc:
                 output = PageSplitOutputResult(
                     chunk=chunk,
@@ -243,7 +255,6 @@ class PdfPageSplitService:
         working_copy_path: Path | None,
         targets: tuple[Path, ...],
         *,
-        overwrite: bool,
         is_managed_path: Callable[[Path], bool] | None,
     ) -> None:
         if not source_path.exists() or not source_path.is_file():
@@ -255,16 +266,14 @@ class PdfPageSplitService:
         if len(set(targets)) != len(targets):
             raise PageSplitError("分割後の出力先が重複しています")
         for target_path in targets:
+            if target_path.parent != output_directory:
+                raise PageSplitError("出力先フォルダ外にはPDFを作成できません")
             if target_path == source_path:
                 raise PageSplitError("分割元PDFと同じ場所には出力できません")
             if working_copy_path is not None and target_path == working_copy_path:
                 raise PageSplitError("現在の作業コピーには出力できません")
             if is_managed_path is not None and is_managed_path(target_path):
                 raise PageSplitError("アプリの一時作業フォルダ内には出力できません")
-        if not overwrite:
-            existing = [target.name for target in targets if target.exists()]
-            if existing:
-                raise PageSplitError("既存の同名ファイルがあります: " + ", ".join(existing[:5]))
 
     @staticmethod
     def _prepare_target_snapshots(
@@ -274,8 +283,28 @@ class PdfPageSplitService:
         expected_target_snapshots: Mapping[Path, TargetSnapshot] | None,
     ) -> dict[Path, TargetSnapshot]:
         if expected_target_snapshots is not None:
-            return {target: expected_target_snapshots[target] for target in targets}
-        return {target: TargetSnapshot.capture(target) for target in targets}
+            normalized = {
+                key.expanduser().resolve(): value
+                for key, value in expected_target_snapshots.items()
+            }
+            expected_keys = set(targets)
+            actual_keys = set(normalized)
+            missing = expected_keys - actual_keys
+            extra = actual_keys - expected_keys
+            if missing:
+                missing_names = ", ".join(sorted(path.name for path in missing)[:5])
+                raise PageSplitError("出力先snapshotが不足しています: " + missing_names)
+            if extra:
+                extra_names = ", ".join(sorted(path.name for path in extra)[:5])
+                raise PageSplitError("未知の出力先snapshotがあります: " + extra_names)
+            snapshots = {target: normalized[target] for target in targets}
+        else:
+            snapshots = {target: TargetSnapshot.capture(target) for target in targets}
+        if not overwrite:
+            existing = [target.name for target, snapshot in snapshots.items() if snapshot.exists]
+            if existing:
+                raise PageSplitError("既存の同名ファイルがあります: " + ", ".join(existing[:5]))
+        return snapshots
 
     @staticmethod
     def _remaining_results(
@@ -296,6 +325,34 @@ class PdfPageSplitService:
                 completed_at=now,
             )
             for chunk, target_path in zip(chunks, targets, strict=True)
+        ]
+
+    @classmethod
+    def _source_changed_results(
+        cls,
+        chunk: PageSplitChunk,
+        target_path: Path,
+        remaining_chunks: tuple[PageSplitChunk, ...],
+        remaining_targets: tuple[Path, ...],
+        failed_message: str,
+    ) -> list[PageSplitOutputResult]:
+        now = datetime.now(UTC)
+        return [
+            PageSplitOutputResult(
+                chunk=chunk,
+                target_path=target_path,
+                status=PageSplitOutputStatus.FAILED,
+                fingerprint=None,
+                error_message=failed_message,
+                started_at=now,
+                completed_at=now,
+            ),
+            *cls._remaining_results(
+                remaining_chunks,
+                remaining_targets,
+                PageSplitOutputStatus.SKIPPED,
+                "分割元PDFが変更されたためスキップしました",
+            ),
         ]
 
     @staticmethod

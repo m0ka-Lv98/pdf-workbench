@@ -162,11 +162,11 @@ working copy を直接 mutate する専用サービス。Issue #7では、select
 - `/AcroForm`、`/Widget` annotations、`/StructTreeRoot`、`/PageLabels`、`/Threads`、`/OpenAction`、annotation action、file attachment、media、cross-page annotation `/P` のような独立PDF化を保証できない構造は fail-closed にする
 - target は `TargetSnapshot` を保存前と replace 直前に再確認し、別プロセスの変更が見つかった場合は既存targetを維持して中止する
 - `PageSplitPlan` は Qt 非依存のdomain objectで、manual range split と max-pages split の両方を全ページの完全partitionへ正規化する。chunk数は2以上、各chunkは連続範囲、overlap/gapなし、filenameはuniqueで deterministic とする
-- split の filename は `<source-stem>_pages_<start>-<end>.pdf` で、1-based page number を `max(4, len(str(page_count)))` 桁に zero padding する。mode差で命名結果を変えない
+- split の filename は `<source-stem>_pages_<start>-<end>.pdf` で、1-based page number を `max(4, len(str(page_count)))` 桁に zero padding する。mode差で命名結果を変えず、domain invariant と service boundary の両方で basename `.pdf` と output directory containment を検証する
 - split は GUI thread では実行せず、1 outputずつ順番に worker thread から `PdfPageExportService.extract_pages()` を呼ぶ。並列export、eager rasterize、複数candidateの同時保持は行わない
-- overwrite off では既存target衝突を global preflight failure とし、1ファイルも出力しない。overwrite on では各targetの `TargetSnapshot` をbatch開始前に固定し、target drift はそのoutputだけ failed として記録できる
+- overwrite off / on のどちらでも各targetの `TargetSnapshot` をbatch開始前に固定する。overwrite off ではsnapshot上の既存target衝突を global preflight failure とし、snapshot後に出現・変更したtargetは置換せず、そのoutputだけ failed として後続outputを継続する
 - source revision はbatch開始時に固定し、各output開始前と export service 内で再確認する。途中driftが見つかった場合は現在outputをfailed、残りをskippedにして、異なるsource revisionの混在output setを作らない
-- cancellation はoutput間だけで処理し、進行中のatomic exportを中断しない。完了済みoutputは維持し、残りはcancelledとしてcopy可能なsummaryへ含める
+- cancellation はGUI threadが所有するthread-safe cancel tokenでoutput間だけに観測し、worker threadのqueued slot処理には依存しない。進行中のatomic exportは中断せず、完了済みoutputは維持し、残りはcancelledとしてcopy可能なsummaryへ含める
 
 ### SessionRecoveryService
 

@@ -98,11 +98,12 @@ PDF-writing PR の最低限の回帰チェック:
 - page extraction では `/AcroForm`、`/Widget` annotations、annotation action、file attachment、media、cross-page dependency を fail-closed にし、silent removal しないことを確認する
 - page extraction では `TargetSnapshot` drift、source revision drift、atomic replace failure、candidate validation failure で source / working copy / existing target が維持されることを確認する
 - PDF split では manual range parser と max-pages builder を Qt 非依存でテストし、全ページを昇順でちょうど1回ずつ含むpartition、overlap / gap / reverse / malformed / bool rejection、2 output以上の制約を検証する
-- PDF split では deterministic filename、zero padding、source stem handling、output directory collision、source / working copy / managed workspace rejection を確認する
-- PDF split では overwrite off の既存target衝突がglobal preflight failureになり、1ファイルも出力しないことを確認する
+- PDF split では deterministic filename、zero padding、source stem handling、basename `.pdf` invariant、path traversal rejection、output directory containment、source / working copy / managed workspace rejection を確認する
+- PDF split では overwrite off の既存target衝突がbatch開始snapshotに基づくglobal preflight failureになり、1ファイルも出力しないことを確認する
+- PDF split では snapshot取得後にtargetが作成・変更された場合も置換せず、該当outputだけfailed、後続outputは継続、既存targetは維持されることを確認する
 - PDF split では overwrite on のtarget snapshot drift、candidate validation failure、atomic replace failureで該当outputだけfailedになり、後続outputと既存targetが維持されることを確認する
-- PDF split では source revision drift時に現在outputをfailed、残りをskippedにし、異なるsource revisionの混在output setを作らないことを確認する
-- PDF split では cancelをoutput間で処理し、完了済みoutputを維持しつつ残りをcancelledとしてsummaryへ表示することを確認する
+- PDF split では source revision driftを専用failureとして扱い、現在outputをfailed、残りをskippedにし、異なるsource revisionの混在output setを作らないことを確認する
+- PDF split では thread-safe cancel tokenを実QThread経路で検証し、queued worker slotへ依存せずoutput間で処理し、完了済みoutputを維持しつつ残りをcancelledとしてsummaryへ表示することを確認する
 - PDF split では source PDF、working copy、current tab/page、selection、dirty state、command historyを変更しないことをUI経路で確認する
 - PDF split では page/object copyを逐次実行し、QImage/Pixmapへのrasterize、並列export、複数candidate同時保持を行わないことを設計レビューとテストdoubleで確認する
 - page object と annotation object の独立性、annotation `/P` back-reference、raw/effective rotation、all page boxes の保存を検証する

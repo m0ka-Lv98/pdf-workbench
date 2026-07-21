@@ -7,6 +7,7 @@ from pdf_workbench.domain.page_split import (
     PageSplitPlan,
     build_max_pages_split_plan,
     build_page_range_split_plan,
+    build_split_output_filename,
 )
 
 
@@ -64,6 +65,7 @@ def test_build_max_pages_split_plan_handles_exact_remainder_and_one_page_chunks(
     assert [chunk.display_range for chunk in exact.chunks] == ["1-5", "6-10"]
     assert [chunk.display_range for chunk in remainder.chunks] == ["1-5", "6-10", "11-11"]
     assert [chunk.display_range for chunk in single_pages.chunks] == ["1-1", "2-2", "3-3"]
+    assert exact.chunks[0].output_page_count == 5
 
 
 def test_build_max_pages_split_plan_rejects_invalid_values() -> None:
@@ -83,6 +85,16 @@ def test_split_filename_padding_and_stem_handling() -> None:
     ]
 
 
+def test_build_split_output_filename_rejects_invalid_ranges_and_stems() -> None:
+    assert build_split_output_filename("source", 12, 0, 1) == "source_pages_0001-0002.pdf"
+    for source_stem in ("", "   ", ".", "..", "../source", "dir/source", "dir\\source"):
+        with pytest.raises((TypeError, ValueError)):
+            build_split_output_filename(source_stem, 12, 0, 1)
+    for start_index, end_index in ((-1, 1), (2, 1), (0, 12)):
+        with pytest.raises(ValueError):
+            build_split_output_filename("source", 12, start_index, end_index)
+
+
 def test_page_split_plan_rejects_tampered_chunk_invariants() -> None:
     plan = build_max_pages_split_plan(4, 2, source_stem="source")
     first, second = plan.chunks
@@ -94,7 +106,56 @@ def test_page_split_plan_rejects_tampered_chunk_invariants() -> None:
             source_end_index=1,
             extraction_plan=second.extraction_plan,
             display_range="1-2",
-            filename="bad.pdf",
+            filename="source_pages_0001-0002.pdf",
         )
     with pytest.raises(ValueError):
-        PageSplitPlan(source_page_count=4, chunks=(second, first))
+        PageSplitPlan(source_page_count=4, source_stem="source", chunks=(second, first))
+
+
+def test_page_split_chunk_rejects_unsafe_filename_and_display_range() -> None:
+    plan = build_max_pages_split_plan(4, 2, source_stem="source")
+    first = plan.chunks[0]
+    for filename in (
+        "",
+        "   ",
+        ".",
+        "..",
+        "/tmp/out.pdf",
+        "nested/out.pdf",
+        "nested\\out.pdf",
+        "out.txt",
+        " out.pdf",
+    ):
+        with pytest.raises((TypeError, ValueError)):
+            PageSplitChunk(
+                chunk_index=0,
+                source_start_index=0,
+                source_end_index=1,
+                extraction_plan=first.extraction_plan,
+                display_range="1-2",
+                filename=filename,
+            )
+    with pytest.raises(ValueError, match="display_range"):
+        PageSplitChunk(
+            chunk_index=0,
+            source_start_index=0,
+            source_end_index=1,
+            extraction_plan=first.extraction_plan,
+            display_range="1-3",
+            filename="source_pages_0001-0002.pdf",
+        )
+
+
+def test_page_split_plan_rejects_non_deterministic_filename() -> None:
+    plan = build_max_pages_split_plan(4, 2, source_stem="source")
+    first = PageSplitChunk(
+        chunk_index=0,
+        source_start_index=0,
+        source_end_index=1,
+        extraction_plan=plan.chunks[0].extraction_plan,
+        display_range="1-2",
+        filename="other_pages_0001-0002.pdf",
+    )
+
+    with pytest.raises(ValueError, match="filename"):
+        PageSplitPlan(source_page_count=4, source_stem="source", chunks=(first, plan.chunks[1]))

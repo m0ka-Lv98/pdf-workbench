@@ -11,6 +11,7 @@ from datetime import UTC
 from enum import StrEnum
 from functools import partial
 from pathlib import Path
+from threading import Event
 
 from PySide6.QtCore import (
     QEvent,
@@ -229,6 +230,7 @@ class SplitPdfWorker(QObject):
         expected_source_revision: SourcePdfRevision,
         overwrite: bool,
         is_managed_path: Callable[[Path], bool],
+        cancel_event: Event,
     ) -> None:
         super().__init__()
         self._service = service
@@ -239,7 +241,7 @@ class SplitPdfWorker(QObject):
         self._expected_source_revision = expected_source_revision
         self._overwrite = overwrite
         self._is_managed_path = is_managed_path
-        self._cancel_requested = False
+        self._cancel_event = cancel_event
 
     @Slot()
     def run(self) -> None:
@@ -252,7 +254,7 @@ class SplitPdfWorker(QObject):
                 expected_source_revision=self._expected_source_revision,
                 overwrite=self._overwrite,
                 is_managed_path=self._is_managed_path,
-                should_cancel=lambda: self._cancel_requested,
+                should_cancel=self._cancel_event.is_set,
                 progress_callback=self.progress.emit,
             )
         except Exception as exc:
@@ -262,10 +264,6 @@ class SplitPdfWorker(QObject):
             self.succeeded.emit(result)
         finally:
             self.finished.emit()
-
-    @Slot()
-    def cancel(self) -> None:
-        self._cancel_requested = True
 
 
 class MainWindow(QMainWindow):
@@ -322,6 +320,7 @@ class MainWindow(QMainWindow):
         self._split_worker_thread: QThread | None = None
         self._split_worker: SplitPdfWorker | None = None
         self._split_progress_dialog: QProgressDialog | None = None
+        self._split_cancel_event: Event | None = None
         self._toolbar_widget = DocumentToolbar(self)
         self._search_bar = SearchBar(self)
         self._main_toolbar: QWidget | None = None
@@ -990,6 +989,7 @@ class MainWindow(QMainWindow):
         progress_dialog.setWindowTitle("PDFを分割")
         progress_dialog.setMinimumDuration(0)
         progress_dialog.setValue(0)
+        cancel_event = Event()
         thread = QThread(self)
         worker = SplitPdfWorker(
             service=self._page_split_service,
@@ -1000,6 +1000,7 @@ class MainWindow(QMainWindow):
             expected_source_revision=context.source_revision,
             overwrite=result.overwrite,
             is_managed_path=self._workspace_manager.contains_managed_path,
+            cancel_event=cancel_event,
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -1009,15 +1010,25 @@ class MainWindow(QMainWindow):
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
-        progress_dialog.canceled.connect(worker.cancel)
+        progress_dialog.canceled.connect(self._request_split_cancel)
         thread.finished.connect(self._on_split_thread_finished)
         self._split_in_progress_session_id = context.session_id
         self._split_worker_thread = thread
         self._split_worker = worker
         self._split_progress_dialog = progress_dialog
+        self._split_cancel_event = cancel_event
         self._set_status_message("PDFを分割しています…")
         self._update_actions()
         thread.start()
+
+    @Slot()
+    def _request_split_cancel(self) -> None:
+        if self._split_cancel_event is None:
+            return
+        self._split_cancel_event.set()
+        if self._split_progress_dialog is not None:
+            self._split_progress_dialog.setLabelText("現在の出力完了後にキャンセルします…")
+        self._set_status_message("PDF分割をキャンセルしています…")
 
     def _on_split_progress(self, progress: object) -> None:
         if not isinstance(progress, PageSplitProgress):
@@ -1060,6 +1071,7 @@ class MainWindow(QMainWindow):
         self._split_progress_dialog = None
         self._split_worker = None
         self._split_worker_thread = None
+        self._split_cancel_event = None
         self._split_in_progress_session_id = None
         self._update_actions()
         self._update_status()

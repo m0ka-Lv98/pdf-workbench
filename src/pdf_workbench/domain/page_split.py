@@ -40,10 +40,10 @@ class PageSplitChunk:
             raise ValueError("chunk_index must be non-negative")
         if source_start_index < 0 or source_end_index < source_start_index:
             raise ValueError("chunk range must be non-empty and sorted")
-        if not self.display_range:
-            raise ValueError("display_range must not be empty")
-        if not self.filename:
-            raise ValueError("filename must not be empty")
+        expected_display_range = f"{source_start_index + 1}-{source_end_index + 1}"
+        if self.display_range != expected_display_range:
+            raise ValueError("display_range must match the chunk range")
+        _validate_split_filename(self.filename)
         expected_indexes = tuple(range(source_start_index, source_end_index + 1))
         if self.extraction_plan.source_page_indexes != expected_indexes:
             raise ValueError("chunk extraction plan must match the chunk range")
@@ -59,10 +59,12 @@ class PageSplitChunk:
 @dataclass(frozen=True, slots=True)
 class PageSplitPlan:
     source_page_count: int
+    source_stem: str
     chunks: tuple[PageSplitChunk, ...]
 
     def __post_init__(self) -> None:
         source_page_count = _validate_page_count(self.source_page_count)
+        source_stem = _validate_source_stem(self.source_stem)
         chunks = tuple(self.chunks)
         if len(chunks) < 2:
             raise ValueError("分割結果は2ファイル以上になる必要があります")
@@ -78,11 +80,20 @@ class PageSplitPlan:
                 raise ValueError("chunk page count must match source_page_count")
             if chunk.source_start_index != expected_start:
                 raise ValueError("分割範囲には重複または抜けがあります")
+            expected_filename = build_split_output_filename(
+                source_stem,
+                source_page_count,
+                chunk.source_start_index,
+                chunk.source_end_index,
+            )
+            if chunk.filename != expected_filename:
+                raise ValueError("chunk filename must be deterministic")
             covered.extend(chunk.extraction_plan.source_page_indexes)
             expected_start = chunk.source_end_index + 1
         if tuple(covered) != tuple(range(source_page_count)):
             raise ValueError("分割範囲は全ページをちょうど1回ずつ含む必要があります")
         object.__setattr__(self, "source_page_count", source_page_count)
+        object.__setattr__(self, "source_stem", source_stem)
         object.__setattr__(self, "chunks", chunks)
 
     @property
@@ -143,8 +154,24 @@ def build_max_pages_split_plan(
     return _build_split_plan(normalized_page_count, ranges, source_stem=source_stem)
 
 
+def build_split_output_filename(
+    source_stem: str,
+    source_page_count: object,
+    start_index: object,
+    end_index: object,
+) -> str:
+    normalized_stem = _validate_source_stem(source_stem)
+    page_count = _validate_page_count(source_page_count)
+    start = _require_int(start_index, label="start_index")
+    end = _require_int(end_index, label="end_index")
+    if start < 0 or end < start or end >= page_count:
+        raise ValueError("chunk range must fit within the source page count")
+    width = max(4, len(str(page_count)))
+    return f"{normalized_stem}_pages_{start + 1:0{width}d}-{end + 1:0{width}d}.pdf"
+
+
 def build_split_target_path(output_directory: Path, chunk: PageSplitChunk) -> Path:
-    return output_directory.expanduser().resolve() / chunk.filename
+    return (output_directory.expanduser().resolve() / chunk.filename).resolve()
 
 
 def _build_split_plan(
@@ -153,16 +180,19 @@ def _build_split_plan(
     *,
     source_stem: str,
 ) -> PageSplitPlan:
-    if not source_stem:
-        raise ValueError("source_stem must not be empty")
+    normalized_stem = _validate_source_stem(source_stem)
     expected_start = 0
     chunks: list[PageSplitChunk] = []
-    width = max(4, len(str(page_count)))
     for chunk_index, (start_index, end_index) in enumerate(ranges):
         if start_index != expected_start:
             raise ValueError("分割範囲は昇順で、重複や抜けなく指定してください")
         display_range = f"{start_index + 1}-{end_index + 1}"
-        filename = f"{source_stem}_pages_{start_index + 1:0{width}d}-{end_index + 1:0{width}d}.pdf"
+        filename = build_split_output_filename(
+            normalized_stem,
+            page_count,
+            start_index,
+            end_index,
+        )
         chunks.append(
             PageSplitChunk(
                 chunk_index=chunk_index,
@@ -177,7 +207,11 @@ def _build_split_plan(
             )
         )
         expected_start = end_index + 1
-    return PageSplitPlan(source_page_count=page_count, chunks=tuple(chunks))
+    return PageSplitPlan(
+        source_page_count=page_count,
+        source_stem=normalized_stem,
+        chunks=tuple(chunks),
+    )
 
 
 def _page_number_to_index(page_number: int, page_count: int) -> int:
@@ -187,3 +221,36 @@ def _page_number_to_index(page_number: int, page_count: int) -> int:
     if page_index >= page_count:
         raise ValueError("ページ番号が文書のページ数を超えています")
     return page_index
+
+
+def _validate_source_stem(source_stem: str) -> str:
+    if not isinstance(source_stem, str):
+        raise TypeError("source_stem must be a string")
+    normalized = source_stem.strip()
+    if not normalized:
+        raise ValueError("source_stem must not be empty")
+    if normalized in {".", ".."}:
+        raise ValueError("source_stem must not be a relative path marker")
+    if "/" in normalized or "\\" in normalized:
+        raise ValueError("source_stem must not contain path separators")
+    if Path(normalized).name != normalized:
+        raise ValueError("source_stem must be a filename stem")
+    return normalized
+
+
+def _validate_split_filename(filename: str) -> None:
+    if not isinstance(filename, str):
+        raise TypeError("filename must be a string")
+    if not filename.strip():
+        raise ValueError("filename must not be empty")
+    if filename != filename.strip():
+        raise ValueError("filename must not contain surrounding whitespace")
+    if filename in {".", ".."}:
+        raise ValueError("filename must not be a relative path marker")
+    if "/" in filename or "\\" in filename:
+        raise ValueError("filename must not contain path separators")
+    path = Path(filename)
+    if path.is_absolute() or path.name != filename:
+        raise ValueError("filename must be a basename")
+    if path.suffix.lower() != ".pdf":
+        raise ValueError("filename must end with .pdf")
