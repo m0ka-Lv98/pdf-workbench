@@ -45,6 +45,12 @@ from pdf_workbench.domain.command_history import (
     DocumentCommand,
 )
 from pdf_workbench.domain.document_session import DocumentSession, FileFingerprint, SourceStatus
+from pdf_workbench.domain.image_to_pdf import (
+    ImageInput,
+    ImageSourceRevision,
+    TransparencyPolicy,
+    build_image_to_pdf_plan,
+)
 from pdf_workbench.domain.mutation import PageIndexTransition, WorkingCopyMutationResult
 from pdf_workbench.domain.page_commands import DeletePagesCommand, RotatePagesCommand
 from pdf_workbench.domain.page_crop import PageCropMargins
@@ -52,6 +58,13 @@ from pdf_workbench.domain.page_extraction import PageExtractionPlan, build_page_
 from pdf_workbench.domain.page_insertion import SourcePageSelection
 from pdf_workbench.domain.page_split import build_max_pages_split_plan
 from pdf_workbench.domain.pdf_merge import PdfMergeInput, build_pdf_merge_plan
+from pdf_workbench.services.image_to_pdf import (
+    ImageToPdfCancelled,
+    ImageToPdfProgress,
+    ImageToPdfResult,
+    ImageToPdfService,
+    ImageToPdfStage,
+)
 from pdf_workbench.services.page_coordinates import PageMetadata
 from pdf_workbench.services.pdf_merge import (
     InspectedPdfMergeInput,
@@ -104,6 +117,7 @@ from pdf_workbench.ui.widgets.crop_pages_dialog import CropPagesDialog, CropPage
 from pdf_workbench.ui.widgets.extract_pages_dialog import (
     ExtractPagesDialogResult,
 )
+from pdf_workbench.ui.widgets.image_to_pdf_dialog import ImageToPdfDialogResult
 from pdf_workbench.ui.widgets.insert_pages_dialog import InsertPagesDialog, InsertPagesDialogResult
 from pdf_workbench.ui.widgets.merge_pdfs_dialog import MergePdfsDialogResult
 from pdf_workbench.ui.widgets.replace_pages_dialog import (
@@ -469,6 +483,67 @@ class BlockingPdfMergeService(FakePdfMergeService):
 class FailingPdfMergeService(FakePdfMergeService):
     def merge_pdfs(self, *_args: object, **_kwargs: object) -> PdfMergeResult:
         raise RuntimeError("merge boom")
+
+
+class BlockingImageToPdfService(ImageToPdfService):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.calls: list[tuple[object, bool, object, object]] = []
+        self.progress_events: list[ImageToPdfProgress] = []
+
+    def create_pdf(
+        self,
+        plan: object,
+        *,
+        expected_source_revisions: object,
+        expected_target_snapshot: object,
+        overwrite: bool,
+        is_managed_path: Callable[[Path], bool] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+        progress_callback: Callable[[ImageToPdfProgress], None] | None = None,
+    ) -> ImageToPdfResult:
+        del is_managed_path
+        assert hasattr(plan, "output_path")
+        assert hasattr(plan, "total_page_count")
+        assert hasattr(plan, "inputs")
+        self.calls.append((plan, overwrite, expected_source_revisions, expected_target_snapshot))
+        self.started.set()
+        if progress_callback is not None:
+            progress = ImageToPdfProgress(
+                stage=ImageToPdfStage.DECODING,
+                input_number=1,
+                input_count=len(plan.inputs),
+                filename=plan.inputs[0].label,
+                frame_number=1,
+                frame_count=1,
+                completed_pages=0,
+                total_pages=plan.total_page_count,
+                message="decoding",
+            )
+            self.progress_events.append(progress)
+            progress_callback(progress)
+        self.release.wait(timeout=5)
+        if should_cancel is not None and should_cancel():
+            raise ImageToPdfCancelled("画像PDF作成をキャンセルしました")
+        plan.output_path.write_bytes(b"%PDF-1.7\n% fake image pdf\n")
+        return ImageToPdfResult(
+            target_path=plan.output_path,
+            fingerprint=FileFingerprint.from_path(plan.output_path),
+            input_count=len(plan.inputs),
+            total_page_count=plan.total_page_count,
+            page_size_mode=plan.page_size_mode,
+            scaling_mode=plan.scaling_mode,
+            transparency_policy=plan.transparency_policy,
+            inputs=(),
+            created_at=datetime.now(UTC),
+        )
+
+
+class FailingImageToPdfService(ImageToPdfService):
+    def create_pdf(self, *_args: object, **_kwargs: object) -> ImageToPdfResult:
+        raise RuntimeError("image boom")
 
 
 class BlockingPageSplitService(FakePageSplitService):
@@ -7311,3 +7386,184 @@ def test_main_window_undo_action_prefers_line_edit_history(
     assert command.redo_calls == 0
     assert document.session.operation_history == ["Document edit"]
     assert recovery_service.write_calls == []
+
+
+def test_main_window_image_to_pdf_action_is_available_without_document(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+        recovery_service=FakeRecoveryService(),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    assert window.image_to_pdf_action.isEnabled() is True
+
+
+def test_main_window_disables_image_to_pdf_during_background_pdf_operation(
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+        recovery_service=FakeRecoveryService(),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+
+    window._merge_worker_thread = QThread(window)
+    try:
+        window._update_actions()
+        assert window.image_to_pdf_action.isEnabled() is False
+        assert window.merge_pdfs_action.isEnabled() is False
+    finally:
+        window._merge_worker_thread = None
+        window._update_actions()
+
+
+def _image_to_pdf_dialog_result_for_thread_tests(tmp_path: Path) -> ImageToPdfDialogResult:
+    image_path = (tmp_path / "thread-image.png").resolve()
+    image_path.write_bytes(b"fake image bytes")
+    image_input = ImageInput(
+        path=image_path,
+        label=image_path.name,
+        detected_format="PNG",
+        pixel_width=10,
+        pixel_height=10,
+        frame_count=1,
+        color_mode="RGB",
+        has_alpha=False,
+        has_icc_profile=False,
+        exif_orientation=None,
+    )
+    revision = ImageSourceRevision(
+        resolved_path=image_path,
+        size_bytes=len(image_path.read_bytes()),
+        modified_time_ns=image_path.stat().st_mtime_ns,
+        sha256="a" * 64,
+        detected_format="PNG",
+        frame_count=1,
+        pixel_width=10,
+        pixel_height=10,
+    )
+    output_path = tmp_path / "thread-image-output.pdf"
+    return ImageToPdfDialogResult(
+        plan=build_image_to_pdf_plan(
+            (image_input,),
+            output_path,
+            transparency_policy=TransparencyPolicy.WHITE_BACKGROUND,
+        ),
+        overwrite=True,
+        expected_source_revisions={image_path: revision},
+        expected_target_snapshot=TargetSnapshot.capture(output_path),
+    )
+
+
+def test_main_window_image_to_pdf_actual_qthread_success_cleans_up(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    image_service = BlockingImageToPdfService()
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+        recovery_service=FakeRecoveryService(),
+        image_to_pdf_service=image_service,
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    monkeypatch.setattr(window, "_show_image_to_pdf_result_summary", lambda _result: None)
+
+    result = _image_to_pdf_dialog_result_for_thread_tests(tmp_path)
+    window._start_image_to_pdf_worker(result)
+    qtbot.waitUntil(image_service.started.is_set)
+    image_service.release.set()
+
+    qtbot.waitUntil(lambda: window._image_to_pdf_worker_thread is None)
+
+    assert image_service.calls
+    assert image_service.progress_events
+    assert image_service.calls[-1][2] == result.expected_source_revisions
+    assert image_service.calls[-1][3] == result.expected_target_snapshot
+    assert result.plan.output_path.exists()
+    assert window._image_to_pdf_worker is None
+    assert window._image_to_pdf_cancel_event is None
+    assert window._image_to_pdf_progress_dialog is None
+    assert window.image_to_pdf_action.isEnabled() is True
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
+def test_main_window_image_to_pdf_actual_qthread_cancel_cleans_up(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    image_service = BlockingImageToPdfService()
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+        recovery_service=FakeRecoveryService(),
+        image_to_pdf_service=image_service,
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    errors: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        window,
+        "_report_error",
+        lambda title, message: errors.append((title, message)),
+    )
+
+    window._start_image_to_pdf_worker(_image_to_pdf_dialog_result_for_thread_tests(tmp_path))
+    qtbot.waitUntil(image_service.started.is_set)
+    window._request_image_to_pdf_cancel()
+    image_service.release.set()
+
+    qtbot.waitUntil(lambda: window._image_to_pdf_worker_thread is None)
+
+    assert errors
+    assert "キャンセル" in errors[0][0]
+    assert window._image_to_pdf_worker is None
+    assert window._image_to_pdf_cancel_event is None
+    assert window._image_to_pdf_progress_dialog is None
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())
+
+
+def test_main_window_image_to_pdf_actual_qthread_failure_cleans_up(
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+) -> None:
+    window = MainWindow(
+        create_settings(tmp_path),
+        workspace_manager=create_workspace_manager(tmp_path),
+        recovery_service=FakeRecoveryService(),
+        image_to_pdf_service=FailingImageToPdfService(),
+    )
+    qtbot.addWidget(window)
+    show_window(qtbot, window)
+    errors: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        window,
+        "_report_error",
+        lambda title, message: errors.append((title, message)),
+    )
+
+    window._start_image_to_pdf_worker(_image_to_pdf_dialog_result_for_thread_tests(tmp_path))
+
+    qtbot.waitUntil(lambda: window._image_to_pdf_worker_thread is None)
+
+    assert errors
+    assert "失敗" in errors[0][0]
+    assert window._image_to_pdf_worker is None
+    assert window._image_to_pdf_cancel_event is None
+    assert window._image_to_pdf_progress_dialog is None
+    window.close()
+    qtbot.waitUntil(lambda: not window.isVisible())

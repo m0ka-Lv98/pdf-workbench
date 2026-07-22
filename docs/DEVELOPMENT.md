@@ -113,6 +113,14 @@ PDF-writing PR の最低限の回帰チェック:
 - PDF merge では output PDF の page count、input order、content、resources、page boxes、rotation、安全な annotations、annotation `/P` を pikepdf reopen と全ページ逐次PDFium renderで検証する
 - PDF merge では metadata none / selected-source whitelist、bookmark none / grouped preserve、duplicate filename group suffix、source-local named destinationの明示destination化、output name tree非保持、unsupported bookmark action / malformed destination / document action の fail-closed を fixture で明示する
 - PDF merge では worker thread経路で progress、cancel、failure、result summary、thread cleanup、window close cancel、Splitとの同時実行ブロック、active documentを暗黙に含めないことを確認する
+- Image-to-PDF では `ImageToPdfPlan` をQt非依存でテストし、unique resolved inputs、frame mapping、output `.pdf` invariant、page size / orientation / margin / scaling / transparency policy、actual-size overflow rejectionを検証する
+- Image-to-PDF では Pillow の実format判定を使い、JPEG / PNG / TIFF / BMP / WebP、multi-page TIFF、animated GIF / animated WebP / APNG rejection、static GIF rejection、拡張子だけに依存しない検査をfixtureで確認する
+- Image-to-PDF では EXIF orientation 1-8、DPI fallback、A4 / Letter / custom / image-fit geometry、fit / fill / actual-size matrix、FILL cropのrender結果、transparent imageのwhite / black flattenと soft mask保持を検証する
+- Image-to-PDF では ICC付きCMYKがsRGB RGBへ変換されgrayscaleへ落ちないこと、ICC付きRGBA / LAでalphaを色変換から分離して保持すること、palette transparency、binary / gradient alpha、ICCなしCMYK、invalid ICC、floating NaN / infinite pixel、unsupported or animated inputを確認する
+- Image-to-PDF では 16-bit unsigned、integer、floating point imageの8-bit normalization、constant image、byte order差、truncated image、decompression bomb warning/error、extensionとdetected format policyをfixtureで確認する
+- Image-to-PDF では source revision drift、same-dimension content drift、target snapshot drift、managed input/output、overwrite off、candidate validation failure、atomic replace failureで既存targetと入力画像が維持されることを確認する
+- Image-to-PDF では worker thread経路で progress、cancel、failure、result summary、thread cleanup、window close cancel、Split / Mergeとの同時実行ブロック、active documentを暗黙に変更しないことを実QThreadで確認する
+- Image-to-PDF では画像を一括rasterize/list保持せず、source imageを1件ずつ開いてframe単位で処理し、candidateはpikepdf reopenと全ページPDFium render validationを通した後だけatomic replaceすることをresource instrumentationとテストdoubleで確認する
 - page object と annotation object の独立性、annotation `/P` back-reference、raw/effective rotation、all page boxes の保存を検証する
 - execute / undo / redo の各経路で、pikepdf 再オープンと PDFium render を通して semantic restoration を確認する
 - form / widget page duplication は fail-closed とし、working copy hash が変わらないことを確認する
