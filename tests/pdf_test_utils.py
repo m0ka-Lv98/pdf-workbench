@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import shutil
 from pathlib import Path
 
@@ -78,25 +79,41 @@ def create_simple_text_pdf(path: Path, pages: list[str]) -> Path:
 
 
 def create_unfilterable_resource_stream_pdf(path: Path, page_count: int = 3) -> Path:
-    """Create a PDF whose page resources include a stream pikepdf cannot decode."""
+    """Create a renderable PDF with DCTDecode page resources pikepdf cannot decode."""
     if page_count <= 0:
         raise ValueError("page_count must be positive")
+    jpeg_stream = _small_dct_jpeg_stream()
     objects: dict[int, bytes] = {
         1: b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n",
         2: f"2 0 obj << /Type /Pages /Count {page_count} /Kids [".encode("ascii"),
     }
     page_object_numbers = [3 + index for index in range(page_count)]
+    content_object_numbers = [20 + index for index in range(page_count)]
     objects[2] += b" ".join(f"{number} 0 R".encode("ascii") for number in page_object_numbers)
     objects[2] += b"] >> endobj\n"
-    for page_number in page_object_numbers:
+    for page_number, content_number in zip(
+        page_object_numbers,
+        content_object_numbers,
+        strict=True,
+    ):
+        content = b"q\n100 0 0 100 50 50 cm\n/Im1 Do\nQ\n"
         objects[page_number] = (
             f"{page_number} 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] "
-            f"/Resources << /XObject << /Im1 100 0 R >> >> >> endobj\n".encode("ascii")
+            f"/Resources << /XObject << /Im1 100 0 R >> >> "
+            f"/Contents {content_number} 0 R >> endobj\n".encode("ascii")
+        )
+        objects[content_number] = (
+            f"{content_number} 0 obj << /Length {len(content)} >> stream\n".encode("ascii")
+            + content
+            + b"endstream\nendobj\n"
         )
     objects[100] = (
-        b"100 0 obj << /Type /XObject /Subtype /Image /Width 1 /Height 1 "
-        b"/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length 4 >> stream\n"
-        b"xxxx\nendstream\nendobj\n"
+        b"100 0 obj << /Type /XObject /Subtype /Image /Width 4 /Height 4 "
+        b"/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode "
+        + f"/Length {len(jpeg_stream)}".encode("ascii")
+        + b" >> stream\n"
+        + jpeg_stream
+        + b"\nendstream\nendobj\n"
     )
     pdf = bytearray(b"%PDF-1.4\n")
     offsets = [0]
@@ -121,6 +138,21 @@ def create_unfilterable_resource_stream_pdf(path: Path, page_count: int = 3) -> 
     )
     path.write_bytes(pdf)
     return path
+
+
+def _small_dct_jpeg_stream() -> bytes:
+    image = Image.new("RGB", (4, 4), "white")
+    pixels = image.load()
+    for y in range(4):
+        for x in range(4):
+            pixels[x, y] = (
+                220 if x < 2 else 40,
+                40 if y < 2 else 180,
+                40 if (x + y) % 2 == 0 else 220,
+            )
+    output = io.BytesIO()
+    image.save(output, format="JPEG", quality=95, optimize=False)
+    return output.getvalue()
 
 
 def create_qt_text_pdf(path: Path, pages: list[str]) -> Path:

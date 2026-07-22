@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
-from pdf_test_utils import create_blank_pdf
+from pdf_test_utils import create_unfilterable_resource_stream_pdf
 from pdf_workbench.__main__ import (
     _discard_candidate,
     _handle_startup_recovery,
@@ -66,19 +67,31 @@ def test_build_parser_supports_skip_recovery_prompt() -> None:
 
 
 def test_page_mutation_smoke_preserves_source_and_restores_structure(tmp_path: Path) -> None:
-    source = create_blank_pdf(tmp_path / "source.pdf", 3)
+    source = create_unfilterable_resource_stream_pdf(tmp_path / "source.pdf", 3)
     result_path = tmp_path / "page-mutation-smoke.json"
 
     exit_code = _run_page_mutation_smoke(source, result_path)
 
     assert exit_code == 0
-    payload = result_path.read_text(encoding="utf-8")
-    assert '"duplicate": "success"' in payload
-    assert '"undo_duplicate": "success"' in payload
-    assert '"delete": "success"' in payload
-    assert '"undo_delete": "success"' in payload
-    assert '"working_copy_structure_restored": true' in payload
-    assert '"source_unchanged": true' in payload
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    assert payload["duplicate"] == "success"
+    assert payload["undo_duplicate"] == "success"
+    assert payload["redo_duplicate"] == "success"
+    assert payload["final_undo_duplicate"] == "success"
+    assert payload["delete"] == "success"
+    assert payload["undo_delete"] == "success"
+    assert payload["redo_delete"] == "success"
+    assert payload["final_undo_delete"] == "success"
+    assert payload["duplicate_render_digest_matches_source"] is True
+    assert payload["delete_survivor_render_digest_matches_source"] is True
+    assert payload["undo_delete_render_digests_restored"] is True
+    assert payload["working_copy_render_digests_restored"] is True
+    assert payload["working_copy_structure_restored"] is True
+    assert payload["source_unchanged"] is True
+    assert payload["candidate_cleanup"] is True
+    assert payload["delete_undo_snapshot_cleanup"] is True
+    assert payload["insert_replace_snapshot_cleanup"] is True
+    assert payload["working_directory_contains_only_working_pdf"] is True
 
 
 def test_initial_open_performs_recovery_before_cli_pdf(

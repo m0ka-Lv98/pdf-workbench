@@ -189,8 +189,12 @@ def _run_page_mutation_smoke(input_path: Path, result_path: Path) -> int:
         "source_sha256_before": _file_sha256(resolved_input) if resolved_input.exists() else None,
         "duplicate": "not-run",
         "undo_duplicate": "not-run",
+        "redo_duplicate": "not-run",
+        "final_undo_duplicate": "not-run",
         "delete": "not-run",
         "undo_delete": "not-run",
+        "redo_delete": "not-run",
+        "final_undo_delete": "not-run",
         "all_page_render": "not-run",
     }
     try:
@@ -200,21 +204,74 @@ def _run_page_mutation_smoke(input_path: Path, result_path: Path) -> int:
             initial_sha = _file_sha256(working_copy)
             page_count = service.read_page_count(working_copy)
             initial_snapshot = service.snapshot_document_structure(working_copy)
+            initial_render_digests = service._render_page_digests(
+                working_copy,
+                tuple(range(page_count)),
+            )
             payload["initial_page_count"] = page_count
             if page_count < 2:
                 raise RuntimeError("page mutation smoke requires at least two pages")
             duplicate = service.duplicate_pages(working_copy, (0,))
             payload["duplicate"] = "success"
             payload["after_duplicate_page_count"] = service.read_page_count(working_copy)
+            duplicate_render_digests = service._render_page_digests(working_copy, (0, 1))
+            payload["duplicate_render_digest_matches_source"] = (
+                duplicate_render_digests[0] == duplicate_render_digests[1]
+            )
             service.undo_page_duplication(working_copy, duplicate.receipt)
             payload["undo_duplicate"] = "success"
             payload["after_undo_duplicate_page_count"] = service.read_page_count(working_copy)
+            duplicate_redo = service.duplicate_pages(
+                working_copy,
+                duplicate.receipt.source_page_indexes,
+            )
+            payload["redo_duplicate"] = "success"
+            payload["after_redo_duplicate_page_count"] = service.read_page_count(working_copy)
+            service.undo_page_duplication(working_copy, duplicate_redo.receipt)
+            payload["final_undo_duplicate"] = "success"
+            payload["after_final_undo_duplicate_page_count"] = service.read_page_count(working_copy)
             deletion = service.delete_pages(working_copy, (1,), current_page_index=1)
             payload["delete"] = "success"
             payload["after_delete_page_count"] = service.read_page_count(working_copy)
+            delete_render_digests = service._render_page_digests(working_copy, (0, 1))
+            payload["delete_survivor_render_digest_matches_source"] = (
+                delete_render_digests[0] == initial_render_digests[0]
+                and delete_render_digests[1] == initial_render_digests[2]
+            )
             service.undo_page_deletion(working_copy, deletion.receipt)
             payload["undo_delete"] = "success"
             payload["after_undo_delete_page_count"] = service.read_page_count(working_copy)
+            undo_delete_render_digests = service._render_page_digests(
+                working_copy,
+                tuple(range(page_count)),
+            )
+            payload["undo_delete_render_digests_restored"] = (
+                undo_delete_render_digests == initial_render_digests
+            )
+            service.redo_page_deletion(working_copy, deletion.receipt)
+            payload["redo_delete"] = "success"
+            payload["after_redo_delete_page_count"] = service.read_page_count(working_copy)
+            service.undo_page_deletion(working_copy, deletion.receipt)
+            payload["final_undo_delete"] = "success"
+            payload["after_final_undo_delete_page_count"] = service.read_page_count(working_copy)
+            final_render_digests = service._render_page_digests(
+                working_copy,
+                tuple(range(page_count)),
+            )
+            payload["working_copy_render_digests_restored"] = (
+                final_render_digests == initial_render_digests
+            )
+            service.discard_page_deletion_receipt(working_copy, deletion.receipt)
+            leftovers = _page_mutation_smoke_leftovers(working_copy)
+            payload["candidate_cleanup"] = not leftovers["candidate_paths"]
+            payload["delete_undo_snapshot_cleanup"] = not leftovers["delete_undo_snapshot_paths"]
+            payload["insert_replace_snapshot_cleanup"] = not leftovers[
+                "insert_replace_snapshot_paths"
+            ]
+            payload["working_directory_entries"] = leftovers["working_directory_entries"]
+            payload["working_directory_contains_only_working_pdf"] = leftovers[
+                "working_directory_entries"
+            ] == ["working.pdf"]
             final_sha = _file_sha256(working_copy)
             payload["working_copy_sha256_restored"] = final_sha == initial_sha
             payload["working_copy_structure_restored"] = (
@@ -228,8 +285,12 @@ def _run_page_mutation_smoke(input_path: Path, result_path: Path) -> int:
             )
             if payload["working_copy_structure_restored"] is not True:
                 raise RuntimeError("working copy structure was not restored after undo operations")
+            if payload["working_copy_render_digests_restored"] is not True:
+                raise RuntimeError("working copy renders were not restored after undo operations")
             if payload["source_unchanged"] is not True:
                 raise RuntimeError("source PDF changed during page mutation smoke")
+            if payload["working_directory_contains_only_working_pdf"] is not True:
+                raise RuntimeError("page mutation smoke left temporary files behind")
     except Exception as exc:
         logger.exception("Page mutation smoke failed")
         payload["error_class"] = type(exc).__name__
@@ -252,6 +313,29 @@ def _file_sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _page_mutation_smoke_leftovers(working_copy: Path) -> dict[str, object]:
+    directory = working_copy.parent
+    names = sorted(path.name for path in directory.iterdir())
+    candidate_paths = sorted(
+        path.name for path in directory.glob(f".{working_copy.stem}.mutation.*.tmp.pdf")
+    )
+    delete_undo_snapshot_paths = sorted(
+        path.name for path in directory.glob(f".{working_copy.stem}.delete-undo.*.pdf")
+    )
+    insert_replace_snapshot_paths = sorted(
+        path.name
+        for path in directory.glob(
+            f".{working_copy.stem}.*-snapshot.*.pdf",
+        )
+    )
+    return {
+        "working_directory_entries": names,
+        "candidate_paths": candidate_paths,
+        "delete_undo_snapshot_paths": delete_undo_snapshot_paths,
+        "insert_replace_snapshot_paths": insert_replace_snapshot_paths,
+    }
 
 
 def _handle_startup_recovery(

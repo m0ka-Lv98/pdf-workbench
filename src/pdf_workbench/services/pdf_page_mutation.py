@@ -3551,17 +3551,36 @@ class PdfPageMutationService:
                         rotations[index],
                         page_objgens,
                         exact_page_object=page_objects[index],
+                        operation=operation,
                     )
                     for index in range(page_count)
                 )
+            metadata_fingerprint = self._metadata_fingerprint(resolved_path)
+            outlines = self._outlines_snapshot(resolved_path, page_count=page_count)
+            named_destinations = self._named_destination_snapshots(
+                resolved_path,
+                page_count=page_count,
+            )
+            attachments_fingerprint = self._attachments_fingerprint(resolved_path)
+            return PdfDocumentStructureSnapshot(
+                page_count=page_count,
+                pages=pages,
+                metadata_fingerprint=metadata_fingerprint,
+                outlines=outlines,
+                named_destinations=named_destinations,
+                attachments_fingerprint=attachments_fingerprint,
+            )
         except PdfPageMutationError as exc:
             if exc.operation is not None or operation is None:
                 raise
+            original_exception = (
+                exc.original_exception if exc.original_exception is not None else exc.__cause__
+            )
             raise PdfPageMutationError(
                 exc.message,
                 operation=operation,
                 stage=stage,
-                original_exception=exc.__cause__,
+                original_exception=original_exception,
             ) from exc
         except Exception as exc:
             if operation is None:
@@ -3572,21 +3591,6 @@ class PdfPageMutationService:
                 stage=stage,
                 original_exception=exc,
             ) from exc
-        metadata_fingerprint = self._metadata_fingerprint(resolved_path)
-        outlines = self._outlines_snapshot(resolved_path, page_count=page_count)
-        named_destinations = self._named_destination_snapshots(
-            resolved_path,
-            page_count=page_count,
-        )
-        attachments_fingerprint = self._attachments_fingerprint(resolved_path)
-        return PdfDocumentStructureSnapshot(
-            page_count=page_count,
-            pages=pages,
-            metadata_fingerprint=metadata_fingerprint,
-            outlines=outlines,
-            named_destinations=named_destinations,
-            attachments_fingerprint=attachments_fingerprint,
-        )
 
     def _page_structure_snapshot(
         self,
@@ -3595,6 +3599,7 @@ class PdfPageMutationService:
         page_objgens: set[tuple[int, int]],
         *,
         exact_page_object: Any,
+        operation: str | None = None,
     ) -> PdfPageStructureSnapshot:
         annotations = self._annotation_snapshots(
             page.obj.get("/Annots", None),
@@ -3605,7 +3610,7 @@ class PdfPageMutationService:
             content_fingerprint=self._contents_fingerprint(page.obj.get("/Contents", None)),
             boxes=self._page_box_state_from_objects(page, exact_page_object),
             direct_resources_present=exact_page_object.get("/Resources", None) is not None,
-            resources_fingerprint=self._resources_fingerprint(page),
+            resources_fingerprint=self._resources_fingerprint(page, operation=operation),
             direct_rotate_present=rotation_state.direct_rotate_present,
             direct_rotate_value=rotation_state.direct_rotate_value,
             effective_rotation=rotation_state.effective_rotation,
@@ -3683,24 +3688,41 @@ class PdfPageMutationService:
             return "none"
         return self._object_fingerprint(contents)
 
-    def _resources_fingerprint(self, page: pikepdf.Page) -> str:
-        resources: object | None = page.obj.get("/Resources", None)
-        if resources is None:
-            resources = self._resolve_inherited_value(page.obj, "/Resources")
-        if resources is None:
-            return "none"
-        normalized = self._normalize_resource_object(
-            resources,
-            memo={},
-            active=set(),
-        )
-        encoded = json.dumps(
-            normalized,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        return sha256(encoded).hexdigest()
+    def _resources_fingerprint(
+        self,
+        page: pikepdf.Page,
+        *,
+        operation: str | None = None,
+    ) -> str:
+        try:
+            resources: object | None = page.obj.get("/Resources", None)
+            if resources is None:
+                resources = self._resolve_inherited_value(page.obj, "/Resources")
+            if resources is None:
+                return "none"
+            normalized = self._normalize_resource_object(
+                resources,
+                memo={},
+                active=set(),
+            )
+            encoded = json.dumps(
+                normalized,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            return sha256(encoded).hexdigest()
+        except PdfPageMutationError:
+            raise
+        except Exception as exc:
+            if operation is None:
+                raise
+            raise PdfPageMutationError(
+                "作業コピーPDFの更新に失敗しました",
+                operation=operation,
+                stage=PdfPageMutationStage.RESOURCE_FINGERPRINT,
+                original_exception=exc,
+            ) from exc
 
     def _normalize_resource_object(
         self,
@@ -3778,16 +3800,19 @@ class PdfPageMutationService:
             }
         except pikepdf.PdfError as exc:
             logger.info(
-                "Falling back to raw resource stream fingerprint after decode failure",
-                exc_info=exc,
+                "Falling back to raw resource stream fingerprint after %s",
+                type(exc).__name__,
             )
             return {
                 "__stream_data__": sha256(stream.read_raw_bytes()).hexdigest(),
                 "__stream_encoding__": "raw",
-                "__stream_filter__": self._normalize_stream_filter(stream.get("/Filter", None)),
+                "__stream_filter__": self._normalize_stream_parameter(stream.get("/Filter", None)),
+                "__stream_decode_parms__": self._normalize_stream_parameter(
+                    stream.get("/DecodeParms", None)
+                ),
             }
 
-    def _normalize_stream_filter(self, value: object) -> object:
+    def _normalize_stream_parameter(self, value: object) -> object:
         if value is None:
             return None
         return self._normalize_resource_object(value, memo={}, active=set())
