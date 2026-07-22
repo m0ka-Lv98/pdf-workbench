@@ -15,6 +15,7 @@ from pdf_regression_utils import (
     file_sha256,
     render_pdf_pages,
 )
+from pdf_test_utils import create_unfilterable_resource_stream_pdf
 from pdf_workbench.services.pdf_page_mutation import (
     AnnotationParentState,
     PageDuplicationReceipt,
@@ -689,6 +690,47 @@ def test_duplicate_pages_tolerate_parent_directory_fsync_failure(
 
     assert mutation.receipt.duplicate_page_indexes == (1,)
     assert page_count(working_copy_path) == 3
+
+
+def test_duplicate_pages_handles_unfilterable_resource_stream_without_temp_leaks(
+    tmp_path: Path,
+) -> None:
+    working_copy_path = create_unfilterable_resource_stream_pdf(
+        tmp_path / "unfilterable-resource.pdf"
+    )
+    service = PdfPageMutationService()
+    before_snapshot = service.snapshot_document_structure(working_copy_path)
+
+    mutation = service.duplicate_pages(working_copy_path, (0,))
+
+    assert mutation.receipt.duplicate_page_indexes == (1,)
+    assert page_count(working_copy_path) == 4
+    service.undo_page_duplication(working_copy_path, mutation.receipt)
+    assert page_count(working_copy_path) == 3
+    assert service.snapshot_document_structure(working_copy_path) == before_snapshot
+    assert list(tmp_path.glob(".unfilterable-resource.mutation.*.tmp.pdf")) == []
+
+
+def test_duplicate_pages_stage_error_message_omits_sensitive_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    working_copy_path = create_text_fixture(tmp_path / "stage-error.pdf", ["A", "B"])
+    service = PdfPageMutationService()
+
+    def fail_snapshot(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError(f"sensitive path {working_copy_path}")
+
+    monkeypatch.setattr(service, "_page_structure_snapshot", fail_snapshot)
+
+    with pytest.raises(PdfPageMutationError) as exc_info:
+        service.duplicate_pages(working_copy_path, (0,))
+
+    message = str(exc_info.value)
+    assert "ページ複製" in message
+    assert "snapshot-before" in message
+    assert "RuntimeError" in message
+    assert str(working_copy_path) not in message
 
 
 def test_duplicate_pages_close_source_streams_before_replace_for_execute_and_undo(

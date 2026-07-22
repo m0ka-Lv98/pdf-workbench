@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from pdf_test_utils import create_blank_pdf
 from pdf_workbench.__main__ import (
     _discard_candidate,
     _handle_startup_recovery,
     _perform_initial_document_open,
     _restore_candidate,
+    _run_page_mutation_smoke,
     build_parser,
 )
 from pdf_workbench.ui.dialogs.recovery_dialog import RecoveryDialogAction, RecoveryDialogResult
@@ -61,6 +63,22 @@ def test_build_parser_supports_skip_recovery_prompt() -> None:
     args = parser.parse_args(["--skip-recovery-prompt"])
 
     assert args.skip_recovery_prompt is True
+
+
+def test_page_mutation_smoke_preserves_source_and_restores_structure(tmp_path: Path) -> None:
+    source = create_blank_pdf(tmp_path / "source.pdf", 3)
+    result_path = tmp_path / "page-mutation-smoke.json"
+
+    exit_code = _run_page_mutation_smoke(source, result_path)
+
+    assert exit_code == 0
+    payload = result_path.read_text(encoding="utf-8")
+    assert '"duplicate": "success"' in payload
+    assert '"undo_duplicate": "success"' in payload
+    assert '"delete": "success"' in payload
+    assert '"undo_delete": "success"' in payload
+    assert '"working_copy_structure_restored": true' in payload
+    assert '"source_unchanged": true' in payload
 
 
 def test_initial_open_performs_recovery_before_cli_pdf(

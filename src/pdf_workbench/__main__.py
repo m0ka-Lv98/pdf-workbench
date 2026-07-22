@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +19,7 @@ from pdf_workbench.core.logging_config import configure_logging
 from pdf_workbench.core.settings import configure_qsettings
 from pdf_workbench.domain.document_session import SourceStatus
 from pdf_workbench.services.pdf_document_validator import PdfDocumentValidator
+from pdf_workbench.services.pdf_page_mutation import PdfPageMutationService
 from pdf_workbench.services.pdf_save_service import PdfSaveService
 from pdf_workbench.services.session_recovery import RecoveryCandidate, SessionRecoveryService
 from pdf_workbench.services.session_workspace import SessionWorkspaceManager
@@ -76,6 +80,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip interrupted-session recovery prompts during startup",
     )
+    parser.add_argument(
+        "--page-mutation-smoke-input",
+        type=Path,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--page-mutation-smoke-result",
+        type=Path,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--version", action="version", version=__version__)
     return parser
 
@@ -83,6 +99,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     configure_logging()
+    if args.page_mutation_smoke_input is not None:
+        if args.page_mutation_smoke_result is None:
+            raise SystemExit("--page-mutation-smoke-result is required")
+        return _run_page_mutation_smoke(
+            args.page_mutation_smoke_input,
+            args.page_mutation_smoke_result,
+        )
 
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
@@ -153,6 +176,82 @@ def main() -> int:
         QTimer.singleShot(args.quit_after_ms, app.quit)
 
     return app.exec()
+
+
+def _run_page_mutation_smoke(input_path: Path, result_path: Path) -> int:
+    resolved_input = input_path.expanduser().resolve()
+    result_path = result_path.expanduser().resolve()
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    service = PdfPageMutationService()
+    validator = PdfDocumentValidator()
+    payload: dict[str, object] = {
+        "input_exists": resolved_input.exists(),
+        "source_sha256_before": _file_sha256(resolved_input) if resolved_input.exists() else None,
+        "duplicate": "not-run",
+        "undo_duplicate": "not-run",
+        "delete": "not-run",
+        "undo_delete": "not-run",
+        "all_page_render": "not-run",
+    }
+    try:
+        with tempfile.TemporaryDirectory(prefix="pdf-workbench-page-mutation-smoke-") as tmp:
+            working_copy = Path(tmp) / "working.pdf"
+            shutil.copyfile(resolved_input, working_copy)
+            initial_sha = _file_sha256(working_copy)
+            page_count = service.read_page_count(working_copy)
+            initial_snapshot = service.snapshot_document_structure(working_copy)
+            payload["initial_page_count"] = page_count
+            if page_count < 2:
+                raise RuntimeError("page mutation smoke requires at least two pages")
+            duplicate = service.duplicate_pages(working_copy, (0,))
+            payload["duplicate"] = "success"
+            payload["after_duplicate_page_count"] = service.read_page_count(working_copy)
+            service.undo_page_duplication(working_copy, duplicate.receipt)
+            payload["undo_duplicate"] = "success"
+            payload["after_undo_duplicate_page_count"] = service.read_page_count(working_copy)
+            deletion = service.delete_pages(working_copy, (1,), current_page_index=1)
+            payload["delete"] = "success"
+            payload["after_delete_page_count"] = service.read_page_count(working_copy)
+            service.undo_page_deletion(working_copy, deletion.receipt)
+            payload["undo_delete"] = "success"
+            payload["after_undo_delete_page_count"] = service.read_page_count(working_copy)
+            final_sha = _file_sha256(working_copy)
+            payload["working_copy_sha256_restored"] = final_sha == initial_sha
+            payload["working_copy_structure_restored"] = (
+                service.snapshot_document_structure(working_copy) == initial_snapshot
+            )
+            validator.validate(str(working_copy), render_page_indexes=range(page_count))
+            payload["all_page_render"] = "success"
+            payload["source_sha256_after"] = _file_sha256(resolved_input)
+            payload["source_unchanged"] = (
+                payload["source_sha256_before"] == payload["source_sha256_after"]
+            )
+            if payload["working_copy_structure_restored"] is not True:
+                raise RuntimeError("working copy structure was not restored after undo operations")
+            if payload["source_unchanged"] is not True:
+                raise RuntimeError("source PDF changed during page mutation smoke")
+    except Exception as exc:
+        logger.exception("Page mutation smoke failed")
+        payload["error_class"] = type(exc).__name__
+        payload["error"] = str(exc)
+        result_path.write_text(
+            json.dumps(payload, ensure_ascii=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return 1
+    result_path.write_text(
+        json.dumps(payload, ensure_ascii=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return 0
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _handle_startup_recovery(

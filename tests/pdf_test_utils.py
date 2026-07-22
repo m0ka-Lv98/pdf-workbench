@@ -77,6 +77,52 @@ def create_simple_text_pdf(path: Path, pages: list[str]) -> Path:
     return path
 
 
+def create_unfilterable_resource_stream_pdf(path: Path, page_count: int = 3) -> Path:
+    """Create a PDF whose page resources include a stream pikepdf cannot decode."""
+    if page_count <= 0:
+        raise ValueError("page_count must be positive")
+    objects: dict[int, bytes] = {
+        1: b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n",
+        2: f"2 0 obj << /Type /Pages /Count {page_count} /Kids [".encode("ascii"),
+    }
+    page_object_numbers = [3 + index for index in range(page_count)]
+    objects[2] += b" ".join(f"{number} 0 R".encode("ascii") for number in page_object_numbers)
+    objects[2] += b"] >> endobj\n"
+    for page_number in page_object_numbers:
+        objects[page_number] = (
+            f"{page_number} 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] "
+            f"/Resources << /XObject << /Im1 100 0 R >> >> >> endobj\n".encode("ascii")
+        )
+    objects[100] = (
+        b"100 0 obj << /Type /XObject /Subtype /Image /Width 1 /Height 1 "
+        b"/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length 4 >> stream\n"
+        b"xxxx\nendstream\nendobj\n"
+    )
+    pdf = bytearray(b"%PDF-1.4\n")
+    offsets = [0]
+    max_object_number = max(objects)
+    for object_number in range(1, max_object_number + 1):
+        offsets.append(len(pdf))
+        pdf.extend(
+            objects.get(
+                object_number,
+                f"{object_number} 0 obj << >> endobj\n".encode("ascii"),
+            )
+        )
+    xref_start = len(pdf)
+    pdf.extend(f"xref\n0 {len(offsets)}\n".encode("ascii"))
+    pdf.extend(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        pdf.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
+    pdf.extend(
+        (
+            f"trailer << /Size {len(offsets)} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n"
+        ).encode("ascii")
+    )
+    path.write_bytes(pdf)
+    return path
+
+
 def create_qt_text_pdf(path: Path, pages: list[str]) -> Path:
     app = QApplication.instance()
     if app is None:
