@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+from hashlib import sha256
 from pathlib import Path
 
 import pikepdf
@@ -15,6 +16,7 @@ from pdf_regression_utils import (
     file_sha256,
     render_pdf_pages,
 )
+from pdf_test_utils import create_unfilterable_resource_stream_pdf
 from pdf_workbench.services.pdf_page_mutation import (
     AnnotationParentState,
     PageDuplicationReceipt,
@@ -23,6 +25,7 @@ from pdf_workbench.services.pdf_page_mutation import (
     PdfOutlineItemSnapshot,
     PdfPageMutationError,
     PdfPageMutationService,
+    PdfPageMutationStage,
 )
 
 
@@ -202,6 +205,38 @@ def add_normal_appearance_to_first_annotation(path: Path) -> None:
 
 def page_count(path: Path) -> int:
     return len(PdfReader(str(path)).pages)
+
+
+def render_digests(path: Path) -> tuple[str, ...]:
+    return tuple(sha256(image.tobytes()).hexdigest() for image in render_pdf_pages(path))
+
+
+def assert_image_is_not_blank(path: Path) -> None:
+    images = render_pdf_pages(path)
+    assert images
+    for image in images:
+        colors = image.convert("RGB").getcolors(maxcolors=256 * 256)
+        assert colors is not None
+        assert len(colors) > 1
+
+
+def assert_valid_unfilterable_dct_fixture(path: Path) -> None:
+    with pikepdf.open(path) as pdf:
+        assert len(pdf.pages) == 3
+        page = pdf.pages[0].obj
+        xobject = page["/Resources"]["/XObject"]
+        stream = xobject["/Im1"]
+        assert str(stream["/Subtype"]) == "/Image"
+        assert str(stream["/Filter"]) == "/DCTDecode"
+        assert int(stream["/Width"]) == 4
+        assert int(stream["/Height"]) == 4
+        assert str(stream["/ColorSpace"]) == "/DeviceRGB"
+        assert int(stream["/BitsPerComponent"]) == 8
+        assert b"/Im1 Do" in page["/Contents"].read_bytes()
+        with pytest.raises(pikepdf.PdfError, match="unfilterable"):
+            stream.read_bytes()
+        assert stream.read_raw_bytes()
+    assert_image_is_not_blank(path)
 
 
 def copy_compatibility_fixture(name: str, destination: Path) -> Path:
@@ -689,6 +724,236 @@ def test_duplicate_pages_tolerate_parent_directory_fsync_failure(
 
     assert mutation.receipt.duplicate_page_indexes == (1,)
     assert page_count(working_copy_path) == 3
+
+
+def test_duplicate_pages_handles_unfilterable_resource_stream_without_temp_leaks(
+    tmp_path: Path,
+) -> None:
+    working_copy_path = create_unfilterable_resource_stream_pdf(
+        tmp_path / "unfilterable-resource.pdf"
+    )
+    service = PdfPageMutationService()
+    before_snapshot = service.snapshot_document_structure(working_copy_path)
+    before_render_digests = render_digests(working_copy_path)
+    assert_valid_unfilterable_dct_fixture(working_copy_path)
+
+    mutation = service.duplicate_pages(working_copy_path, (0,))
+
+    assert mutation.receipt.duplicate_page_indexes == (1,)
+    assert page_count(working_copy_path) == 4
+    duplicated_render_digests = render_digests(working_copy_path)
+    assert duplicated_render_digests[0] == before_render_digests[0]
+    assert duplicated_render_digests[1] == before_render_digests[0]
+    assert duplicated_render_digests[2:] == before_render_digests[1:]
+    service.undo_page_duplication(working_copy_path, mutation.receipt)
+    assert page_count(working_copy_path) == 3
+    assert service.snapshot_document_structure(working_copy_path) == before_snapshot
+    assert render_digests(working_copy_path) == before_render_digests
+    redo_mutation = service.duplicate_pages(working_copy_path, mutation.receipt.source_page_indexes)
+    assert page_count(working_copy_path) == 4
+    assert render_digests(working_copy_path)[1] == before_render_digests[0]
+    service.undo_page_duplication(working_copy_path, redo_mutation.receipt)
+    assert render_digests(working_copy_path) == before_render_digests
+    assert list(tmp_path.glob(".unfilterable-resource.mutation.*.tmp.pdf")) == []
+
+
+def test_valid_dct_fixture_exercises_pre_fix_resource_fingerprint_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    working_copy_path = create_unfilterable_resource_stream_pdf(tmp_path / "pre-fix.pdf")
+    service = PdfPageMutationService()
+
+    def decoded_only_payload(stream: pikepdf.Stream) -> dict[str, object]:
+        return {
+            "__stream_data__": sha256(stream.read_bytes()).hexdigest(),
+            "__stream_encoding__": "decoded",
+        }
+
+    monkeypatch.setattr(service, "_stream_fingerprint_payload", decoded_only_payload)
+
+    with pytest.raises(pikepdf.PdfError, match="unfilterable"):
+        service.snapshot_document_structure(working_copy_path)
+
+
+def test_raw_stream_fingerprint_includes_decode_parms(tmp_path: Path) -> None:
+    working_copy_path = create_unfilterable_resource_stream_pdf(
+        tmp_path / "decode-parms-present.pdf"
+    )
+    with pikepdf.open(working_copy_path, allow_overwriting_input=True) as pdf:
+        image_stream = pdf.pages[0].obj["/Resources"]["/XObject"]["/Im1"]
+        image_stream["/DecodeParms"] = pikepdf.Dictionary({"/ColorTransform": 1})
+        pdf.save(working_copy_path)
+    service = PdfPageMutationService()
+
+    with pikepdf.open(working_copy_path) as pdf:
+        payload = service._stream_fingerprint_payload(
+            pdf.pages[0].obj["/Resources"]["/XObject"]["/Im1"]
+        )
+
+    assert payload["__stream_encoding__"] == "raw"
+    assert payload["__stream_decode_parms__"] == {"/ColorTransform": 1}
+
+
+def test_raw_stream_fingerprint_changes_when_decode_parms_change(tmp_path: Path) -> None:
+    first_path = create_unfilterable_resource_stream_pdf(tmp_path / "decode-parms-a.pdf")
+    second_path = create_unfilterable_resource_stream_pdf(tmp_path / "decode-parms-b.pdf")
+    for path, value in ((first_path, 1), (second_path, 0)):
+        with pikepdf.open(path, allow_overwriting_input=True) as pdf:
+            pdf.pages[0].obj["/Resources"]["/XObject"]["/Im1"]["/DecodeParms"] = pikepdf.Dictionary(
+                {"/ColorTransform": value}
+            )
+            pdf.save(path)
+    service = PdfPageMutationService()
+
+    first_snapshot = service.snapshot_document_structure(first_path)
+    second_snapshot = service.snapshot_document_structure(second_path)
+
+    assert first_snapshot.pages[0].resources_fingerprint != (
+        second_snapshot.pages[0].resources_fingerprint
+    )
+
+
+def test_raw_stream_fingerprint_normalizes_filter_and_decode_parms_arrays(
+    tmp_path: Path,
+) -> None:
+    working_copy_path = create_unfilterable_resource_stream_pdf(tmp_path / "decode-parms-array.pdf")
+    with pikepdf.open(working_copy_path, allow_overwriting_input=True) as pdf:
+        image_stream = pdf.pages[0].obj["/Resources"]["/XObject"]["/Im1"]
+        image_stream["/Filter"] = pikepdf.Array([pikepdf.Name("/DCTDecode")])
+        image_stream["/DecodeParms"] = pikepdf.Array(
+            [
+                pikepdf.Dictionary(
+                    {
+                        "/ColorTransform": 1,
+                        "/Nested": pikepdf.Dictionary({"/Mode": pikepdf.Name("/RGB")}),
+                        "/Label": pikepdf.String("fixture"),
+                    }
+                )
+            ]
+        )
+        pdf.save(working_copy_path)
+    service = PdfPageMutationService()
+
+    with pikepdf.open(working_copy_path) as pdf:
+        payload = service._stream_fingerprint_payload(
+            pdf.pages[0].obj["/Resources"]["/XObject"]["/Im1"]
+        )
+
+    assert payload["__stream_filter__"] == [{"__name__": "/DCTDecode"}]
+    assert payload["__stream_decode_parms__"] == [
+        {
+            "/ColorTransform": 1,
+            "/Label": {"__string__": "fixture"},
+            "/Nested": {"/Mode": {"__name__": "/RGB"}},
+        }
+    ]
+
+
+def test_raw_stream_fingerprint_is_stable_across_reopen(tmp_path: Path) -> None:
+    working_copy_path = create_unfilterable_resource_stream_pdf(
+        tmp_path / "decode-parms-stable.pdf"
+    )
+    with pikepdf.open(working_copy_path, allow_overwriting_input=True) as pdf:
+        image_stream = pdf.pages[0].obj["/Resources"]["/XObject"]["/Im1"]
+        image_stream["/DecodeParms"] = pikepdf.Dictionary({"/ColorTransform": 1})
+        pdf.save(working_copy_path)
+    service = PdfPageMutationService()
+
+    first_snapshot = service.snapshot_document_structure(working_copy_path)
+    second_snapshot = service.snapshot_document_structure(working_copy_path)
+
+    assert first_snapshot.pages[0].resources_fingerprint == (
+        second_snapshot.pages[0].resources_fingerprint
+    )
+
+
+def test_duplicate_resource_fingerprint_error_reports_specific_stage(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    working_copy_path = create_unfilterable_resource_stream_pdf(tmp_path / "resource-stage.pdf")
+    service = PdfPageMutationService()
+
+    def fail_stream(*_args: object, **_kwargs: object) -> object:
+        raise pikepdf.PdfError("raw stream failure")
+
+    monkeypatch.setattr(service, "_stream_fingerprint_payload", fail_stream)
+
+    with pytest.raises(PdfPageMutationError) as exc_info:
+        service.duplicate_pages(working_copy_path, (0,))
+
+    assert exc_info.value.operation == "ページ複製"
+    assert exc_info.value.stage is PdfPageMutationStage.RESOURCE_FINGERPRINT
+    assert isinstance(exc_info.value.original_exception, pikepdf.PdfError)
+    assert "resource-fingerprint" in str(exc_info.value)
+
+
+def test_duplicate_metadata_snapshot_error_reports_snapshot_before(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    working_copy_path = create_text_fixture(tmp_path / "metadata-stage.pdf", ["A", "B"])
+    service = PdfPageMutationService()
+
+    def fail_metadata(*_args: object, **_kwargs: object) -> str:
+        raise RuntimeError("metadata failure")
+
+    monkeypatch.setattr(service, "_metadata_fingerprint", fail_metadata)
+
+    with pytest.raises(PdfPageMutationError) as exc_info:
+        service.duplicate_pages(working_copy_path, (0,))
+
+    assert exc_info.value.operation == "ページ複製"
+    assert exc_info.value.stage is PdfPageMutationStage.SNAPSHOT_BEFORE
+    assert isinstance(exc_info.value.original_exception, RuntimeError)
+
+
+def test_existing_specific_stage_is_not_overwritten(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    working_copy_path = create_text_fixture(tmp_path / "specific-stage.pdf", ["A", "B"])
+    service = PdfPageMutationService()
+    original = RuntimeError("specific")
+
+    def fail_resources(*_args: object, **_kwargs: object) -> str:
+        raise PdfPageMutationError(
+            "作業コピーPDFの更新に失敗しました",
+            operation="ページ複製",
+            stage=PdfPageMutationStage.RESOURCE_FINGERPRINT,
+            original_exception=original,
+        )
+
+    monkeypatch.setattr(service, "_resources_fingerprint", fail_resources)
+
+    with pytest.raises(PdfPageMutationError) as exc_info:
+        service.duplicate_pages(working_copy_path, (0,))
+
+    assert exc_info.value.stage is PdfPageMutationStage.RESOURCE_FINGERPRINT
+    assert exc_info.value.original_exception is original
+
+
+def test_duplicate_pages_stage_error_message_omits_sensitive_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    working_copy_path = create_text_fixture(tmp_path / "stage-error.pdf", ["A", "B"])
+    service = PdfPageMutationService()
+
+    def fail_snapshot(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError(f"sensitive path {working_copy_path}")
+
+    monkeypatch.setattr(service, "_page_structure_snapshot", fail_snapshot)
+
+    with pytest.raises(PdfPageMutationError) as exc_info:
+        service.duplicate_pages(working_copy_path, (0,))
+
+    message = str(exc_info.value)
+    assert "ページ複製" in message
+    assert "snapshot-before" in message
+    assert "RuntimeError" in message
+    assert str(working_copy_path) not in message
 
 
 def test_duplicate_pages_close_source_streams_before_replace_for_execute_and_undo(

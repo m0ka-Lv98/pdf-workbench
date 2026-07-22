@@ -139,6 +139,44 @@ def _all_original_indexes_after(
 class PdfPageMutationError(RuntimeError):
     """Raised when a working-copy PDF page mutation fails."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        operation: str | None = None,
+        stage: PdfPageMutationStage | None = None,
+        original_exception: BaseException | None = None,
+    ) -> None:
+        self.message = message
+        self.operation = operation
+        self.stage = stage
+        self.original_exception = original_exception
+        super().__init__(self.user_message)
+
+    @property
+    def user_message(self) -> str:
+        details: list[str] = []
+        if self.operation is not None:
+            details.append(f"操作: {self.operation}")
+        if self.stage is not None:
+            details.append(f"処理段階: {self.stage.value}")
+        if self.original_exception is not None:
+            errno = getattr(self.original_exception, "errno", None)
+            exception_detail = type(self.original_exception).__name__
+            if errno is not None:
+                exception_detail = f"{exception_detail} [errno {errno}]"
+            details.append(f"詳細: {exception_detail}")
+        if not details:
+            return self.message
+        return self.message + "\n\n" + "\n".join(details)
+
+
+class PdfPageMutationStage(StrEnum):
+    """Diagnostic stage for page mutation failures."""
+
+    SNAPSHOT_BEFORE = "snapshot-before"
+    RESOURCE_FINGERPRINT = "resource-fingerprint"
+
 
 class PdfPageRotationValidationError(PdfPageMutationError):
     """Raised when a page rotation value is invalid."""
@@ -1268,7 +1306,11 @@ class PdfPageMutationService:
 
         try:
             old_revision = DocumentRevision.from_path(resolved_path)
-            before_snapshot = self._snapshot_document_structure(resolved_path)
+            before_snapshot = self._snapshot_document_structure(
+                resolved_path,
+                operation="ページ複製",
+                stage=PdfPageMutationStage.SNAPSHOT_BEFORE,
+            )
             if expected_before_snapshot is not None and before_snapshot != expected_before_snapshot:
                 raise PdfPageMutationError("複製対象ページの前提状態が変化しました")
             normalized_page_indexes = self._normalize_duplicate_page_indexes(
@@ -2222,7 +2264,11 @@ class PdfPageMutationService:
 
         try:
             old_revision = DocumentRevision.from_path(resolved_path)
-            before_snapshot = self._snapshot_document_structure(resolved_path)
+            before_snapshot = self._snapshot_document_structure(
+                resolved_path,
+                operation="ページ削除",
+                stage=PdfPageMutationStage.SNAPSHOT_BEFORE,
+            )
             validated_current_page_index = self._validate_delete_current_page_index(
                 current_page_index,
                 page_count=before_snapshot.page_count,
@@ -3475,47 +3521,76 @@ class PdfPageMutationService:
         except PdfDocumentValidationError as exc:
             raise PdfPageMutationError(str(exc)) from exc
 
-    def _snapshot_document_structure(self, path: Path) -> PdfDocumentStructureSnapshot:
+    def _snapshot_document_structure(
+        self,
+        path: Path,
+        *,
+        operation: str | None = None,
+        stage: PdfPageMutationStage | None = None,
+    ) -> PdfDocumentStructureSnapshot:
         resolved_path = path.expanduser().resolve()
-        with pikepdf.open(resolved_path) as pdf:
-            page_count = len(pdf.pages)
-            rotations = self.read_rotation_states(resolved_path, tuple(range(page_count)))
-            with resolved_path.open("rb") as source_stream:
-                reader = PdfReader(source_stream)
-                root = cast(Any, reader.trailer["/Root"])
-                root_pages = cast(Any, root["/Pages"]).get_object()
-                page_objects = self._collect_page_objects(root_pages)
-            if len(page_objects) != page_count:
-                raise PdfPageMutationError("ページ数の読み取り結果が一致しません")
-            page_objgens = {
-                page.obj.objgen
-                for page in pdf.pages
-                if self._has_indirect_objgen(getattr(page.obj, "objgen", None))
-            }
-            pages = tuple(
-                self._page_structure_snapshot(
-                    pdf.pages[index],
-                    rotations[index],
-                    page_objgens,
-                    exact_page_object=page_objects[index],
+        try:
+            with pikepdf.open(resolved_path) as pdf:
+                page_count = len(pdf.pages)
+                rotations = self.read_rotation_states(resolved_path, tuple(range(page_count)))
+                with resolved_path.open("rb") as source_stream:
+                    reader = PdfReader(source_stream)
+                    root = cast(Any, reader.trailer["/Root"])
+                    root_pages = cast(Any, root["/Pages"]).get_object()
+                    page_objects = self._collect_page_objects(root_pages)
+                if len(page_objects) != page_count:
+                    raise PdfPageMutationError("ページ数の読み取り結果が一致しません")
+                page_objgens = {
+                    page.obj.objgen
+                    for page in pdf.pages
+                    if self._has_indirect_objgen(getattr(page.obj, "objgen", None))
+                }
+                pages = tuple(
+                    self._page_structure_snapshot(
+                        pdf.pages[index],
+                        rotations[index],
+                        page_objgens,
+                        exact_page_object=page_objects[index],
+                        operation=operation,
+                    )
+                    for index in range(page_count)
                 )
-                for index in range(page_count)
+            metadata_fingerprint = self._metadata_fingerprint(resolved_path)
+            outlines = self._outlines_snapshot(resolved_path, page_count=page_count)
+            named_destinations = self._named_destination_snapshots(
+                resolved_path,
+                page_count=page_count,
             )
-        metadata_fingerprint = self._metadata_fingerprint(resolved_path)
-        outlines = self._outlines_snapshot(resolved_path, page_count=page_count)
-        named_destinations = self._named_destination_snapshots(
-            resolved_path,
-            page_count=page_count,
-        )
-        attachments_fingerprint = self._attachments_fingerprint(resolved_path)
-        return PdfDocumentStructureSnapshot(
-            page_count=page_count,
-            pages=pages,
-            metadata_fingerprint=metadata_fingerprint,
-            outlines=outlines,
-            named_destinations=named_destinations,
-            attachments_fingerprint=attachments_fingerprint,
-        )
+            attachments_fingerprint = self._attachments_fingerprint(resolved_path)
+            return PdfDocumentStructureSnapshot(
+                page_count=page_count,
+                pages=pages,
+                metadata_fingerprint=metadata_fingerprint,
+                outlines=outlines,
+                named_destinations=named_destinations,
+                attachments_fingerprint=attachments_fingerprint,
+            )
+        except PdfPageMutationError as exc:
+            if exc.operation is not None or operation is None:
+                raise
+            original_exception = (
+                exc.original_exception if exc.original_exception is not None else exc.__cause__
+            )
+            raise PdfPageMutationError(
+                exc.message,
+                operation=operation,
+                stage=stage,
+                original_exception=original_exception,
+            ) from exc
+        except Exception as exc:
+            if operation is None:
+                raise
+            raise PdfPageMutationError(
+                "作業コピーPDFの更新に失敗しました",
+                operation=operation,
+                stage=stage,
+                original_exception=exc,
+            ) from exc
 
     def _page_structure_snapshot(
         self,
@@ -3524,6 +3599,7 @@ class PdfPageMutationService:
         page_objgens: set[tuple[int, int]],
         *,
         exact_page_object: Any,
+        operation: str | None = None,
     ) -> PdfPageStructureSnapshot:
         annotations = self._annotation_snapshots(
             page.obj.get("/Annots", None),
@@ -3534,7 +3610,7 @@ class PdfPageMutationService:
             content_fingerprint=self._contents_fingerprint(page.obj.get("/Contents", None)),
             boxes=self._page_box_state_from_objects(page, exact_page_object),
             direct_resources_present=exact_page_object.get("/Resources", None) is not None,
-            resources_fingerprint=self._resources_fingerprint(page),
+            resources_fingerprint=self._resources_fingerprint(page, operation=operation),
             direct_rotate_present=rotation_state.direct_rotate_present,
             direct_rotate_value=rotation_state.direct_rotate_value,
             effective_rotation=rotation_state.effective_rotation,
@@ -3612,24 +3688,41 @@ class PdfPageMutationService:
             return "none"
         return self._object_fingerprint(contents)
 
-    def _resources_fingerprint(self, page: pikepdf.Page) -> str:
-        resources: object | None = page.obj.get("/Resources", None)
-        if resources is None:
-            resources = self._resolve_inherited_value(page.obj, "/Resources")
-        if resources is None:
-            return "none"
-        normalized = self._normalize_resource_object(
-            resources,
-            memo={},
-            active=set(),
-        )
-        encoded = json.dumps(
-            normalized,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        return sha256(encoded).hexdigest()
+    def _resources_fingerprint(
+        self,
+        page: pikepdf.Page,
+        *,
+        operation: str | None = None,
+    ) -> str:
+        try:
+            resources: object | None = page.obj.get("/Resources", None)
+            if resources is None:
+                resources = self._resolve_inherited_value(page.obj, "/Resources")
+            if resources is None:
+                return "none"
+            normalized = self._normalize_resource_object(
+                resources,
+                memo={},
+                active=set(),
+            )
+            encoded = json.dumps(
+                normalized,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            return sha256(encoded).hexdigest()
+        except PdfPageMutationError:
+            raise
+        except Exception as exc:
+            if operation is None:
+                raise
+            raise PdfPageMutationError(
+                "作業コピーPDFの更新に失敗しました",
+                operation=operation,
+                stage=PdfPageMutationStage.RESOURCE_FINGERPRINT,
+                original_exception=exc,
+            ) from exc
 
     def _normalize_resource_object(
         self,
@@ -3661,7 +3754,7 @@ class PdfPageMutationService:
                     for key, item in sorted(dereferenced.items(), key=lambda entry: str(entry[0]))
                     if str(key) not in _VOLATILE_STREAM_KEYS
                 }
-                payload["__stream_data__"] = sha256(dereferenced.read_bytes()).hexdigest()
+                payload.update(self._stream_fingerprint_payload(dereferenced))
                 normalized: object = payload
             elif isinstance(dereferenced, pikepdf.Dictionary):
                 normalized = {
@@ -3698,6 +3791,31 @@ class PdfPageMutationService:
         finally:
             if active_identity is not None:
                 active.discard(active_identity)
+
+    def _stream_fingerprint_payload(self, stream: pikepdf.Stream) -> dict[str, object]:
+        try:
+            return {
+                "__stream_data__": sha256(stream.read_bytes()).hexdigest(),
+                "__stream_encoding__": "decoded",
+            }
+        except pikepdf.PdfError as exc:
+            logger.info(
+                "Falling back to raw resource stream fingerprint after %s",
+                type(exc).__name__,
+            )
+            return {
+                "__stream_data__": sha256(stream.read_raw_bytes()).hexdigest(),
+                "__stream_encoding__": "raw",
+                "__stream_filter__": self._normalize_stream_parameter(stream.get("/Filter", None)),
+                "__stream_decode_parms__": self._normalize_stream_parameter(
+                    stream.get("/DecodeParms", None)
+                ),
+            }
+
+    def _normalize_stream_parameter(self, value: object) -> object:
+        if value is None:
+            return None
+        return self._normalize_resource_object(value, memo={}, active=set())
 
     def _appearance_fingerprint(self, annot: Any) -> str | None:
         appearance = annot.get("/AP", None)

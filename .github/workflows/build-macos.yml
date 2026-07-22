@@ -124,6 +124,81 @@ jobs:
           assert payload["page_input_geometry"][2] > 0
           assert payload["zoom_control_geometry"][2] > 0
           PY
+      - name: Smoke test packaged page mutation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PYTHONPATH=tests python - <<'PY'
+          from pathlib import Path
+
+          import pikepdf
+
+          from pdf_regression_utils import render_pdf_pages
+          from pdf_test_utils import create_unfilterable_resource_stream_pdf
+
+          path = create_unfilterable_resource_stream_pdf(Path("page-mutation-smoke-input.pdf"))
+          with pikepdf.open(path) as pdf:
+              assert len(pdf.pages) == 3
+              page = pdf.pages[0].obj
+              stream = page["/Resources"]["/XObject"]["/Im1"]
+              assert str(stream["/Subtype"]) == "/Image"
+              assert str(stream["/Filter"]) == "/DCTDecode"
+              assert b"/Im1 Do" in page["/Contents"].read_bytes()
+              try:
+                  stream.read_bytes()
+              except pikepdf.PdfError:
+                  pass
+              else:
+                  raise AssertionError("DCTDecode fixture must exercise raw stream fallback")
+              assert stream.read_raw_bytes()
+          images = render_pdf_pages(path)
+          assert len(images) == 3
+          for image in images:
+              colors = image.convert("RGB").getcolors(maxcolors=256 * 256)
+              assert colors is not None
+              assert len(colors) > 1
+          PY
+
+          "dist/PDF Workbench.app/Contents/MacOS/PDF Workbench" \
+            --page-mutation-smoke-input page-mutation-smoke-input.pdf \
+            --page-mutation-smoke-result page-mutation-smoke-result.json
+
+          test -f page-mutation-smoke-result.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          payload = json.loads(Path("page-mutation-smoke-result.json").read_text(encoding="utf-8"))
+          assert payload["duplicate"] == "success"
+          assert payload["undo_duplicate"] == "success"
+          assert payload["redo_duplicate"] == "success"
+          assert payload["final_undo_duplicate"] == "success"
+          assert payload["delete"] == "success"
+          assert payload["undo_delete"] == "success"
+          assert payload["redo_delete"] == "success"
+          assert payload["final_undo_delete"] == "success"
+          assert payload["all_page_render"] == "success"
+          assert payload["initial_page_count"] == 3
+          assert payload["after_duplicate_page_count"] == 4
+          assert payload["after_undo_duplicate_page_count"] == 3
+          assert payload["after_redo_duplicate_page_count"] == 4
+          assert payload["after_final_undo_duplicate_page_count"] == 3
+          assert payload["after_delete_page_count"] == 2
+          assert payload["after_undo_delete_page_count"] == 3
+          assert payload["after_redo_delete_page_count"] == 2
+          assert payload["after_final_undo_delete_page_count"] == 3
+          assert payload["duplicate_render_digest_matches_source"] is True
+          assert payload["delete_survivor_render_digest_matches_source"] is True
+          assert payload["undo_delete_render_digests_restored"] is True
+          assert payload["working_copy_render_digests_restored"] is True
+          assert payload["working_copy_structure_restored"] is True
+          assert payload["source_unchanged"] is True
+          assert payload["candidate_cleanup"] is True
+          assert payload["delete_undo_snapshot_cleanup"] is True
+          assert payload["insert_replace_snapshot_cleanup"] is True
+          assert payload["working_directory_contains_only_working_pdf"] is True
+          PY
       - name: Capture UI review screenshots
         shell: bash
         env:
@@ -568,4 +643,6 @@ jobs:
             gui-search-light.json
             gui-stdout.log
             gui-stderr.log
+            page-mutation-smoke-input.pdf
+            page-mutation-smoke-result.json
           if-no-files-found: error

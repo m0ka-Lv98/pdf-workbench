@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+from hashlib import sha256
 from pathlib import Path
 
 import pikepdf
@@ -9,12 +10,18 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.generic import ArrayObject, DictionaryObject, FloatObject, NameObject, TextStringObject
 
 import pdf_workbench.services.pdf_page_mutation as mutation_module
-from pdf_regression_utils import compatibility_fixture_dir, extract_pdfium_text, file_sha256
-from pdf_test_utils import create_blank_pdf
+from pdf_regression_utils import (
+    compatibility_fixture_dir,
+    extract_pdfium_text,
+    file_sha256,
+    render_pdf_pages,
+)
+from pdf_test_utils import create_blank_pdf, create_unfilterable_resource_stream_pdf
 from pdf_workbench.services.pdf_page_mutation import (
     PageDeletionReceipt,
     PdfPageMutationError,
     PdfPageMutationService,
+    PdfPageMutationStage,
 )
 
 
@@ -200,6 +207,10 @@ def copy_compatibility_fixture(name: str, destination: Path) -> Path:
 
 def page_count(path: Path) -> int:
     return len(PdfReader(str(path)).pages)
+
+
+def render_digests(path: Path) -> tuple[str, ...]:
+    return tuple(sha256(image.tobytes()).hexdigest() for image in render_pdf_pages(path))
 
 
 def delete_undo_snapshots(path: Path) -> list[Path]:
@@ -543,6 +554,80 @@ def test_delete_pages_prepared_result_failures_do_not_replace_working_copy(
     assert file_sha256(source_path) == source_sha_before
     assert delete_undo_snapshots(working_copy) == []
     assert delete_candidates(working_copy) == []
+
+
+def test_delete_pages_handles_unfilterable_resource_stream_without_temp_leaks(
+    tmp_path: Path,
+) -> None:
+    working_copy_path = create_unfilterable_resource_stream_pdf(
+        tmp_path / "unfilterable-resource.pdf"
+    )
+    source_sha_before = file_sha256(working_copy_path)
+    service = PdfPageMutationService()
+    before_snapshot = service.snapshot_document_structure(working_copy_path)
+    before_render_digests = render_digests(working_copy_path)
+
+    mutation = service.delete_pages(working_copy_path, (1,), current_page_index=1)
+
+    assert page_count(working_copy_path) == 2
+    after_delete_render_digests = render_digests(working_copy_path)
+    assert after_delete_render_digests == (
+        before_render_digests[0],
+        before_render_digests[2],
+    )
+    service.undo_page_deletion(working_copy_path, mutation.receipt)
+    assert page_count(working_copy_path) == 3
+    assert render_digests(working_copy_path) == before_render_digests
+    service.redo_page_deletion(working_copy_path, mutation.receipt)
+    assert page_count(working_copy_path) == 2
+    assert render_digests(working_copy_path) == after_delete_render_digests
+    service.undo_page_deletion(working_copy_path, mutation.receipt)
+    assert service.snapshot_document_structure(working_copy_path) == before_snapshot
+    assert render_digests(working_copy_path) == before_render_digests
+    assert file_sha256(working_copy_path) == source_sha_before
+    service.discard_page_deletion_receipt(working_copy_path, mutation.receipt)
+    assert delete_undo_snapshots(working_copy_path) == []
+    assert delete_candidates(working_copy_path) == []
+
+
+def test_delete_resource_fingerprint_error_reports_specific_stage(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    working_copy_path = create_unfilterable_resource_stream_pdf(tmp_path / "resource-stage.pdf")
+    service = PdfPageMutationService()
+
+    def fail_stream(*_args: object, **_kwargs: object) -> object:
+        raise pikepdf.PdfError("raw stream failure")
+
+    monkeypatch.setattr(service, "_stream_fingerprint_payload", fail_stream)
+
+    with pytest.raises(PdfPageMutationError) as exc_info:
+        service.delete_pages(working_copy_path, (1,), current_page_index=1)
+
+    assert exc_info.value.operation == "ページ削除"
+    assert exc_info.value.stage is PdfPageMutationStage.RESOURCE_FINGERPRINT
+    assert isinstance(exc_info.value.original_exception, pikepdf.PdfError)
+
+
+def test_delete_outline_snapshot_error_reports_snapshot_before(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    working_copy_path = create_text_fixture(tmp_path / "outline-stage.pdf", ["A", "B"])
+    service = PdfPageMutationService()
+
+    def fail_outlines(*_args: object, **_kwargs: object) -> tuple[object, ...]:
+        raise RuntimeError("outline failure")
+
+    monkeypatch.setattr(service, "_outlines_snapshot", fail_outlines)
+
+    with pytest.raises(PdfPageMutationError) as exc_info:
+        service.delete_pages(working_copy_path, (1,), current_page_index=1)
+
+    assert exc_info.value.operation == "ページ削除"
+    assert exc_info.value.stage is PdfPageMutationStage.SNAPSHOT_BEFORE
+    assert isinstance(exc_info.value.original_exception, RuntimeError)
 
 
 @pytest.mark.parametrize(
